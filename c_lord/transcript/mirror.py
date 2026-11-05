@@ -781,7 +781,7 @@ def _turn_state_at_end(
 
 def _read_back_state(
     path: Path, end: int | None = None
-) -> tuple[str | None, str | None, set[str], bool]:
+) -> tuple[str | None, str | None, set[str], bool | None]:
     """Who opened the turn still open at *end* of *path*, when, the agents still out,
     and whether an agent's report is still waiting for a turn end (#1281).
 
@@ -789,8 +789,8 @@ def _read_back_state(
     Replays the live loop's own rules (#913/#979/#917/#1092) over what the old
     process already read, so a mirror restored after a restart picks up where it
     left off (#1011/#1012/#1093). *end* is where the tail starts (#1018); ``None``
-    reads to the end of file. Blocking; ``(None, None, set(), False)`` when the
-    file cannot be read.
+    reads to the end of file. Blocking; ``(None, None, set(), None)`` when the
+    file cannot be read — the last item ``None`` means "unknown", never "at rest".
 
     The last item is true from an agent's ``<task-notification>`` until the
     next turn end: the turn Claude starts on the report — the one that carries
@@ -799,7 +799,7 @@ def _read_back_state(
     try:
         lines = list(_read_back_lines(path, end))
     except OSError:
-        return None, None, set(), False
+        return None, None, set(), None
     opened_by: str | None = None
     opened_at: str | None = None
     spoke = False
@@ -1199,7 +1199,9 @@ class TranscriptMirror:
             )
             return
         self._background_agents |= agents
-        if opened_by is None and not agents and not report_pending:
+        # ``report_pending is None``: the transcript could not be read, so nothing
+        # is known about it — never a reason to release (review of #1281).
+        if opened_by is None and not agents and report_pending is False:
             # #1281: the transcript is at rest — every agent reported back and the
             # turn Claude started on the report ended, all while c-lord was down.
             # No turn end will come for a completion held before the restart.

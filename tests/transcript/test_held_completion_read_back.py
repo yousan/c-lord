@@ -141,3 +141,27 @@ async def test_a_report_not_yet_taken_up_waits_for_its_turn(tmp_path: Path, log:
         await restored.feed(_NOTIFICATION_TURN, _text("全部そろいました。"), TURN_END)
     events = _lines(log)
     assert [(e["started_by"]["type"], e.get("reason")) for e in events] == [("webhook", None)]
+
+
+async def test_an_unreadable_transcript_keeps_the_hold(
+    tmp_path: Path, log: Path, monkeypatch
+) -> None:
+    """A read-back that could not read the transcript knows nothing — not "at rest".
+
+    RED: the failed read looked like a transcript with no turn open and no agent
+    out, and the hold went out while the agent was still running.
+    """
+    from c_lord.transcript import mirror as mirror_mod
+
+    def unreadable(*_args: object, **_kwargs: object):
+        raise OSError("transcript unreadable")
+
+    _hold_before_restart()
+    turn_events.reset()
+    monkeypatch.setattr(mirror_mod, "_read_back_lines", unreadable)
+    async with _Restored(tmp_path, _tool_use(), _launch("a1"), TURN_END):
+        turn_events.restore_held()
+        await asyncio.sleep(0.3)
+        await turn_events.drain()
+        assert _lines(log) == []
+        assert THREAD_ID in turn_events._HELD
