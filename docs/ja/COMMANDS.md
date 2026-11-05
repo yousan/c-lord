@@ -189,7 +189,7 @@ Bot は 2 つの認可方式に対応しています（OR 条件 — どちら�
 | `DELETE` | `/api/tasks/{id}` | タスクを削除 |
 | `POST` | `/api/spawn` | 新しいスレッドを作成して Claude Code を開始 |
 | `POST` | `/api/threads/{thread_id}/messages` | Discord スレッドにメッセージを投稿 |
-| `POST` | `/api/threads/{thread_id}/sleep` | スレッドのワークスペースを眠らせる（4時間のアイドルと同じスリープ、#572）。眠らせたら `{"status": "slept"}`、窓が無ければ `"not_resident"`（どちらも 200）。窓を閉じられず残っているかもしれない（kill の失敗・tmux が答えない）ときは **503** `{"status": "failed"}` で、`not_resident` とは言わない（#1214）。窓がこの bot の別の tmux セッションにある・tmux のマネージャが無い・スレッドでないチャンネルは、従来どおり `not_resident`（`scripts/staging.sh release` はそのペインを id で閉じる）。`failed` / 5xx のとき release は窓を閉じず一覧に出す |
+| `POST` | `/api/threads/{thread_id}/sleep` | スレッドのワークスペースを眠らせる（4時間のアイドルと同じスリープ、#572）。眠らせたら `{"status": "slept"}`、窓が無ければ `"not_resident"`（どちらも 200）。窓を閉じられず残っているかもしれない（kill の失敗・tmux が答えない）ときは **503** `{"status": "failed"}` で、`not_resident` とは言わない（#1214）。kill が失敗と返っても実際には実行されていた（そのあと tmux が窓は無いと答えた）ときは `slept`。窓がこの bot の別の tmux セッションにある・tmux のマネージャが無い・スレッドでないチャンネルは、従来どおり `not_resident`（`scripts/staging.sh release` はそのペインを id で閉じる）。`failed` / 5xx のとき release は窓を閉じず一覧に出す |
 | `POST` | `/api/mark-resume` | 再起動後にスレッドを再開するようマーク |
 | `GET` | `/api/lounge` | AI Lounge の最新メッセージ一覧 |
 | `POST` | `/api/lounge` | AI Lounge にメッセージを投稿 |

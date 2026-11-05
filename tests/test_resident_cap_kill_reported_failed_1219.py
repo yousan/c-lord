@@ -209,10 +209,12 @@ def _failed_kill_mgr(second_look: bool | None) -> MagicMock:
 
 
 async def test_sleep_impl_failed_kill_with_window_gone_everywhere_is_gone() -> None:
+    """Our kill was carried out after all: a sleep, recorded (W57 round 8)."""
     cog = _real_impl_cog(_failed_kill_mgr(False))
     with patch("c_lord.tmux.is_resident_anywhere", return_value=False):
         out = await cog._sleep_workspace_impl(channel=_thread3(), reason=MagicMock())
-    assert out is None, "tmux answered that the window is gone, but it counted as still there"
+    assert out is True, "tmux answered that the window is gone, but it counted as still there"
+    cog.repo.set_slept.assert_awaited_once_with(3, True)
 
 
 async def test_sleep_impl_failed_kill_stays_failed_unless_tmux_says_gone() -> None:

@@ -107,6 +107,12 @@ EMERGENCY_LOW_FRACTION = 0.10
 #: 0.00) does not trip it, short enough to act before the host swaps itself flat.
 EMERGENCY_CONSECUTIVE_SAMPLES = 3
 
+#: How many cap ticks a victim whose sleep was attempted and failed stays behind
+#: every other candidate (#1219, W57 round 8). Bounded: deferred until the user
+#: came back, one transient failure kept the longest-idle workspace awake while
+#: younger ones were slept in its place. A repeat failure defers it again.
+DEFERRAL_TICKS = 10
+
 #: How often to sample memory. The cap itself is re-checked on the same tick;
 #: both reads are cheap (one ``/proc/meminfo`` read, one ``tmux list-panes -a``).
 _TICK_INTERVAL_SECONDS = 30.0
@@ -400,7 +406,8 @@ class ResidentCapLoop:
         # instead, one window that can never be killed was retried ahead of a
         # younger one that failed only once, which was never tried again (whole-
         # branch review of 79fc532). Kept until the sleep succeeds, tmux answers
-        # "gone", or the thread leaves the residents.
+        # "gone", the thread leaves the residents or its user uses it, or
+        # ``DEFERRAL_TICKS`` cap ticks pass.
         self._deferred: dict[int, int] = {}
         # Victims attempted last tick, by attempt order (review of 469a137). Any
         # of them still counted next tick is deferred whatever its answer was:
@@ -413,6 +420,9 @@ class ResidentCapLoop:
         # its user came back — is an ordinary candidate again (review of 5b35a64).
         self._attempt_last_used: dict[int, str | None] = {}
         self._failures = 0
+        # The cap tick each deferred thread was deferred at (``DEFERRAL_TICKS``).
+        self._deferred_at: dict[int, int] = {}
+        self._cap_tick = 0
         # Whether the last ``_sleep_one`` got as far as the sleep itself (#1219).
         self._sleep_reached = False
         self._task: object | None = None
@@ -755,12 +765,20 @@ class ResidentCapLoop:
         if answer is None:
             return 0
         resident = answer - self._gone
-        # Bounded by the residents (#1219).
-        self._deferred = {t: n for t, n in self._deferred.items() if t in resident}
+        self._cap_tick += 1
         for t, n in self._attempted.items():
             if t in resident:
                 self._deferred[t] = max(n, self._deferred.get(t, 0))
+                self._deferred_at[t] = self._cap_tick
         self._attempted = {}
+        # Bounded by the residents, and in time: after DEFERRAL_TICKS a deferred
+        # thread is back in plain LRU order (#1219, W57 round 8).
+        self._deferred = {
+            t: n
+            for t, n in self._deferred.items()
+            if t in resident and self._cap_tick - self._deferred_at.get(t, 0) < DEFERRAL_TICKS
+        }
+        self._deferred_at = {t: v for t, v in self._deferred_at.items() if t in self._deferred}
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
         if len(resident) <= self._limit:
@@ -861,7 +879,10 @@ class ResidentCapLoop:
             if outcome is False and not self._sleep_reached:
                 # Not an attempt: the thread could not be resolved (or the cog is
                 # missing), so no kill was sent and nothing can have died behind
-                # our back. The next candidate takes its turn now (#1033).
+                # our back. The next candidate takes its turn now (#1033), and it
+                # is never deferred — a Discord hiccup is not a failed sleep (W57
+                # round 8: the longest-idle one was put behind with no kill sent).
+                self._attempted.pop(thread_id, None)
                 if thread_id in self._gone:
                     # Found deleted just now (#1086): it never counted, so it
                     # frees no slot to make up for — close it, lower the bar.
@@ -887,6 +908,7 @@ class ResidentCapLoop:
                 # Still there, or tmux did not answer: tried last from now on.
                 self._failures += 1
                 self._deferred[thread_id] = self._failures
+                self._deferred_at[thread_id] = self._cap_tick
                 if left is None:
                     quiet = self._quiet.sample("cap-reread-unanswered")
                     if quiet.emit:

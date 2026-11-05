@@ -2086,17 +2086,20 @@ class SessionManageCog(commands.Cog):
             # again with lookups that can say "did not answer": gone only when
             # tmux answers that the window is nowhere on the host.
             again = await asyncio.to_thread(tmux_mgr.window_present, thread_id)
-            if again is False and await self._gone_host_wide(thread_id):
-                logger.info(
-                    "%s sleep: the kill reported failure but the window is gone",
+            if not (again is False and await self._gone_host_wide(thread_id)):
+                logger.warning(
+                    "%s sleep: could not kill the tmux window — counted as still there",
                     log_ctx(thread_id=thread_id),
                 )
-                return None
-            logger.warning(
-                "%s sleep: could not kill the tmux window — counted as still there",
+                return False
+            # The window is gone because *we* killed it (the kill timed out and
+            # tmux carried it out): a sleep like any other — recorded below, so
+            # the next message resumes silently (#572), not with the "workspace
+            # was down" notice (#464) (W57 round 8).
+            logger.info(
+                "%s sleep: the kill reported failure but the window is gone — slept",
                 log_ctx(thread_id=thread_id),
             )
-            return False
 
         # Remember it, so the next message resumes without a word even across a
         # bot restart. Wording only — see ``SessionRepository.set_slept``.
