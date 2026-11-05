@@ -57,6 +57,20 @@ _GIT_TIMEOUT_SECONDS = 60.0
 #: Exit status of a call that timed out (as ``timeout(1)`` reports it).
 _TIMEOUT_RETURNCODE = 124
 
+#: Variables that point git at a repository other than the one a call names.
+_REPO_LOCATING_ENV: tuple[str, ...] = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG",
+)
+
 #: ``-c`` for every inspecting git call (review of 3eaa7da): nothing the workspace
 #: planted runs — no ``core.fsmonitor`` command (``git status``), no hook
 #: (``reference-transaction`` on a ref update), no ``ext::`` remote.
@@ -102,6 +116,14 @@ def _run(
         env.pop(key, None)
     if timeout is not None and args[:1] == ["git"]:
         args = ["git", *_INSPECT_CONFIG, *args[1:]]
+        # W57 round 14: a repo-locating variable in the bot's environment
+        # (``GIT_COMMON_DIR`` …) made git read — or inspect — another repo:
+        # its ``core.sshCommand`` ran, and a ``GIT_DIR`` at a clean repo would
+        # have read every workspace as clean. Each call locates its repo by
+        # ``cwd`` / ``--git-dir``, or by the ``GIT_DIR`` *extra_env* sets.
+        for key in _REPO_LOCATING_ENV:
+            env.pop(key, None)
+        env.update(extra_env or {})
     proc = subprocess.Popen(
         args,
         stdin=subprocess.PIPE if stdin is not None else None,
@@ -435,7 +457,10 @@ def _make_empty_git_dir(directory: Path) -> None:
     (directory / "refs" / "heads").mkdir(parents=True, exist_ok=True)
     head = directory / "HEAD"
     if not head.exists():
-        head.write_text("ref: refs/heads/main\n", encoding="utf-8")
+        # Not ``main`` (W57 round 14): the bot's own ``includeIf "onbranch:main"``
+        # would match this throwaway dir. ``gitdir:/**`` still matches any git
+        # dir — the bot's own global config, unavoidable.
+        head.write_text(f"ref: refs/heads/clord-neutral-{os.urandom(6).hex()}\n", encoding="utf-8")
 
 
 def _remote_head_shas(path: str, skip: frozenset[str] = frozenset()) -> frozenset[str] | None:

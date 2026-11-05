@@ -273,3 +273,116 @@ def test_bot_env_git_dir_is_not_used(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "R" / ".git"))
     sd._ask_ls_remote("ssh://fakehost/x.git")
     assert not log.exists(), log.read_text()
+
+
+# ---- W57 round 14: other repo-locating variables in the bot's environment ----
+
+
+def _probe_ws(tmp: Path) -> tuple[Path, str]:
+    ws = tmp / "probe-ws"
+    git(tmp, "init", "-q", str(ws))
+    git(ws, "commit", "-q", "--allow-empty", "-m", "x")
+    return ws, git(ws, "rev-parse", "HEAD").strip()
+
+
+@pytest.mark.parametrize("call", ["ls-remote", "probe"])
+@pytest.mark.parametrize(
+    "var",
+    [
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ],
+)
+def test_bot_env_other_git_vars(tmp_path: Path, monkeypatch, var: str, call: str) -> None:
+    """``GIT_COMMON_DIR`` in the bot's environment made git read that repo's config
+    (its ``core.sshCommand`` ran) although ``GIT_DIR`` named the empty git dir."""
+    import tempfile
+
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    log = tmp_path / "ran.log"
+    script = tmp_path / "evil-ssh.sh"
+    script.write_text(f'#!/bin/sh\necho "evil-ssh $*" >> "{log}"\nexit 1\n')
+    script.chmod(0o755)
+    _evil_ssh_repo(tmp_path / "R", script)
+    gd = tmp_path / "R" / ".git"
+    ws, old = _probe_ws(tmp_path)
+    value = {
+        "GIT_COMMON_DIR": str(gd),
+        "GIT_CONFIG": str(gd / "config"),
+        "GIT_WORK_TREE": str(tmp_path / "R"),
+        "GIT_OBJECT_DIRECTORY": str(gd / "objects"),
+        "GIT_INDEX_FILE": str(gd / "index"),
+        "GIT_NAMESPACE": "x",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(gd / "objects"),
+    }[var]
+    monkeypatch.setenv(var, value)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "t"))
+    (tmp_path / "t").mkdir()
+    if call == "ls-remote":
+        sd._ask_ls_remote("ssh://fakehost/x.git")
+    else:
+        sd._probe_contains(str(ws), ["git"], ws / ".git", "ssh://fakehost/x.git", ("main",), [old])
+    assert not log.exists(), log.read_text()
+
+
+def test_probe_with_bot_git_common_dir_writes_nothing_there(tmp_path: Path, monkeypatch) -> None:
+    from .test_created_here_probe_1245 import _merge_on_remote, _record_sub
+
+    ws, subr = _workspace(tmp_path)
+    sub = ws / "sub"
+    git(sub, "checkout", "-q", "-b", "work")
+    git(sub, "commit", "-q", "--allow-empty", "-m", "w")
+    git(sub, "push", "-q", "origin", "work")
+    _record_sub(ws)
+    _merge_on_remote(tmp_path, subr, "work", ff=False)
+    other = tmp_path / "other"
+    git(tmp_path, "init", "-q", str(other))
+    before = git(other, "for-each-ref")
+    monkeypatch.setenv("GIT_COMMON_DIR", str(other / ".git"))
+    res = _delete(ws)
+    monkeypatch.delenv("GIT_COMMON_DIR")
+    assert git(other, "for-each-ref") == before
+    assert res.removed, res.reason
+
+
+def test_bot_global_include_if_onbranch_main_does_not_match(tmp_path: Path, monkeypatch) -> None:
+    """W57 round 14: the empty git dir's HEAD named ``main``, so the bot's own
+    ``includeIf "onbranch:main"`` newly applied to ls-remote. (``gitdir:/**``
+    matches any git dir and stays — it is the bot's own global config.)"""
+    import tempfile
+
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
+    log = tmp_path / "ran.log"
+    script = tmp_path / "evil-ssh.sh"
+    script.write_text(f'#!/bin/sh\necho "evil-ssh $*" >> "{log}"\nexit 1\n')
+    script.chmod(0o755)
+    inc = tmp_path / "inc"
+    inc.write_text(f"[core]\n\tsshCommand = {script}\n")
+    g = tmp_path / "global"
+    g.write_text(f'[includeIf "onbranch:main"]\n\tpath = {inc}\n')
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(g))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "t"))
+    (tmp_path / "t").mkdir()
+    sd._ask_ls_remote("ssh://fakehost/x.git")
+    assert not log.exists(), log.read_text()
+
+
+def test_bot_env_git_dir_at_a_clean_repo_does_not_hide_work(tmp_path: Path, monkeypatch) -> None:
+    """Found with W57 round 14: ``GIT_DIR`` in the bot's environment made every
+    inspecting call read that repo — a clean one read every workspace as clean."""
+    ws, subr = _workspace(tmp_path)
+    git(ws, "checkout", "-q", "-b", "work")
+    git(ws, "commit", "-q", "--allow-empty", "-m", "only copy")
+    clean = tmp_path / "clean"
+    git(tmp_path, "clone", "-q", str(subr), str(clean))  # everything pushed: reads clean
+    monkeypatch.setenv("GIT_DIR", str(clean / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(clean))
+    res = _delete(ws)
+    assert not res.removed and ws.exists(), res.reason

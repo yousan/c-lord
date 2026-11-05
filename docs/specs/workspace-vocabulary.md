@@ -299,12 +299,19 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
       ディレクトリ（空の一時ディレクトリを手で空の git ディレクトリにし、`GIT_DIR` でそれを指す — リポジトリを探しに行かないので、
       `TMPDIR` が誰かの git リポジトリの中にあっても、パスに `:` があっても、bot の環境に `GIT_DIR` があっても、その
       `core.sshCommand` や `insteadOf` は効かない。W57 の12・13回目のレビュー。12回目の `GIT_CEILING_DIRECTORIES` は `:` で
-      区切られて効かなかった）で走らせるので、ワークスペースの設定（`remote.<name>.uploadpack`・`core.sshCommand`・credential helper・
+      区切られて効かなかった。その git ディレクトリの HEAD は `main` ではなく `clord-neutral-<乱数>` を指すので、bot の global の
+      `includeIf "onbranch:main"` も当たらない — W57 の14回目のレビュー。`includeIf "gitdir:/**"` はどの git ディレクトリにも当たる
+      ので効く。これは bot 自身の global の設定で、避けられない）で走らせるので、ワークスペースの設定（`remote.<name>.uploadpack`・`core.sshCommand`・credential helper・
       `insteadOf`）は効かない。bot の global の設定と環境（ssh の鍵・`GIT_SSH_COMMAND`・global の credential helper）は効くので、
       ふつうの ssh / https の remote はそのまま使える。調べるだけの git の呼び出しはすべて `core.fsmonitor=false`・
       `core.hooksPath=/dev/null`・`protocol.ext.allow=never` で走らせ（ワークスペースが仕込んだ fsmonitor のコマンドや hook は
       動かない。`-c` は git が起こすサブモジュールの git にも届く）、bot の秘密（`SENSITIVE_ENV_KEYS`、#353）は子プロセスの環境から
-      除く。clean/smudge フィルタ（`.gitattributes` と `filter.<名前>.clean`）は `git status` が走らせうる（既知の限界）。
+      除く。**bot の環境にあるリポジトリを指す変数**（`GIT_DIR`・`GIT_COMMON_DIR`・`GIT_WORK_TREE`・`GIT_INDEX_FILE`・
+      `GIT_OBJECT_DIRECTORY`・`GIT_ALTERNATE_OBJECT_DIRECTORIES`・`GIT_NAMESPACE`・`GIT_CEILING_DIRECTORIES`・
+      `GIT_DISCOVERY_ACROSS_FILESYSTEM`・`GIT_CONFIG`）も、調べるだけの git の呼び出しからはすべて除く（W57 の14回目のレビュー。
+      `GIT_COMMON_DIR` があるとそのリポジトリの `core.sshCommand` が走り、`GIT_DIR` がクリーンなリポジトリを指していると、
+      どのワークスペースもそのリポジトリとして読まれてクリーンと判定され、唯一のコピーごと消えていた）。呼び出しはそれぞれ
+      `cwd` か `--git-dir` か、自分で渡す `GIT_DIR` でリポジトリを決める。clean/smudge フィルタ（`.gitattributes` と `filter.<名前>.clean`）は `git status` が走らせうる（既知の限界）。
     - remote に聞けない（失敗・打ち切り）ときは `sub: unpushed commits unknown (ls-remote failed)` として残す。聞くのは確かめる
       追跡 ref があるときだけなので、ネットワークの無いホストでも、手元で何もコミットを作っていないサブモジュールは妨げにならない。
     - 使い回しの鍵は remote の URL で、ローカルのパス（`../sub.git` など）はそのリポジトリの場所から解決した絶対パスにする
