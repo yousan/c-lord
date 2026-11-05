@@ -72,11 +72,12 @@ async def test_kill_reported_failed_but_window_died_sleeps_whole_fleet_in_one_ti
     assert len(resident) >= 3, f"over was 1, but one tick left {sorted(resident)} resident"
 
 
-async def test_unreadable_residents_after_a_failed_kill_stop_this_tick() -> None:
-    """Review of e971435: a failed kill whose second look cannot be read stops the
-    making-up for this tick (tmux is not answering, and a kill that timed out may
-    still be carried out). The next tick counts again and makes up then."""
-    resident = {1, 2, 3}
+async def test_two_unanswered_re_reads_end_the_tick() -> None:
+    """Review of e971435 / db65406: under a stall, one failed kill whose re-read gets
+    no answer is still made up for (only the oldest may be stuck), a second one ends
+    the tick — a kill that timed out may still be carried out. Once tmux answers
+    again, the next tick makes up for both (#1192)."""
+    resident = {1, 2, 3, 4}
     stalled = {"on": False, "once": True}
 
     def resident_fn() -> set[int]:
@@ -85,16 +86,17 @@ async def test_unreadable_residents_after_a_failed_kill_stop_this_tick() -> None
         return set(resident)
 
     async def impl(*, channel, reason, idle_label):  # noqa: ANN001
-        if channel.id == 3:
-            stalled["on"], stalled["once"] = stalled["once"], False
+        if channel.id in (3, 4):
+            if channel.id == 4 and stalled["once"]:
+                stalled["on"], stalled["once"] = True, False
             return False
         resident.discard(channel.id)
         return True
 
     loop = ResidentCapLoop(
         _bot(cog=_cog(AsyncMock(side_effect=impl))),
-        _repo([_rec(i, hours_ago=i) for i in range(1, 4)]),
-        limit=2,
+        _repo([_rec(i, hours_ago=i) for i in range(1, 5)]),
+        limit=3,
         resident_fn=resident_fn,
         in_flight_fn=set,
         mem_fn=lambda: OK,
@@ -102,10 +104,50 @@ async def test_unreadable_residents_after_a_failed_kill_stop_this_tick() -> None
     )
     with patch("c_lord.tmux.pane_turn_states", return_value=NONE):
         assert await loop._enforce_cap() == 0
-        assert resident == {1, 2, 3}
-        stalled["on"] = False  # tmux answers again: the next tick makes up (#1192)
+        assert resident == {1, 2, 3, 4}
+        stalled["on"] = False  # tmux answers again
         assert await loop._enforce_cap() == 1
-    assert resident == {1, 3}
+    assert resident == {1, 3, 4}
+
+
+async def test_a_stuck_oldest_with_unanswered_re_reads_does_not_hold_the_cap() -> None:
+    """Review of db65406: the oldest's kill always fails with the window staying and
+    its re-read never answers, while the count does. Stopping at the first
+    unanswered re-read picked the same victim first every tick and slept nothing
+    behind it — 50 ticks later all 5 were still resident (limit 3)."""
+    resident = {1, 2, 3, 4, 5}
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        if channel.id == 5:
+            return False
+        resident.discard(channel.id)
+        return True
+
+    loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, 5, 3)
+    with (
+        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
+        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        for _ in range(50):
+            await loop.tick()
+    assert len(resident) <= 3, f"still {sorted(resident)} resident after 50 ticks (limit 3)"
+
+
+async def test_the_unanswered_re_read_warning_is_sampled(caplog) -> None:  # noqa: ANN001
+    """Review of db65406: for as long as a stall lasts the WARNING came once per tick.
+    Sampled like the loop's other repeated lines ("cap-stuck", "cap-short")."""
+    resident = {1, 2, 3, 4, 5}
+    loop = _production_loop(_cog(AsyncMock(return_value=False)), resident, 5, 4)
+    with (
+        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
+        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        for _ in range(10):
+            await loop.tick()
+    unanswered = [r for r in caplog.records if "did not answer the re-read" in r.getMessage()]
+    assert len(unanswered) <= 1, f"{len(unanswered)} WARNINGs in 10 ticks"
 
 
 def _production_loop(cog, resident: set[int], n: int, limit: int) -> ResidentCapLoop:  # noqa: ANN001

@@ -783,6 +783,7 @@ class ResidentCapLoop:
 
         label = f"{self._limit}本"
         slept = 0
+        unanswered = 0  # failed sleeps whose re-read tmux did not answer (#1219)
         for thread_id in victims:
             if slept >= over:
                 break
@@ -811,14 +812,25 @@ class ResidentCapLoop:
                 elif left is None:
                     # #1219 (review): tmux is not answering, and a kill that
                     # timed out may still be carried out — making up for each
-                    # one slept the whole fleet under a sustained stall. Stop for
-                    # this tick; the next one counts again.
-                    logger.warning(
-                        "%s resident-cap: the sleep failed and tmux did not answer the "
-                        "re-read — not making up for it this tick",
-                        log_ctx(thread_id=thread_id),
-                    )
-                    break
+                    # one slept the whole fleet under a sustained stall. But
+                    # stopping at the first one let a stuck oldest hold the cap
+                    # above its limit for good (review of db65406). So one such
+                    # failure per tick is made up for; a second ends the tick
+                    # (about over+1 at worst), and the next tick counts again.
+                    unanswered += 1
+                    quiet = self._quiet.sample("cap-reread-unanswered")
+                    if quiet.emit:
+                        logger.warning(
+                            "%s resident-cap: the sleep failed and tmux did not answer the "
+                            "re-read — %s%s",
+                            log_ctx(thread_id=thread_id),
+                            "making up for it once this tick"
+                            if unanswered == 1
+                            else "not making up for more this tick",
+                            quiet.suffix,
+                        )
+                    if unanswered > 1:
+                        break
         if slept:
             logger.info("resident-cap: slept %d workspace(s) to stay under the limit", slept)
         if slept < over:
