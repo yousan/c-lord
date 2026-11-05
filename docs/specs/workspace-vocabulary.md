@@ -417,12 +417,17 @@ stat できないときも、一覧から黙って外さず `status unknown (che
   上の表の「追跡されていて作業ツリーだけ違う」の行が引き続き効く
 
 残した理由は **INFO** に出る（どのディレクトリを、どの行のせいで）。サマリ行は
-「c-lord のファイルだけだったので消した件数」「利用者の作業で残した件数」
-「git でないので残した件数」を分けて出す:
+「c-lord のファイルだけだったので消した件数」「コミットしていないファイルで残した件数」
+「作業ツリーは clean で、push していないコミット・stash だけで残した件数」
+「git でないので残した件数」を分けて出す。1 つのディレクトリは 1 つの理由にだけ数え、
+両方あるときはコミットしていないファイルの側に数える（#1250 — それまでは push していない
+コミットだけのものも「uncommitted user work」に数えていて、本番では残した 10 件のうち
+8 件がそれだった）:
 
 ```
 orphan sweep: keeping /…/1535252745026670623 — uncommitted user work: ?? .env.dev-local
-orphan sweep: removed 60 directory(ies) (9.6 GB; 60 held only c-lord's own files), kept 20 (20 with uncommitted user work, 0 not a git repo, 0 unsafe or failed to remove)
+orphan sweep: keeping /…/1505951360342818887 — 2 unpushed commit(s) on no remote branch
+orphan sweep: removed 60 directory(ies) (9.6 GB; 60 held only c-lord's own files), kept 20 (12 with uncommitted user work, 8 with unpushed commits or stashes only, 0 not a git repo, 0 unsafe or failed to remove)
 ```
 
 **上限は「実際に消せた数」で数える**（#593 の教訓）。試行回数で数えると、先頭に
