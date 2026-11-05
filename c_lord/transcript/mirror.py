@@ -62,6 +62,7 @@ from .formatter import (
     bash_input_command,
     is_harness_user_record,
     is_task_notification,
+    is_user_interrupt,
     local_command_record,
     render_event,
 )
@@ -1540,6 +1541,13 @@ class TranscriptMirror:
                     # instruction. The runner's poll loop needs it to tell its own
                     # turn's ending from that of the turn its prompt displaced.
                     wakeup = _is_scheduled_wakeup(event)
+                    if is_user_interrupt(event):
+                        # Review of #1285: an Esc'd turn writes no turn_duration, so
+                        # ``_turn_open`` stays set and a notification / wakeup that
+                        # starts the next turn would not reset this — that turn's
+                        # first API-error line was hidden. #913's turn-open logic
+                        # is left as is; only the per-turn line memory ends here.
+                        self._turn_api_error_lines.clear()
                     if _is_user_prompt(event) or wakeup:
                         turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                         _limit_reported = False

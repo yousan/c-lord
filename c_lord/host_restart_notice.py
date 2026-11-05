@@ -39,7 +39,7 @@ import discord
 from .api_error import api_error_text
 from .claude.types import UsageLimit
 from .discord_failures import DISCORD_CALL_FAILURES
-from .transcript.formatter import is_harness_user_record
+from .transcript.formatter import USER_INTERRUPT_PREFIX, is_harness_user_record
 from .transcript.resolver import ThreadSessionResolver, derive_project_dir
 from .usage_limit import extract_usage_limit, is_rate_limit_event
 from .utils.logger import log_ctx
@@ -79,7 +79,7 @@ _TAIL_MAX_BYTES = 32 * 1024 * 1024
 _DEDUP_SCAN_MESSAGES = 50
 
 # A turn the user stopped themselves (Esc): Claude stopped because it was told to.
-_INTERRUPTED_PREFIX = "[Request interrupted by user"
+_INTERRUPTED_PREFIX = USER_INTERRUPT_PREFIX
 
 # Slash-command bookkeeping the formatter's well-formed-record test does not
 # cover (a lone or unclosed tag). Like the formatter's harness rows, nobody
