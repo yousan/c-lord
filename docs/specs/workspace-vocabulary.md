@@ -195,9 +195,33 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
 #903 まではどちらも「クリーン」と見なされて消えていた（2026-10-16 に本番コードで確認）:
 
 - **どの remote ブランチにも載っていないコミット** — Claude がブランチに commit したが
-  push していない作業。HEAD（detached を含む）・すべてのローカルブランチ・stash から辿れて、
-  `refs/remotes/*` のどれからも辿れないコミットを数える（`git rev-list --count HEAD --branches refs/stash --not --remotes`）。
+  push していない作業。HEAD（detached を含む）と**手元の ref**（ブランチ・`refs/original`・`refs/keep/*` など。
+  `refs/remotes/*`・別に数える stash・タグ・notes を除く）から辿れて、`refs/remotes/*` のどれからも辿れないコミットを数える
+  （#1198。以前はブランチと HEAD だけを見ていて、`refs/original` などにしか無いコミットを消していた）。
+  タグと notes を数えないのは、fetch したもの（push したもの）と手元だけのものを見分けられず、数えると
+  `git fetch --tags` や notes を取り込んだワークスペースを永久に残してしまうため。タグや notes にしか無いコミットは
+  消える（既知の限界）。
+  annotated tag を指す ref も中のコミットまで辿る（ref の名前のまま `git rev-list` に渡す）。
+  - **ワークスペース自身のタグにしか無いコミットは数えない**（既知の限界。サブモジュールではタグも数える）。
+    手元では fetch したタグと手で打った `git tag wip` を見分けられず、タグを数えると、タグを取ってきただけの
+    ワークスペース（`--depth=1` の clone のあとの `git fetch --tags`、消されたブランチに打たれたタグを持つ `--local` の clone）が
+    すべて「未 push」になって消せなくなったため（`ls-remote` のブランチ先端では、shallow の境界の下や消えたブランチのタグを確かめられない）。
   1 件でもあれば残す。remote が1つも無いリポジトリでは全コミットがこれに当たる（他にどこにも無いので）。
+  リンクされた worktree（`git worktree add --detach` で別の場所に作ったもの）の detached HEAD と、その worktree だけの ref
+  （`refs/worktree/*`・`refs/bisect/*`、`.git/worktrees/<名前>/` の中のファイル。シンボリックリンクのディレクトリも git と同じく辿る）からも数える（#1198。以前は数えず、
+  そのコミットをワークスペースごと消していた）。ファイルを読むだけで git の呼び出しは増えない。読めない・壊れているときは
+  `unpushed commits unknown (git rev-list failed or worktree unreadable)` として残す。数える起点は標準入力で `git rev-list --stdin` に渡す（ref が何万あってもコマンドラインがあふれない）。
+  - **git の呼び出しはどれも 60 秒で打ち切り、打ち切りは「分からない」として残す**（#1198。`git clone` だけは打ち切らない）。
+    打ち切るときは、git が起こしたサブモジュールの `git status` やフィルタもまとめて止める（git は自分のプロセスグループで動かす）。
+    remote に聞く `git ls-remote` も同じで、打ち切ると ssh・`git-remote-https`・`upload-pack` などの子もまとめて止める（打ち切りは 20 秒のまま）。
+    調べるだけの git は任意のロックを取らない（`GIT_OPTIONAL_LOCKS=0`。`git status` が `index.lock` を持ったまま止められると、
+    残したワークスペースで次の `git commit` が失敗していた）。`git status` 自体が打ち切られたときの理由は `status unknown (git timed out)`（「git リポジトリではない」とは書かない）。
+    「分からない」を「stash 無し」「ブランチ無し」「サブモジュール無し」と読む箇所は無い。partial clone（`--filter=blob:none`）で
+    オブジェクトが欠けていても、調べる途中でネットワークから取りに行かない（`GIT_NO_LAZY_FETCH=1`。git 2.44 未満では効かず、そのときは打ち切りが守る）。
+  - **サブモジュールのブランチを push したあと remote 側で消すと、手元に残った古い `refs/remotes/origin/<branch>` を
+    「push 済み」と信じる**（既知の限界。前から）。remote で消えたことを知るにはネットワークに聞く必要があり、サブモジュールでは聞かない。
+  - **reflog にしか無いコミットは数えない**（既知の限界。ワークスペースでもサブモジュールでも）。`--reflog` まで数えると、
+    `--amend` で書き換えた前のコミットのために 90 日間ワークスペースを残すことになるため。
   - **push 済みかは remote に聞いて確かめる。** session dir は `main` だけを取る clone なので、作業ブランチを
     push しても手元に `origin/<branch>` ができず、手元の ref だけでは「未 push」に見える。だから
     **ほかに残す理由が無い dir だけ**、消す直前に `git ls-remote --heads` で remote のブランチ先端を取り、
@@ -236,7 +260,7 @@ session cleanup: keeping /…/1559120173389062204 — uncommitted user work: !! 
 
 **`/workspace-cleanup` も残した理由を同じ言い方で出す**（#1016）。Discord の「⚠️ Dirty — not removed」欄の
 各行は `` `<パス>` — 2 unpushed commit(s) on no remote branch `` / `` `<パス>` — uncommitted user work: !! .env `` の形で、
-dry run の「Would skip」欄も同じ理由を出す。stash は push していないコミットとは別に `1 stash entry` と書く（#1045。以前は stash のコミットが `2 unpushed commit(s)` と数えられていた）。`refs/stash` が在れば、reflog が空でも（`git reflog expire` の後や `update-ref` で置いた stash）最低1件と数えて残す（#1080。以前は 0 件と数えてフォルダごと stash を消していた）。**サブモジュールの中の stash も数える**（#1121）。サブモジュールの stash は `<ワークスペース>/.git/modules/<名前>` にあってフォルダと一緒に消えるのに、親の `git status` にも `refs/stash` にも出ないため、以前は clean と読んで stash ごと消していた。理由は `sub: 1 stash entry` のようにサブモジュールのパス付きで出す（入れ子は3段まで）。`.gitmodules` に載っていない、`git add` しただけの入れ子のリポジトリ（gitlink）の stash も同じように数える（#1207。以前は `.gitmodules` が無いと見に行かず、stash ごと消していた）。**チェックアウトの無いサブモジュールも見る**（#1181）: `git submodule deinit` や `git rm` の後はフォルダに `.git` が無くなるが、stash は `.git/modules/<名前>` に残っていてフォルダと一緒に消える。そこで `.git/modules` の下の git ディレクトリのうちチェックアウトに対応しないものも確かめ、モジュール名付きで理由に出す（以前はチェックアウトされているものだけを見ていて、stash ごと消していた）。残すかどうかと理由は**同じ1回の `git status` から**決める（2回取ると、間で `ls-remote` の答えが変わったとき理由が空になった）。`/workspace-delete` で残したときは `ℹ️ Session directory kept — <理由>` と出す。ログは INFO 1 行
+dry run の「Would skip」欄も同じ理由を出す。stash は push していないコミットとは別に `1 stash entry` と書く（#1045。以前は stash のコミットが `2 unpushed commit(s)` と数えられていた）。`refs/stash` が在れば、reflog が空でも（`git reflog expire` の後や `update-ref` で置いた stash）最低1件と数えて残す（#1080。以前は 0 件と数えてフォルダごと stash を消していた）。**サブモジュールの中の stash も数える**（#1121）。サブモジュールの stash は `<ワークスペース>/.git/modules/<名前>` にあってフォルダと一緒に消えるのに、親の `git status` にも `refs/stash` にも出ないため、以前は clean と読んで stash ごと消していた。理由は `sub: 1 stash entry` のようにサブモジュールのパス付きで出す（入れ子は3段まで）。`.gitmodules` に載っていない、`git add` しただけの入れ子のリポジトリ（gitlink）の stash も同じように数える（#1207。以前は `.gitmodules` が無いと見に行かず、stash ごと消していた）。**チェックアウトの無いサブモジュールも見る**（#1181）: `git submodule deinit` や `git rm` の後はフォルダに `.git` が無くなるが、stash は `.git/modules/<名前>` に残っていてフォルダと一緒に消える。そこで `.git/modules` の下の git ディレクトリのうちチェックアウトに対応しないものも確かめ、モジュール名付きで理由に出す（以前はチェックアウトされているものだけを見ていて、stash ごと消していた）。**サブモジュールの中の、push していないコミットも数える**（#1198）。チェックアウトされているサブモジュール・`.gitmodules` の無い入れ子のリポジトリ・チェックアウトの無い `.git/modules` の git ディレクトリのどれでも、**手元のすべての ref**（ブランチ・タグ・notes・`refs/original`・`refs/keep/*` などと HEAD。`git rev-list --all`。stash は別に数えるので除く）と、リンクされた worktree の detached HEAD・その worktree だけの ref（`refs/worktree/*`・`refs/bisect/*`。`--all` は git 2.43 では他の worktree のこれらを見ないのでファイルから読む）から辿れて、remote ブランチ（`refs/remotes/*`）から辿れないコミットがあれば残す理由に数え、`sub: 1 unpushed commit(s)` と出す。チェックアウトされていても親の `git status` には出ない場合がある（HEAD を記録済みのコミットに戻したがブランチにコミットが残っている／親がサブモジュールの新しいコミットを記録して push した）ため、以前は deinit / `git rm` の後でもチェックアウト中でも、そのコミットをフォルダごと消していた。remote の無い入れ子のリポジトリは、すべてのコミットがそこにしか無いので残す。**タグ（`refs/tags/*`）は「載っている」証にしない**。タグは消す対象の `.git/modules/<名前>` の中にあり、手元では fetch したタグと手で打った `git tag wip` を見分けられないため（タグを証にしていたときは、タグを打った detached のコミットを唯一のコピーごと消していた）。git が数えられなかったとき（どこかの ref・worktree の HEAD が指すオブジェクトが無い、打ち切られた、を含む）は `sub: unpushed commits unknown (git failed)`、worktree の HEAD や ref のファイルが読めない・中身がオブジェクト名でない・`worktrees/` を一覧できないときは `sub: unpushed commits unknown (worktree HEAD unreadable)` として残す。見るのは手元の remote-tracking ref だけで、ネットワークには出ない。そのため **shallow なサブモジュールが branch の先端より下に固定されていると、push 済みでも未 push と読んで残す**。**上流のブランチが消されたコミット（squash merge した PR のブランチ）に固定されたサブモジュールも残す**。**どのブランチにも無いリリースタグに固定して deinit したサブモジュールも残す**（タグを証にしないため）。**`--single-branch` で初期化したサブモジュールが、既定でない remote ブランチの push 済みコミットに固定されていても残す**（そのブランチの remote-tracking ref が手元に無いため）。**fetch したタグや notes が、上流で消されたブランチのコミットを指していても残す**。**`submodule update --init` で取り込んだ、上流のどのブランチにも無いタグがあっても残す**（手元の ref はすべて数えるため。消したリリースブランチに打たれたタグなど。何もしていないワークスペースでも `sub: 1 unpushed commit(s)` と出て自動では消えない。消してよいと分かっているなら、ワークスペースの中でそのタグを消す（`git -C <ワークスペース>/sub tag -d <タグ>`）か、ワークスペースを手で消す）。**worktree の HEAD や ref が無いオブジェクトを指しているときも残す**（数えられないので「分からない」）。リポジトリの HEAD がまだコミットを持たない（unborn）だけなら、それは数えに影響しない。どれも既知の「残しすぎ」で、受け入れている（作業を失うほうが、残しすぎより重い）。`.gitmodules` の無い入れ子のリポジトリ（`.git` がディレクトリ）が持つ自分の `.git/modules` も同じように見る（#1198。以前はワークスペースの `.git/modules` だけを見ていて、入れ子のリポジトリの中で deinit したサブモジュールのコミットや stash を消していた）。`.gitmodules` の無い入れ子のリポジトリは深さに関わらず（3段まで）見る。3段より深いところにチェックアウトされたリポジトリがあれば、`a/b/c: nested repos too deep to check` として残す（#1198。以前は黙って見ずに消していた。`.git/modules` の巡回の上限も同じく `modules too deep to check` で残す）（#1227。以前はワークスペース直下の索引だけを見ていて、チェックアウト済みのサブモジュールの中の入れ子のリポジトリの stash を消していた）。git の呼び出しは、ワークスペースの `git ls-files` 1回に加えて、チェックアウトされたサブモジュール1つにつき3回（stash の `rev-parse`・未 push の `rev-list`・入れ子を探す `ls-files`。いちばん深い段でも、さらに深いものが無いか確かめるために `ls-files` を打つ）、チェックアウトの無い git ディレクトリ1つにつき2回（`rev-parse`・`rev-list`）。リンクされた worktree の HEAD と ref はファイルから読むので、git の呼び出しは増えない。#1181 はチェックアウト済みのサブモジュールを1回に抑えていたが、消さないことを優先した。残すかどうかと理由は**同じ1回の `git status` から**決める（2回取ると、間で `ls-remote` の答えが変わったとき理由が空になった）。`/workspace-delete` で残したときは `ℹ️ Session directory kept — <理由>` と出す。ログは INFO 1 行
 （`Keeping session dir <パス> (thread_id=…) — <理由> (#1016)`）。以前は一律
 「session directory has uncommitted changes」で、`git status` に何も出ないフォルダの理由が分からなかった。
 

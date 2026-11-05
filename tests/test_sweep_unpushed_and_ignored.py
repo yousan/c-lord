@@ -224,14 +224,16 @@ def test_an_ls_remote_timeout_keeps_the_dir(tmp_path: Path, monkeypatch) -> None
     _git(ws, "commit", "-q", "--allow-empty", "-m", "done")
     _git(ws, "push", "-q", "origin", "feature/done")
 
-    real_run = subprocess.run
+    # ls-remote goes through session_dir._run (Popen, killed by group — #1198)
+    real_popen = subprocess.Popen
 
-    def hanging_run(args, *a, **kw):
-        if "ls-remote" in args:
-            raise subprocess.TimeoutExpired(args, kw.get("timeout") or 0)
-        return real_run(args, *a, **kw)
+    class HangingPopen(real_popen):  # type: ignore[misc, valid-type]
+        def communicate(self, input=None, timeout=None):  # noqa: A002, ANN001, ANN201
+            if "ls-remote" in self.args and timeout is not None and timeout > 5:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return super().communicate(input, timeout)
 
-    monkeypatch.setattr(session_dir.subprocess, "run", hanging_run)
+    monkeypatch.setattr(session_dir.subprocess, "Popen", HangingPopen)
 
     assert _sweep(ws, tmp_path) is DirOutcome.KEPT_DIRTY
 
@@ -244,14 +246,15 @@ def test_ls_remote_runs_only_for_a_dir_that_would_otherwise_be_removed(
     他の理由で残る dir・未 push の無い dir ではネットワークを叩かない。
     """
     calls: list[list[str]] = []
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
 
-    def counting_run(args, *a, **kw):
-        if "ls-remote" in args:
-            calls.append(list(args))
-        return real_run(args, *a, **kw)
+    class CountingPopen(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, args, **kw):  # noqa: ANN001, ANN003
+            if "ls-remote" in args:
+                calls.append(list(args))
+            super().__init__(args, **kw)
 
-    monkeypatch.setattr(session_dir.subprocess, "run", counting_run)
+    monkeypatch.setattr(session_dir.subprocess, "Popen", CountingPopen)
 
     (tmp_path / "a").mkdir()
     plain = _single_branch_clone(tmp_path / "a")

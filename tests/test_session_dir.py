@@ -152,7 +152,7 @@ class TestCreateSessionDir:
         own API and is unrelated to how answers are delivered."""
         base = str(tmp_path / "sessions")
 
-        def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
+        def fake_run(args, cwd=None, **kwargs):  # noqa: ANN001, ANN003 — test helper
             # Simulate git clone success by creating the target dir.
             if "clone" in args:
                 Path(args[-1]).mkdir(parents=True, exist_ok=True)
@@ -193,7 +193,7 @@ class TestCreateSessionDir:
         monkeypatch.setenv("CLORD_BRIDGE_MODE", "skill")
         base = str(tmp_path / "sessions")
 
-        def fake_run(args, cwd=None):  # noqa: ANN001 — test helper
+        def fake_run(args, cwd=None, **kwargs):  # noqa: ANN001, ANN003 — test helper
             if "clone" in args:
                 Path(args[-1]).mkdir(parents=True, exist_ok=True)
             return MagicMock(returncode=0, stderr="", stdout="")
