@@ -46,6 +46,8 @@ _seen_stamp: tuple[int, int] | None = None
 # The version of the file the last failed read was logged for (#1108): retried
 # on every unknown webhook (#1075), but logged once per version, not per message.
 _failed_stamp: tuple[int, int] | None = None
+# The version of the file whose non-id entries were last reported (same rule).
+_skipped_stamp: tuple[int, int] | None = None
 # The ids this process registered itself (#1176). Whenever the file is read and
 # one of them is missing — it could not be written while the file was
 # unreadable (#1109), or the file was replaced — it is written then, because
@@ -92,7 +94,33 @@ def _read_file(path: Path, *, quiet: bool = False) -> set[int] | None:
         return None
     if not isinstance(raw, list):
         return set()
-    return {int(x) for x in raw if isinstance(x, int | str) and str(x).isdigit()}
+    ids: set[int] = set()
+    skipped: list[object] = []
+    for x in raw:
+        # ASCII digits only, like the .env IDs (#1084): ``"²".isdigit()`` is True
+        # and ``int("²")`` raised on every webhook message (review of #1218).
+        text = str(x) if isinstance(x, int | str) and not isinstance(x, bool) else ""
+        if text.isascii() and text.isdigit():
+            ids.add(int(text))
+        else:
+            skipped.append(x)
+    if skipped:
+        _report_skipped(path, skipped)
+    return ids
+
+
+def _report_skipped(path: Path, skipped: list[object]) -> None:
+    """One WARNING per version of the file for entries that are not ids (#1108's rule)."""
+    global _skipped_stamp
+    stamp = _stamp(path)
+    if stamp == _skipped_stamp:
+        return
+    _skipped_stamp = stamp
+    logger.warning(
+        "voice webhooks: %s has entries that are not webhook ids, ignored: %s",
+        path,
+        ", ".join(repr(x) for x in skipped),
+    )
 
 
 def _load(*, refresh: bool = False) -> set[int]:
@@ -232,7 +260,9 @@ def is_voice_webhook(webhook_id: int | None) -> bool:
         ):
             # #1176: ours is not on disk yet — try again, quietly. #1204: nor
             # if the file was removed — our own voices may be all that posts.
-            _flush_ours(registry_path(), quiet=True)
+            # #1222: quiet only once a failure has been reported (``_unwritten``);
+            # a removed file that cannot be recreated is otherwise never logged.
+            _flush_ours(registry_path(), quiet=_unwritten)
         if webhook_id in _load():
             return True
         # Unknown here — another instance may have registered it since (#1024).
@@ -246,11 +276,12 @@ def is_voice_message(message: object) -> bool:
 
 
 def _reset_for_tests() -> None:
-    global _ids, _seen_stamp, _failed_stamp, _unwritten, _next_retry
+    global _ids, _seen_stamp, _failed_stamp, _skipped_stamp, _unwritten, _next_retry
     with _lock:
         _ids = None
         _seen_stamp = None
         _failed_stamp = None
+        _skipped_stamp = None
         _unwritten = False
         _next_retry = 0.0
         _ours.clear()

@@ -761,6 +761,10 @@ class ApiServer:
             prompt, err = _text(data, "prompt")  # #1208: no more str(["x"]) -> "['x']"
             if err is not None:
                 return err
+            if not prompt:
+                # #1229: POST refuses an empty prompt; PATCH saved it with a 200,
+                # and every run after that woke Claude with no instruction.
+                return web.json_response({"error": "prompt is required"}, status=400)
             patch_kwargs["prompt"] = prompt
         if "interval_seconds" in data:
             interval = _task_int(data["interval_seconds"])

@@ -1113,6 +1113,11 @@ class TranscriptMirror:
         if _LIVE_MIRRORS.get(self.thread_id) is self:
             turn_end_bus.note_tailing(self.thread_id, found)
 
+    def _note_pending_claim(self, key: str | None) -> None:
+        """The named transcript has not appeared yet, or now has (#1223)."""
+        if _LIVE_MIRRORS.get(self.thread_id) is self:
+            turn_end_bus.note_pending_claim(self.thread_id, key)
+
     async def stop(self) -> None:
         """Cancel the tail task and wait for it to settle.  Safe to call repeatedly."""
         task = self._task
@@ -1125,6 +1130,7 @@ class TranscriptMirror:
         if _LIVE_MIRRORS.get(self.thread_id) is self:
             del _LIVE_MIRRORS[self.thread_id]
             turn_end_bus.note_tailing(self.thread_id, False)
+            turn_end_bus.note_pending_claim(self.thread_id, None)
         if self._subagent_log is not None:
             with contextlib.suppress(Exception):
                 await self._subagent_log.stop()
@@ -1416,6 +1422,7 @@ class TranscriptMirror:
                     unresolved_after=self._unresolved_after,
                     on_start=self._read_back if self._resumed else None,
                     on_resolved=self._note_resolved,
+                    on_pending_claim=self._note_pending_claim,
                 ):
                     await queue.put(event)
             except asyncio.CancelledError:

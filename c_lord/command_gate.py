@@ -56,8 +56,11 @@ _Resolver = Callable[..., Awaitable[Any]]
 
 def _trusted_bot_ids() -> set[int]:
     """Bot ids allowed to drive c-lord like a human (``CLORD_TRUSTED_BOT_IDS``)."""
-    raw = os.getenv("CLORD_TRUSTED_BOT_IDS", "")
-    return {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()}
+    # #1218: ASCII digits only, like every other ID (#1084). ``"²".isdigit()``
+    # is True but ``int("²")`` raises — every bot message then raised, and the
+    # correctly listed bots were ignored too. ``load_config`` warns about the rest.
+    parts = (x.strip() for x in os.getenv("CLORD_TRUSTED_BOT_IDS", "").split(","))
+    return {int(x) for x in parts if x.isascii() and x.isdigit()}
 
 
 def is_message_authorized(
