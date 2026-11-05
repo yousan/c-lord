@@ -1079,6 +1079,9 @@ class ApiServer:
 
         Returns (200): ``{"status": "slept" | "not_resident", "thread_id": "..."}``
         — ``not_resident`` when the thread had no window to close.
+        Returns (503): ``{"status": "failed", "thread_id": "..."}`` when the sleep
+        could not close a window that may still be there (#1214) — a failed kill,
+        a tmux that did not answer, or its claude running in another session.
         """
         thread_id = _as_int(request.match_info.get("thread_id"))
         if thread_id is None:
@@ -1102,14 +1105,22 @@ class ApiServer:
                 return web.json_response({"error": "thread not found"}, status=404)
 
         try:
-            slept = bool(await impl(channel=channel, reason=WorkspaceReason.MANUAL))
+            slept = await impl(channel=channel, reason=WorkspaceReason.MANUAL)
         except Exception as exc:
             logger.exception("%s sleep: failed", log_ctx(thread_id=thread_id))
             return web.json_response({"error": str(exc)}, status=500)
 
-        status = "slept" if slept else "not_resident"
+        # #1214: three answers, not two. ``False`` is "could not close it, the
+        # window may still be there" (#1192); folding it into ``not_resident``
+        # told ``staging.sh release`` the bot had no window, so nobody noticed it.
+        if slept:
+            status, code = "slept", 200
+        elif slept is None:
+            status, code = "not_resident", 200
+        else:
+            status, code = "failed", 503
         logger.info("%s sleep via API: %s", log_ctx(thread_id=thread_id), status)
-        return web.json_response({"status": status, "thread_id": str(thread_id)})
+        return web.json_response({"status": status, "thread_id": str(thread_id)}, status=code)
 
     # ------------------------------------------------------------------
     # Thread message endpoint (/api/threads/{thread_id}/messages)

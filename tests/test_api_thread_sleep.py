@@ -5,6 +5,10 @@
 (``SessionManageCog._sleep_workspace_impl``) を呼ぶ。kill を自前でやらないのは、
 ミラーを先に止める (#379) ことと、``set_slept`` で次の発言を無言で復元すること
 を、二つ目の実装に写さないため。
+
+#1214: 眠らせ損ねた（kill が失敗して窓が残っているかもしれない、``False``）ときも
+``not_resident`` と返していた。``release`` はそれを「bot はその窓を持っていない」と読むので、
+残った常駐に誰も気づかない。眠らせ損ねは ``not_resident`` と区別して返す。
 """
 
 from __future__ import annotations
@@ -75,7 +79,8 @@ async def test_sleeps_the_thread_through_the_shared_implementation(repo) -> None
 
 
 async def test_a_thread_with_no_window_is_reported_not_resident(repo) -> None:
-    client = await _client(repo, _bot(impl=AsyncMock(return_value=False), thread=_thread()))
+    # ``None`` is the sleep's "there was no window" (#1192); ``False`` is a failure (#1214).
+    client = await _client(repo, _bot(impl=AsyncMock(return_value=None), thread=_thread()))
     try:
         resp = await client.post(f"/api/threads/{THREAD}/sleep")
         assert resp.status == 200
@@ -119,5 +124,18 @@ async def test_a_sleep_that_raises_is_500_not_a_crash(repo) -> None:
     try:
         resp = await client.post(f"/api/threads/{THREAD}/sleep")
         assert resp.status == 500
+    finally:
+        await client.close()
+
+
+async def test_a_failed_kill_is_not_reported_not_resident(repo) -> None:
+    """#1214: ``False`` (the window may still be there) must not read as "no window"."""
+    client = await _client(repo, _bot(impl=AsyncMock(return_value=False), thread=_thread()))
+    try:
+        resp = await client.post(f"/api/threads/{THREAD}/sleep")
+        body = await resp.json()
+        assert body.get("status") != "not_resident", "a failed kill was reported as not_resident"
+        assert resp.status == 503
+        assert body == {"status": "failed", "thread_id": str(THREAD)}
     finally:
         await client.close()
