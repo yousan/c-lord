@@ -2011,11 +2011,12 @@ class SessionManageCog(commands.Cog):
         tmux_mgr = await self._resolve_tmux_manager(parent_channel_id, thread_id=thread_id)
         if tmux_mgr is None:
             return False
-        # #1206: a stalled tmux (``tmux -V`` / ``show-option`` / ``list-windows``
-        # timing out) makes ``session_exists`` below answer "no window", which
-        # the resident cap counted as gone and never made up for. Could not tell
-        # is "still there".
-        if await asyncio.to_thread(tmux_mgr.window_present, thread_id) is None:
+        # #1206: one lookup that can say "did not answer". A stalled tmux
+        # (``tmux -V`` / ``show-option`` / ``list-windows`` timing out) made
+        # ``session_exists`` answer "no window", which the resident cap counted
+        # as gone and never made up for. Could not tell is "still there".
+        present = await asyncio.to_thread(tmux_mgr.window_present, thread_id)
+        if present is None:
             logger.warning(
                 "%s sleep: tmux did not answer — counted as still there",
                 log_ctx(thread_id=thread_id),
@@ -2025,7 +2026,7 @@ class SessionManageCog(commands.Cog):
         # Already asleep (or never resident): there is nothing to reclaim, and
         # going further would re-post the docker line on every tick — which is
         # how an invisible feature turns into a nuisance.
-        if not await asyncio.to_thread(tmux_mgr.session_exists, thread_id):
+        if not present:
             return None
 
         # Stop the mirror BEFORE the kill (#379): killing the pane can make the

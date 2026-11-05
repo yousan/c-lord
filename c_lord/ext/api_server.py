@@ -1387,10 +1387,17 @@ class ApiServer:
         for i, ch in enumerate(choices):
             if not isinstance(ch, dict):
                 return web.json_response({"error": f"choices[{i}] must be an object"}, status=400)
-            label = str(ch.get("label", "")).strip()
+            # #1208 (review): text, or absent / null — never ``str()`` of a list.
+            raw_label, raw_desc = ch.get("label"), ch.get("description")
+            for key, value in (("label", raw_label), ("description", raw_desc)):
+                if value is not None and not isinstance(value, str):
+                    return web.json_response(
+                        {"error": f"choices[{i}].{key} must be a string"}, status=400
+                    )
+            label = (raw_label or "").strip()
             if not label:
                 return web.json_response({"error": f"choices[{i}].label is required"}, status=400)
-            desc = str(ch.get("description", "")).strip()
+            desc = (raw_desc or "").strip()
             normalized.append((label, desc))
 
         raw = self.bot.get_channel(thread_id)

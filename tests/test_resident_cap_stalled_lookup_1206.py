@@ -133,3 +133,25 @@ def test_window_present_tells_no_window_from_no_answer() -> None:
         assert _stalled_mgr().window_present(3) is False
     with patch("c_lord.tmux._run", side_effect=_stalled):
         assert _stalled_mgr().window_present(3) is None
+
+
+# --- independent review of the #1206 fix: one lookup, not two ---
+
+
+async def test_stall_between_window_present_and_session_exists() -> None:
+    calls = {"n": 0}
+
+    def flaky(argv: list[str]) -> MagicMock:
+        if argv[:2] == ["tmux", "-V"]:
+            return MagicMock(returncode=0, stdout="tmux 3.4", stderr="")
+        calls["n"] += 1
+        if calls["n"] == 1:  # window_present's show-option answers
+            return MagicMock(returncode=0, stdout="3\n", stderr="")
+        return MagicMock(returncode=T._RUN_TIMEOUT_RETURNCODE, stdout="", stderr="timed out")
+
+    cog = _real_impl_cog(_stalled_mgr())
+    with patch("c_lord.tmux._run", side_effect=flaky):
+        out = await cog._sleep_workspace_impl(
+            channel=_thread3(), reason=MagicMock(), idle_label="x"
+        )
+    assert out is not None, "window_present said True, then a stalled session_exists -> None (gone)"

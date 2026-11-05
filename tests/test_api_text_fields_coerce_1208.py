@@ -152,3 +152,35 @@ async def test_strings_and_absent_fields_are_still_accepted(env: Env) -> None:
         "/api/mark-resume", json={"thread_id": 5, "session_id": "abc", "reason": "deploy"}
     )
     assert r.status == 201
+
+
+# --- independent review of the #1208 fix: /api/prompt-choice choices ---
+
+
+# --- #1208 neighbour: /api/prompt-choice still str()s labels
+@pytest.mark.parametrize("label", [["x"], 1])
+async def test_prompt_choice_label_must_be_a_string(env, label) -> None:  # noqa: F811
+    r = await env.c.post(
+        "/api/prompt-choice",
+        json={"thread_id": 5, "question": "q", "choices": [{"label": label}]},
+    )
+    sent = env.thread.send.await_args.kwargs.get("content") if env.thread.send.await_args else None
+    assert r.status == 400, f"{r.status}; sent={sent!r}"
+
+
+async def test_prompt_choice_description_null(env) -> None:  # noqa: F811
+    r = await env.c.post(
+        "/api/prompt-choice",
+        json={"thread_id": 5, "question": "q", "choices": [{"label": "a", "description": None}]},
+    )
+    sent = env.thread.send.await_args.kwargs.get("content")
+    assert "None" not in sent, f"{r.status}; sent={sent!r}"
+
+
+async def test_prompt_choice_label_null_is_required(env) -> None:  # noqa: F811
+    r = await env.c.post(
+        "/api/prompt-choice",
+        json={"thread_id": 5, "question": "q", "choices": [{"label": None}]},
+    )
+    assert r.status == 400
+    assert "label is required" in (await r.json())["error"]

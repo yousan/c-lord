@@ -81,6 +81,7 @@ def _cog(*, window_exists: bool = True, killed: bool = True) -> SimpleNamespace:
 
     tmux_mgr = MagicMock()
     tmux_mgr.session_exists = MagicMock(return_value=window_exists)
+    tmux_mgr.window_present = MagicMock(return_value=window_exists)  # #1206
     tmux_mgr.kill_session = MagicMock(return_value=killed)
     cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
 

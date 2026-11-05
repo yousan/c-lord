@@ -615,7 +615,8 @@ JSON strings. A number, `true`, a list or an object is a `400 {"error": "<field>
 and nothing is saved or posted (#1208 — before, it was accepted and saved through `str()`, so a
 task's `prompt: ["x"]` ran as the instruction `['x']`). Absent or `null` is the same as leaving the
 field out (`label` falls back to `AI`, `source` to `cli`, `reason` to `self_restart`; a `PATCH` with
-`"prompt": null` does not touch the prompt).
+`"prompt": null` does not touch the prompt). The same holds for each choice's `label` / `description`
+on `/api/prompt-choice` (`choices[0].label must be a string`; a `null` label is "label is required").
 
 Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,
 `channel_id`, `thread_id` or numeric ID in the path is a `400`, and a `PATCH` that fails this way

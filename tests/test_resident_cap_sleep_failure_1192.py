@@ -66,6 +66,7 @@ def _thread3() -> MagicMock:
 async def test_real_sleep_impl_kill_failure_is_not_window_gone() -> None:
     mgr = MagicMock()
     mgr.session_exists = MagicMock(return_value=True)  # the window stays
+    mgr.window_present = MagicMock(return_value=True)
     mgr.kill_session = MagicMock(return_value=False)  # tmux kill-window rc!=0 (timeout etc.)
     cog = _real_impl_cog(mgr)
     loop = ResidentCapLoop(
@@ -84,6 +85,7 @@ async def test_real_sleep_impl_no_window_reads_as_gone() -> None:
     """#1094 still holds: nothing to kill means the window left by itself."""
     mgr = MagicMock()
     mgr.session_exists = MagicMock(return_value=False)
+    mgr.window_present = MagicMock(return_value=False)
     cog = _real_impl_cog(mgr)
     loop = ResidentCapLoop(
         _bot(cog=cog, channels={3: _thread3()}),
@@ -102,6 +104,7 @@ async def test_real_sleep_impl_failed_kill_is_not_gone_even_if_the_recheck_says_
     of the rare "it really vanished in between" is one extra thread asleep."""
     mgr = MagicMock()
     mgr.session_exists = MagicMock(side_effect=[True, False])
+    mgr.window_present = MagicMock(return_value=True)
     mgr.kill_session = MagicMock(return_value=False)
     cog = _real_impl_cog(mgr)
     loop = ResidentCapLoop(
