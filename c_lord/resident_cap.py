@@ -107,6 +107,12 @@ EMERGENCY_LOW_FRACTION = 0.10
 #: 0.00) does not trip it, short enough to act before the host swaps itself flat.
 EMERGENCY_CONSECUTIVE_SAMPLES = 3
 
+#: How many cap ticks a victim whose sleep was attempted and failed stays behind
+#: every other candidate (#1219, W57 round 8). Bounded: deferred until the user
+#: came back, one transient failure kept the longest-idle workspace awake while
+#: younger ones were slept in its place. A repeat failure defers it again.
+DEFERRAL_TICKS = 10
+
 #: How often to sample memory. The cap itself is re-checked on the same tick;
 #: both reads are cheap (one ``/proc/meminfo`` read, one ``tmux list-panes -a``).
 _TICK_INTERVAL_SECONDS = 30.0
@@ -394,6 +400,31 @@ class ResidentCapLoop:
         # windows are closed rather than skipped — skipped, each one held a
         # slot forever and a live workspace was slept in its place (#1086).
         self._gone: set[int] = set()
+        # Threads whose sleep failed (#1219), mapped to *when* it last failed (a
+        # counter). Tried after every other candidate, in that order — oldest
+        # failure first, so a re-failure moves behind the others. Ordered by age
+        # instead, one window that can never be killed was retried ahead of a
+        # younger one that failed only once, which was never tried again (whole-
+        # branch review of 79fc532). Kept until the sleep succeeds, tmux answers
+        # "gone", the thread leaves the residents or its user uses it, or
+        # ``DEFERRAL_TICKS`` cap ticks pass.
+        self._deferred: dict[int, int] = {}
+        # Victims attempted last tick, by attempt order (review of 469a137). Any
+        # of them still counted next tick is deferred whatever its answer was:
+        # a window our checks keep reading as gone or slept while the count
+        # keeps it (another c-lord's pane, our own window with an old owner in
+        # another session) can then no longer take the front for good.
+        self._attempted: dict[int, int] = {}
+        # ``last_used_at`` of each attempted / deferred thread when it was
+        # attempted. A deferred thread whose ``last_used_at`` has changed since —
+        # its user came back — is an ordinary candidate again (review of 5b35a64).
+        self._attempt_last_used: dict[int, str | None] = {}
+        self._failures = 0
+        # The cap tick each deferred thread was deferred at (``DEFERRAL_TICKS``).
+        self._deferred_at: dict[int, int] = {}
+        self._cap_tick = 0
+        # Whether the last ``_sleep_one`` got as far as the sleep itself (#1219).
+        self._sleep_reached = False
         self._task: object | None = None
 
     @property
@@ -441,15 +472,41 @@ class ResidentCapLoop:
     # ── inputs ───────────────────────────────────────────────────────────
 
     def _resident(self) -> set[int]:
+        answer = self._resident_answer()
+        return set() if answer is None else answer
+
+    def _resident_answer(self) -> set[int] | None:
+        """The residents, or ``None`` when the read did not answer (#1219 review).
+
+        :func:`c_lord.tmux.resident_thread_ids` raises on a timed-out
+        ``list-panes``; a ``resident_fn`` says "could not read" by raising too.
+        """
         if self._resident_fn is not None:
-            with contextlib.suppress(Exception):
+            try:
                 return set(self._resident_fn())  # type: ignore[operator]
-            return set()
+            except Exception:
+                return None
         from .tmux import resident_thread_ids
 
-        with contextlib.suppress(Exception):
+        try:
             return resident_thread_ids()
-        return set()
+        except Exception:
+            return None
+
+    async def _left_residents(self, thread_id: int) -> bool | None:
+        """Whether a fresh read **answers** that *thread_id* is no longer resident (#1219).
+
+        ``True``: gone. ``False``: still there (the #1192 case — the thread is
+        deferred, and the next tick's next candidate makes up for it).
+        ``None``: tmux did not answer, so nothing can be said. Run off the event
+        loop: the read is ``tmux -V`` plus ``list-panes`` with 30 s timeouts each,
+        and it is asked once per failed victim (review of e971435).
+        """
+        # The same population as the count — every owner (review of 469a137).
+        # Read owned-only, our own window with an old ``@clord_owner`` (#503)
+        # whose kill failed read as gone and was never deferred.
+        answer = await asyncio.to_thread(self._resident_answer)
+        return None if answer is None else thread_id not in answer
 
     async def _turns_in_flight(self, candidates: set[int]) -> set[int]:
         """Everything in *candidates* with a turn running, by both kinds of evidence.
@@ -697,14 +754,45 @@ class ResidentCapLoop:
         # #1086: a thread Discord deleted holds memory nobody can use. Close it
         # whatever the count — and never count it: the cap is about live
         # workspaces, and counting a corpse slept a live one in its place.
-        await self._close_known_gone(self._resident())
-        resident = self._resident() - self._gone
+        # A read that did not answer says nothing about who is resident: skip
+        # the tick, and keep the memory of failed victims (#1219 review — read
+        # as "nobody", it emptied ``_deferred`` on every stalled tick).
+        answer = self._resident_answer()
+        if answer is None:
+            return 0
+        await self._close_known_gone(answer)
+        answer = self._resident_answer()
+        if answer is None:
+            return 0
+        resident = answer - self._gone
+        self._cap_tick += 1
+        for t, n in self._attempted.items():
+            if t in resident:
+                self._deferred[t] = max(n, self._deferred.get(t, 0))
+                self._deferred_at[t] = self._cap_tick
+        self._attempted = {}
+        # Bounded by the residents, and in time: after DEFERRAL_TICKS a deferred
+        # thread is back in plain LRU order (#1219, W57 round 8).
+        self._deferred = {
+            t: n
+            for t, n in self._deferred.items()
+            if t in resident and self._cap_tick - self._deferred_at.get(t, 0) < DEFERRAL_TICKS
+        }
+        self._deferred_at = {t: v for t, v in self._deferred_at.items() if t in self._deferred}
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
         if len(resident) <= self._limit:
             return 0
 
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
+        last_used = {rec.thread_id: rec.last_used_at for rec in records}
+        # Someone used a deferred workspace since it was attempted: its place in
+        # the queue is its idle time again, not the back (review of 5b35a64).
+        for t in [t for t in self._deferred if last_used.get(t) != self._attempt_last_used.get(t)]:
+            del self._deferred[t]
+        self._attempt_last_used = {
+            t: v for t, v in self._attempt_last_used.items() if t in self._deferred
+        }
 
         # Count only what **this** instance owns. One tmux server is shared by
         # every c-lord on the host (and by the operator's own hand-made
@@ -718,11 +806,10 @@ class ResidentCapLoop:
             return 0
 
         over = len(resident) - self._limit
-        # The whole LRU order, not just the oldest *over*: a candidate that
-        # cannot be slept (its thread is gone from Discord, a sleep that failed)
-        # is made up for by the next one, so one tick gets back under the limit
-        # (#1033 — slicing first let one dead thread hold the cap at limit+1
-        # forever, the #593 shape).
+        # The whole LRU order, not just the oldest *over*: threads that cannot be
+        # resolved are filtered out, and one whose sleep failed is moved to the
+        # end, so the next ones get their turn (#1033 — slicing first let one
+        # dead thread hold the cap at limit+1 forever, the #593 shape; #1219).
         in_flight = await self._turns_in_flight(resident)
         victims = [
             tid
@@ -735,6 +822,10 @@ class ResidentCapLoop:
             )
             if tid not in self._unresolvable
         ]
+        deferred = self._deferred
+        victims = [t for t in victims if t not in deferred] + sorted(
+            (t for t in victims if t in deferred), key=deferred.__getitem__
+        )
         if not victims:
             # Say so: "over the cap and doing nothing" must not look like "fine".
             # Sampled, because a fleet that is entirely busy stays over the cap
@@ -762,32 +853,80 @@ class ResidentCapLoop:
 
         label = f"{self._limit}本"
         slept = 0
+        freed = 0  # slept, or found gone (#1094 / #1086 / the #1219 re-read)
+        # #1219 (decided 2026-11-05): every attempt counts toward ``over``, so one
+        # tick never sleeps more than the excess. Making up for failures within
+        # the tick was patched three times and each rule opened a new case: a
+        # kill that times out may still be carried out, and under a sustained
+        # stall the make-ups slept the whole fleet. The next tick re-counts —
+        # a kill that did happen then reads as gone, and a real failed kill
+        # (#1192) is made up for by the next candidate, the failed one being
+        # tried after every other (``_deferred``).
+        attempts = 0
         for thread_id in victims:
-            if slept >= over:
+            if attempts >= over:
                 break
+            self._deferred.pop(thread_id, None)
+            self._failures += 1
+            self._attempted[thread_id] = self._failures
+            self._attempt_last_used[thread_id] = last_used.get(thread_id)
             outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
             if outcome:
+                # Slept. Still counted next tick means its user woke it, not that
+                # our checks cannot see it — it keeps its idle-time place (review
+                # of 5b35a64: it stayed at the back for good).
+                self._attempted.pop(thread_id, None)
+            if outcome is False and not self._sleep_reached:
+                # Not an attempt: the thread could not be resolved (or the cog is
+                # missing), so no kill was sent and nothing can have died behind
+                # our back. The next candidate takes its turn now (#1033), and it
+                # is never deferred — a Discord hiccup is not a failed sleep (W57
+                # round 8: the longest-idle one was put behind with no kill sent).
+                self._attempted.pop(thread_id, None)
+                if thread_id in self._gone:
+                    # Found deleted just now (#1086): it never counted, so it
+                    # frees no slot to make up for — close it, lower the bar.
+                    await self._close_gone(thread_id)
+                    over -= 1
+                continue
+            attempts += 1
+            if outcome:
                 slept += 1
+                freed += 1
             elif outcome is None:
                 # Nothing to sleep — its claude ended on its own between the
-                # count and the kill (#1094). It left the residents by itself,
-                # so it is one fewer over, not a failure to make up for with a
-                # live workspace (that slept the cap below its limit).
-                over -= 1
-            elif thread_id in self._gone:
-                # Found deleted just now (#1086): it never counted, so it frees
-                # no slot to make up for — close it and lower the bar instead.
-                await self._close_gone(thread_id)
-                over -= 1
+                # count and the kill (#1094). It left the residents by itself.
+                freed += 1
+            else:
+                left = await self._left_residents(thread_id)
+                if left:
+                    # #1219: the sleep said it failed, but tmux answers that the
+                    # window is gone (a ``kill-window`` that timed out and was
+                    # carried out anyway).
+                    freed += 1
+                    continue
+                # Still there, or tmux did not answer: tried last from now on.
+                self._failures += 1
+                self._deferred[thread_id] = self._failures
+                self._deferred_at[thread_id] = self._cap_tick
+                if left is None:
+                    quiet = self._quiet.sample("cap-reread-unanswered")
+                    if quiet.emit:
+                        logger.warning(
+                            "%s resident-cap: the sleep failed and tmux did not answer the "
+                            "re-read — the next tick counts again%s",
+                            log_ctx(thread_id=thread_id),
+                            quiet.suffix,
+                        )
         if slept:
             logger.info("resident-cap: slept %d workspace(s) to stay under the limit", slept)
-        if slept < over:
+        if freed < over:
             short = self._quiet.sample("cap-short")
             if short.emit:
                 logger.info(
                     "resident-cap: still %d over limit %d — the rest are running or "
                     "could not be slept%s",
-                    over - slept,
+                    over - freed,
                     self._limit,
                     short.suffix,
                 )
@@ -818,6 +957,7 @@ class ResidentCapLoop:
         Only the sleep's own ``None`` means gone (#1192): reading every falsy
         answer as gone left the cap above its limit whenever a kill failed.
         """
+        self._sleep_reached = False
         cog = self._bot.get_cog("SessionManageCog")  # type: ignore[attr-defined]
         impl = getattr(cog, "_sleep_workspace_impl", None)
         if impl is None:
@@ -827,6 +967,8 @@ class ResidentCapLoop:
         channel = await self._resolve_thread(thread_id)
         if channel is None:
             return False
+        # From here a kill may be sent, so a failure counts as an attempt (#1219).
+        self._sleep_reached = True
         try:
             slept = await impl(channel=channel, reason=reason, idle_label=label)
         except Exception:
