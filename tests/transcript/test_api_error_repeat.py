@@ -13,7 +13,8 @@ docs/specs/turn-end-notification.md — the mirror shows the first sentence of t
 English error as one small line. Within one turn the same line is posted once; a
 different error in the same turn is still posted, and the next turn posts again.
 A line whose post failed does not count as posted, and a prompt typed straight into
-the pane after an interrupted turn (no ``turn_duration``) starts afresh.
+the pane after an interrupted turn (no ``turn_duration``) starts afresh. A notification
+or bare ``<system-reminder>`` row inside a turn does not (#1285).
 """
 
 from __future__ import annotations
@@ -225,3 +226,101 @@ async def test_a_pane_typed_prompt_after_an_interrupted_turn_posts_again(
     api_lines = await _api_lines(tmp_path, rows)
 
     assert len(api_lines) == 2, api_lines
+
+
+# #1285: a background task's notification (or a bare ``<system-reminder>``) that
+# lands in the middle of a person's turn is a user-role row too, but it does not
+# start a new turn (#913) — so the same ⚠️ line must not be posted a second time.
+
+
+def _user_text(uuid: str, parent: str, text: str) -> dict:
+    row = _base("user", "2026-11-04T13:01:44.000Z", uuid, parent)
+    row["message"] = {"role": "user", "content": text}
+    return row
+
+
+_NOTIF = (
+    "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n"
+    "<summary>Background command finished</summary>\n</task-notification>"
+)
+
+
+async def test_notification_inside_a_persons_turn_does_not_reset(tmp_path: Path) -> None:
+    """#913: a notification that lands in a person's turn leaves it the same turn."""
+    rows: list[dict | str] = [_TURN]
+    rows += _refusal(_TIMES[0], 0)
+    rows.append(_user_text("n1", "res0", _NOTIF))
+    rows += _refusal(_TIMES[1], 1)
+    rows.append(_turn_end("end", "res1"))
+    lines = await _api_lines(tmp_path, rows)
+    assert len(lines) == 1, lines
+
+
+async def test_bare_system_reminder_inside_a_turn_does_not_reset(tmp_path: Path) -> None:
+    rows: list[dict | str] = [_TURN]
+    rows += _refusal(_TIMES[0], 0)
+    rows.append(_user_text("r1", "res0", "<system-reminder>x</system-reminder>"))
+    rows += _refusal(_TIMES[1], 1)
+    rows.append(_turn_end("end", "res1"))
+    lines = await _api_lines(tmp_path, rows)
+    assert len(lines) == 1, lines
+
+
+async def test_self_started_turns_each_post_once(tmp_path: Path) -> None:
+    """A turn Claude starts itself (notification between turns): once per turn."""
+    rows: list[dict | str] = [_user_text("n0", "x", _NOTIF)]
+    for n in range(3):
+        rows += _refusal(_TIMES[n], n)
+    rows.append(_turn_end("end0", "res2"))
+    rows.append(_user_text("n1", "end0", _NOTIF))
+    rows += _refusal(_TIMES[3], 3)
+    rows.append(_turn_end("end1", "res3"))
+    lines = await _api_lines(tmp_path, rows)
+    assert len(lines) == 2, lines
+
+
+# Review of #1285: after a turn the user stopped with Esc, no ``turn_duration`` is
+# written, so the mirror still thinks the turn is open. A notification or a
+# scheduled wakeup that then starts Claude's next turn must post the same ⚠️ line
+# again — the CLI's interrupt row ends the old turn's memory.
+
+
+def _interrupt(uuid: str, parent: str, text: str) -> dict:
+    row = _base("user", "2026-11-04T13:01:43.000Z", uuid, parent)
+    row["message"] = {"role": "user", "content": [{"type": "text", "text": text}]}
+    return row
+
+
+def _wakeup(uuid: str, parent: str) -> dict:
+    row = _base("system", "2026-11-04T13:01:44.000Z", uuid, parent)
+    row.update(subtype="scheduled_task_fire", isMeta=True)
+    return row
+
+
+_INTERRUPTS = ["[Request interrupted by user]", "[Request interrupted by user for tool use]"]
+
+
+@pytest.mark.parametrize("text", _INTERRUPTS)
+async def test_notification_after_an_interrupted_turn_posts_again(
+    tmp_path: Path, text: str
+) -> None:
+    rows: list[dict | str] = [_TURN]
+    rows += _refusal(_TIMES[0], 0)
+    rows.append(_interrupt("int", "res0", text))
+    rows.append(_user_text("n1", "int", _NOTIF))
+    rows += _refusal(_TIMES[1], 1)
+    rows.append(_turn_end("end", "res1"))
+    lines = await _api_lines(tmp_path, rows)
+    assert len(lines) == 2, lines
+
+
+@pytest.mark.parametrize("text", _INTERRUPTS)
+async def test_wakeup_after_an_interrupted_turn_posts_again(tmp_path: Path, text: str) -> None:
+    rows: list[dict | str] = [_TURN]
+    rows += _refusal(_TIMES[0], 0)
+    rows.append(_interrupt("int", "res0", text))
+    rows.append(_wakeup("wake", "int"))
+    rows += _refusal(_TIMES[1], 1)
+    rows.append(_turn_end("end", "res1"))
+    lines = await _api_lines(tmp_path, rows)
+    assert len(lines) == 2, lines

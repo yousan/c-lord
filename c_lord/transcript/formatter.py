@@ -480,6 +480,27 @@ def _render_bash_mode(text: str, session_id: str | None) -> RenderedEvent | None
     return RenderedEvent(kind="tool_result", body=stripped, session_id=session_id)
 
 
+#: The row Claude Code writes when the user stops a turn with Esc (also
+#: ``… for tool use]``). No ``turn_duration`` follows it.
+USER_INTERRUPT_PREFIX = "[Request interrupted by user"
+
+
+def is_user_interrupt(event: dict[str, Any]) -> bool:
+    """Whether *event* is Claude Code's ``[Request interrupted by user…]`` row.
+
+    Written as a plain string or as a single text block. Sidechains are a
+    sub-agent's own conversation.
+    """
+    if event.get("type") != "user" or event.get("isSidechain"):
+        return False
+    content = (event.get("message") or {}).get("content")
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        if content[0].get("type") != "text":
+            return False
+        content = content[0].get("text")
+    return isinstance(content, str) and content.lstrip().startswith(USER_INTERRUPT_PREFIX)
+
+
 def is_harness_user_record(event: dict[str, Any]) -> bool:
     """True when a ``user`` row is something the harness wrote, not a person's request.
 

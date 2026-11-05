@@ -52,7 +52,7 @@ from .notify_policy import owner_notify_id
 from .pane_running import pane_shows_running
 from .session_close import is_closed
 from .thread_name import build_name, note_own_rename
-from .tmux import parse_work_number
+from .tmux import _is_ascii_number, parse_work_number
 from .utils.logger import log_ctx
 
 if TYPE_CHECKING:
@@ -265,8 +265,9 @@ def _index_by_thread_id(
         tid = w.get("thread_id") or ""
         # #1255: ASCII digits only, like tmux.py (#1239). ``"²".isdigit()`` is
         # True but ``int("²")`` raises — one such tag on the shared tmux server
-        # stopped the whole sync. Anything else is not a c-lord window.
-        if tid.isascii() and tid.isdigit():
+        # stopped the whole sync. #1287: so did a tag over int()'s 4300-digit
+        # limit; the shared check caps the length. Anything else is not a c-lord window.
+        if _is_ascii_number(tid):
             by_tid[int(tid)] = w
     return by_tid
 
@@ -693,8 +694,9 @@ class MenuWatchdogLoop:
         for w in windows:
             tid = w.get("thread_id") or ""
             # #1255: ASCII digits only (#1239) — a ``²`` tag made int() raise
-            # and stopped the sweep for every window after it.
-            if not (tid.isascii() and tid.isdigit()):
+            # and stopped the sweep for every window after it. #1287: and the
+            # length is capped, as a 5000-digit tag hit int()'s digit limit.
+            if not _is_ascii_number(tid):
                 continue
             thread_id = int(tid)
             session_name = w.get("session_name", "")
