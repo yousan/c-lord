@@ -4751,6 +4751,10 @@ class ClaudeChatCog(commands.Cog):
                 on_session_saved=self.on_session_saved,
                 started_by=started_by,
             )
+            # #1262: this message's input is going to the pane now — a /skill
+            # sent after it is the newer turn and makes this trigger stop counting.
+            with contextlib.suppress(Exception):
+                self.repo.note_trigger_sent(thread.id, user_message.id)
             try:
                 await run_claude_with_config(run_config)
             finally:

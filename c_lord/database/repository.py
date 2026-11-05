@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
-
-
-# "Whatever is there" for :meth:`SessionRepository.clear_trigger_message`.
-_ANY: object = object()
 
 
 @dataclass
@@ -111,6 +108,13 @@ class SessionRepository:
         # row exists (the row comes with the turn's SYSTEM event), so the
         # UPDATE had nothing to write. Held here until ``save`` creates the row.
         self._pending_triggers: dict[int, int] = {}
+        # #1262: the trigger of the last message turn handed to Claude's pane,
+        # per thread — see :meth:`note_trigger_sent`.
+        self._sent_triggers: dict[int, int] = {}
+        # #1262: a ``clear_trigger_message`` the database refused (locked). Held
+        # until it lands, at the latest with the next ``save`` (the turn's SYSTEM
+        # event). ``None`` = whatever is there; otherwise only those messages.
+        self._unapplied_clears: dict[int, frozenset[int] | None] = {}
 
     async def get(self, thread_id: int) -> SessionRecord | None:
         """Get session by Discord thread ID. A swept tombstone (#818) is not one."""
@@ -187,6 +191,10 @@ class SessionRepository:
                     SWEPT_REASON,
                 ),
             )
+            unapplied = thread_id in self._unapplied_clears
+            clear = self._unapplied_clears.get(thread_id)
+            if unapplied:
+                await self._execute_clear(db, thread_id, clear)
             pending = self._pending_triggers.pop(thread_id, None)
             if pending is not None:
                 await db.execute(
@@ -194,6 +202,8 @@ class SessionRepository:
                     (pending, thread_id),
                 )
             await db.commit()
+        if unapplied and self._unapplied_clears.get(thread_id, ()) == clear:
+            self._unapplied_clears.pop(thread_id, None)
 
         record = await self.get(thread_id)
         if record is None:
@@ -430,17 +440,34 @@ class SessionRepository:
                 self._pending_triggers.pop(next(iter(self._pending_triggers)))
         else:
             self._pending_triggers.pop(thread_id, None)
+            # #1262: the row now names this newer message — a clear still
+            # waiting from an earlier turn must not wipe it.
+            self._unapplied_clears.pop(thread_id, None)
 
     def pending_trigger(self, thread_id: int) -> int | None:
         """The first-turn trigger still waiting for *thread_id*'s row, if any."""
         return self._pending_triggers.get(thread_id)
 
+    def note_trigger_sent(self, thread_id: int, message_id: int) -> None:
+        """Remember that the turn *message_id* started is being handed to Claude — #1262.
+
+        Called right before the turn's input goes to the pane. The pane answers
+        whatever reached it last, so a ``/skill`` sent after this turn's input is
+        the newer turn, and this message must stop counting even if it was
+        recorded while the ``/skill`` was still preparing (see
+        :meth:`sent_trigger`). In memory only: after a restart every trigger on
+        record belongs to a turn that was sent long ago.
+        """
+        self._sent_triggers[thread_id] = message_id
+        while len(self._sent_triggers) > 1000:
+            self._sent_triggers.pop(next(iter(self._sent_triggers)))
+
+    def sent_trigger(self, thread_id: int) -> int | None:
+        """The trigger of the last message turn handed to Claude in *thread_id*."""
+        return self._sent_triggers.get(thread_id)
+
     async def clear_trigger_message(
-        self,
-        thread_id: int,
-        *,
-        recorded: int | None | object = _ANY,
-        pending: int | None | object = _ANY,
+        self, thread_id: int, *, only: Iterable[int] | None = None
     ) -> None:
         """Forget the trigger message on record for *thread_id* — #1234.
 
@@ -451,34 +478,48 @@ class SessionRepository:
         and the #115 reply is sent unquoted. A pending first-turn trigger is
         dropped too, so the row this turn creates does not carry it (#1235).
 
-        *recorded* / *pending* are what the caller saw when its turn started. When
-        given, only that trigger is forgotten: a message that arrived since (its
-        own, newer turn) keeps its trigger (W57 review of #1234). ``None`` means
-        nothing was there, so nothing is forgotten.
+        With *only*, just those messages are forgotten — on the row or pending:
+        a message whose turn has not reached Claude yet is a newer turn and keeps
+        its trigger (W57 review of #1234, #1262). An empty *only* forgets nothing.
+
+        #1262: when the database refuses the write (locked), the clear is kept
+        and applied by the next :meth:`save` of this thread — the ``/skill``
+        turn's own SYSTEM event — and the error is raised for the caller to log.
         """
-        if pending is _ANY:
+        among = None if only is None else frozenset(only)
+        if among is None:
             self._pending_triggers.pop(thread_id, None)
-        elif isinstance(pending, int):
-            self.discard_pending_trigger(thread_id, pending)
-        # A pending trigger may have been written onto the row since it was seen
-        # (its turn reached SYSTEM) — it is forgotten there too.
-        seen = [v for v in (recorded, pending) if isinstance(v, int)]
-        if recorded is not _ANY and not seen:
-            return
+        else:
+            if not among:
+                return
+            if self._pending_triggers.get(thread_id) in among:
+                del self._pending_triggers[thread_id]
+        self._unapplied_clears[thread_id] = among
+        while len(self._unapplied_clears) > 1000:
+            self._unapplied_clears.pop(next(iter(self._unapplied_clears)))
         async with aiosqlite.connect(self.db_path) as db:
-            if recorded is _ANY:
-                await db.execute(
-                    "UPDATE sessions SET trigger_message_id = NULL WHERE thread_id = ?",
-                    (thread_id,),
-                )
-            else:
-                marks = ", ".join("?" * len(seen))
-                await db.execute(
-                    "UPDATE sessions SET trigger_message_id = NULL"
-                    f" WHERE thread_id = ? AND trigger_message_id IN ({marks})",
-                    (thread_id, *seen),
-                )
+            await self._execute_clear(db, thread_id, among)
             await db.commit()
+        if thread_id in self._unapplied_clears and self._unapplied_clears[thread_id] == among:
+            del self._unapplied_clears[thread_id]
+
+    @staticmethod
+    async def _execute_clear(
+        db: aiosqlite.Connection, thread_id: int, among: frozenset[int] | None
+    ) -> None:
+        if among is None:
+            await db.execute(
+                "UPDATE sessions SET trigger_message_id = NULL WHERE thread_id = ?",
+                (thread_id,),
+            )
+            return
+        values = sorted(among)
+        marks = ", ".join("?" * len(values))
+        await db.execute(
+            "UPDATE sessions SET trigger_message_id = NULL"
+            f" WHERE thread_id = ? AND trigger_message_id IN ({marks})",
+            (thread_id, *values),
+        )
 
     def discard_pending_trigger(self, thread_id: int, message_id: int) -> None:
         """Drop *message_id* if it is still waiting for *thread_id*'s row — #1235.
