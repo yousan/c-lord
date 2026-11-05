@@ -12,9 +12,11 @@ speaking after a real give-up starts the count again.
 from __future__ import annotations
 
 import dataclasses
+from collections import Counter
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import pytest
 
 import c_lord.idle_sleep as idle_sleep_mod
 import c_lord.tmux as tmux_mod
@@ -208,4 +210,110 @@ async def test_one_window_that_always_times_out() -> None:
         for _ in range(60):
             await loop.tick()
     assert killed == set(range(2, N + 1))
-    assert 1 <= len(tries) <= 10, len(tries)
+    assert idle_sleep_mod._MAX_SLOW == 10
+    assert len(tries) == idle_sleep_mod._MAX_SLOW, len(tries)
+
+
+def _times_out_for(bad: set[int], clock: Clock):  # type: ignore[no-untyped-def]
+    """tmux healthy, but ``kill-window`` of the windows in *bad* always times out."""
+    targets = {f"@{t}" for t in bad}
+
+    def run(argv: list[str]) -> MagicMock:
+        if argv[1] == "kill-window" and targets & set(argv):
+            clock.t += tmux_mod._RUN_TIMEOUT_SECONDS
+            return MagicMock(
+                returncode=tmux_mod._RUN_TIMEOUT_RETURNCODE, stdout="", stderr="timed out"
+            )
+        return _healthy(argv)
+
+    return run
+
+
+def _spy(loop: IdleSleepLoop, killed: set[int], tries: Counter[int]) -> None:
+    real_impl = loop._bot.get_cog.return_value._sleep_workspace_impl
+
+    async def spy(**kw):  # type: ignore[no-untyped-def]
+        tries[kw["channel"].id] += 1
+        r = await real_impl(**kw)
+        if r:
+            killed.add(kw["channel"].id)
+        return r
+
+    loop._bot.get_cog.return_value._sleep_workspace_impl = spy
+
+
+@pytest.mark.parametrize("stall_ticks", [10, 30])
+@pytest.mark.parametrize("n", [1, 2, 4])
+async def test_small_fleet_long_stall_gives_nobody_up(n: int, stall_ticks: int) -> None:
+    """A tmux-wide stall with fewer due windows than ``MAX_UNSURE_PER_TICK``.
+
+    The stall used to be told apart by "five slow answers in one tick", so with
+    1-4 idle windows a 100-minute stall used up their slow budget and they stayed
+    awake after tmux came back, until someone spoke. Now a tick is a stall when
+    no attempt answered fast and a cheap tmux probe is slow too."""
+    loop, repo, recs = _setup(real_count=False)
+    repo.list_all = AsyncMock(return_value=recs[:n])
+    clock = Clock()
+    killed: set[int] = set()
+    tries: Counter[int] = Counter()
+    _spy(loop, killed, tries)
+    cs = patch("c_lord.cogs.session_manage.containers_for_session_dir", AsyncMock(return_value=[]))
+    with patch.object(idle_sleep_mod, "_clock", clock), cs:
+        with patch("c_lord.tmux._run", side_effect=_stalled_with(clock)):
+            for _ in range(stall_ticks):
+                await loop.tick()
+        with patch("c_lord.tmux._run", side_effect=_healthy):
+            for _ in range(3):
+                await loop.tick()
+    assert killed == set(range(1, n + 1)), (sorted(killed), dict(tries))
+
+
+async def test_six_windows_that_always_time_out_among_twenty() -> None:
+    """Six windows whose ``kill-window`` always times out, tmux otherwise fine.
+
+    With "five slow answers in one tick" as the sign of a stall, these six filled
+    every tick and were retried forever (5 x 30 s per tick). Each is now given up
+    after exactly ``_MAX_SLOW`` tries, and the other fourteen are slept."""
+    loop, repo, recs = _setup(real_count=False)
+    repo.list_all = AsyncMock(return_value=recs[:20])
+    bad = set(range(1, 7))
+    clock = Clock()
+    killed: set[int] = set()
+    tries: Counter[int] = Counter()
+    _spy(loop, killed, tries)
+    cs = patch("c_lord.cogs.session_manage.containers_for_session_dir", AsyncMock(return_value=[]))
+    with (
+        patch.object(idle_sleep_mod, "_clock", clock),
+        cs,
+        patch("c_lord.tmux._run", side_effect=_times_out_for(bad, clock)),
+    ):
+        for _ in range(40):
+            await loop.tick()
+    assert killed == set(range(7, 21))
+    assert {t: tries[t] for t in bad} == {t: idle_sleep_mod._MAX_SLOW for t in bad}
+
+
+async def test_a_fast_answer_resets_the_slow_streak() -> None:
+    """ "In a row" means in a row: a fast answer for the window in between (here a
+    fast "could not sleep") starts its slow count again."""
+    loop, repo, recs = _setup(real_count=False)
+    repo.list_all = AsyncMock(return_value=recs[:1])
+    clock = Clock()
+    plan = ["slow"] * 9 + ["fast"] + ["slow"] * 9
+    seen: list[str] = []
+
+    async def impl(**kw):  # type: ignore[no-untyped-def]
+        step = plan[len(seen)] if len(seen) < len(plan) else "slow"
+        seen.append(step)
+        if step == "slow":
+            clock.t += tmux_mod._RUN_TIMEOUT_SECONDS
+        return False
+
+    loop._bot.get_cog.return_value._sleep_workspace_impl = impl
+    with patch.object(idle_sleep_mod, "_clock", clock), patch("c_lord.tmux._run", _healthy):
+        for _ in range(len(plan)):
+            await loop.tick()
+        assert len(seen) == len(plan)  # not given up: the fast one broke the streak
+        await loop.tick()  # the 10th slow one in a row
+        await loop.tick()
+    assert len(seen) == len(plan) + 1, seen
