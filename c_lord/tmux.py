@@ -4254,6 +4254,19 @@ def resident_thread_ids() -> set[int]:
     return set(_claude_panes_by_thread())
 
 
+def is_resident_anywhere(thread_id: int) -> bool | None:
+    """Whether *thread_id* counts in :func:`resident_thread_ids`; ``None``: tmux did not answer.
+
+    The same source the resident cap counts with (#1213): a window that sits in
+    a session other than the one the thread's binding now resolves to (moved on
+    the next turn) is still a resident. ``None`` is "could not tell" (#1034).
+    """
+    panes = _claude_panes_listing()
+    if panes is None:
+        return None
+    return thread_id in panes
+
+
 @dataclass(frozen=True)
 class PaneTurnStates:
     """What the panes of some candidates say about their turns (#742 / #1034).

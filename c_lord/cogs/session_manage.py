@@ -1993,7 +1993,8 @@ class SessionManageCog(commands.Cog):
         ``None`` — there was no window to kill (already asleep, or its claude
         ended on its own); ``False`` — the window may still be there and could
         not be killed (no manager, ``kill-window`` failed — a stalled tmux also
-        fails it, so a failed kill is never read as gone). The resident cap makes
+        fails it, so a failed kill is never read as gone — or its claude still
+        runs in another tmux session, #1213). The resident cap makes
         up for ``False`` with the next candidate and only for that (#1094).
 
         There is no slash command on purpose. Being invisible is the feature; a
@@ -2027,6 +2028,25 @@ class SessionManageCog(commands.Cog):
         # going further would re-post the docker line on every tick — which is
         # how an invisible feature turns into a nuisance.
         if not present:
+            # #1213: the resident cap counts residents host-wide, but this manager
+            # only sees the session the binding resolves to *now*. After a binding
+            # change the window still sits in the old session until the next turn
+            # moves it, and "no window here" was counted as gone — the cap never
+            # made up for it. Still there (or could not tell) is ``False``: the
+            # next candidate makes up. It is not killed from here — the move is
+            # create_session's job, and this manager does not own that window.
+            from .. import tmux as _tmux
+
+            elsewhere = await asyncio.to_thread(_tmux.is_resident_anywhere, thread_id)
+            if elsewhere is not False:
+                logger.warning(
+                    "%s sleep: no window in this thread's session but %s — counted as still there",
+                    log_ctx(thread_id=thread_id),
+                    "tmux did not answer host-wide"
+                    if elsewhere is None
+                    else "its claude runs in another session",
+                )
+                return False
             return None
 
         # Stop the mirror BEFORE the kill (#379): killing the pane can make the
