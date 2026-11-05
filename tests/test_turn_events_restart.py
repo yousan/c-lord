@@ -231,3 +231,70 @@ async def test_startup_restores_the_held_completions(log, monkeypatch):  # noqa:
         await cog.cog_unload()
 
     assert [e.get("reason") for e in _lines(log)] == ["background_agents_unresolved"]
+
+
+# --- #1282: a number in the file that Python reads but cannot use ----------------
+# ``json.loads`` accepts ``Infinity`` / ``NaN`` and arbitrarily large integers.
+# ``int(inf)`` raised OverflowError, which the per-entry ``except`` did not list:
+# ``begin_turn`` (which reads the file lazily) crashed, so the person's message
+# started no turn event at all; from ``restore_held`` the entries after the bad
+# one, and the expired holds, were skipped. c-lord never writes such values — a
+# hand-edited file can.
+
+_BAD_NUMBERS = ("Infinity", "-Infinity", "NaN", "1e400", "1" + "0" * 400, "-5", "1.5")
+
+
+def _entry_json(**override: str) -> str:
+    fields = {
+        "thread_id": str(THREAD_ID),
+        "guild_id": "555",
+        "channel_id": "777",
+        "baseline_reply_id": "0",
+        "deadline": str(time.time() + 3600),
+    }
+    fields.update(override)
+    info = (
+        f'{{"thread_id": {fields["thread_id"]}, "guild_id": {fields["guild_id"]},'
+        f' "channel_id": {fields["channel_id"]},'
+        ' "started_by": {"type": "webhook", "id": "7", "name": "Captain Hook"},'
+        ' "started_at": "2026-11-05T00:00:00+00:00",'
+        f' "baseline_reply_id": {fields["baseline_reply_id"]}}}'
+    )
+    return f'{{"info": {info}, "reason": null, "expires": true, "deadline": {fields["deadline"]}}}'
+
+
+def _bad_bodies() -> list[str]:
+    return [
+        f'{{"held": [{_entry_json(**{field: number})}]}}'
+        for field in ("thread_id", "guild_id", "channel_id", "baseline_reply_id", "deadline")
+        for number in _BAD_NUMBERS
+        if not (field == "deadline" and number in ("-5", "1.5"))  # a past deadline is valid
+    ]
+
+
+async def test_a_bad_number_never_raises_from_begin_turn(log, caplog):  # noqa: F811
+    import logging
+
+    path = turn_events.held_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for body in _bad_bodies():
+        turn_events.reset()
+        path.write_text(body)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="c_lord.turn_events"):
+            info = turn_events.begin_turn(_thread(), StartedBy("user", "1"))
+        assert info is not None, body
+        assert THREAD_ID not in turn_events._HELD, body
+        assert "skipping an unreadable held completion" in caplog.text, body
+
+
+async def test_a_bad_number_never_raises_from_restore_and_later_entries_still_load(log):  # noqa: F811
+    path = turn_events.held_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    good = _entry_json(thread_id="4343")
+    for body in _bad_bodies():
+        turn_events.reset()
+        bad = body[len('{"held": [') : -len("]}")]
+        path.write_text(f'{{"held": [{bad}, {good}]}}')
+        turn_events.restore_held()
+        assert list(turn_events._HELD) == [4343], body

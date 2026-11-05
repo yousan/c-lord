@@ -44,19 +44,27 @@ from .utils.logger import log_ctx
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+#: The longest number c-lord writes into tmux: a Discord snowflake is at most 20
+#: digits, and work numbers are small (#1287).
+MAX_TMUX_NUMBER_DIGITS = 20
+
 # Discord snowflake IDs are 17–19 digits. Require ≥10 to avoid matching
-# unrelated trailing-numeric path components (PIDs, ports, etc.).
-_THREAD_ID_FROM_PATH_RE = re.compile(r"(\d{10,})/*$")
+# unrelated trailing-numeric path components (PIDs, ports, etc.). #1287: and at
+# most 20 — the whole run, not its tail — so a 5000-digit directory name never
+# reaches ``int()``'s 4300-digit limit.
+_THREAD_ID_FROM_PATH_RE = re.compile(rf"(?<!\d)(\d{{10,{MAX_TMUX_NUMBER_DIGITS}}})/*$")
 
 
 def _is_ascii_number(text: str) -> bool:
-    """Whether *text* is ASCII digits only — the only numbers c-lord writes into tmux.
+    """Whether *text* is a number c-lord could have written into tmux.
 
     #1239: ``"²".isdigit()`` is True but ``int("²")`` raises. The tmux server is
     shared, so a window renamed ``w²`` or a stray tag made rebuilding the
-    thread -> window map raise. Anything else is not a c-lord window / row.
+    thread -> window map raise. #1287: likewise more than 4300 ASCII digits —
+    ``int()``'s limit — so anything over :data:`MAX_TMUX_NUMBER_DIGITS` is refused.
+    Anything else is not a c-lord window / row.
     """
-    return text.isascii() and text.isdigit()
+    return text.isascii() and text.isdigit() and len(text) <= MAX_TMUX_NUMBER_DIGITS
 
 
 # tmux's immutable per-window handle, e.g. ``@218``. Unique for the life of the
@@ -475,6 +483,22 @@ def _chunk_for_send_keys(text: str, limit: int = _SEND_KEYS_CHUNK_BYTES) -> list
     return chunks
 
 
+def _argv_word(chunk: str) -> str:
+    """*chunk* as an argv word that tmux types back exactly (#1284).
+
+    tmux reads a command-line word ending in ``;`` as a command separator —
+    even after ``--`` and with ``-l`` — and drops that ``;``; a word ending in
+    ``\\;`` becomes a literal ``;`` instead. So ``foo;`` used to arrive as
+    ``foo``, ``a\\;`` as ``a;``, and a long message cut into pieces at a ``;``
+    lost it from the middle. Escaping the trailing ``;`` as ``\\;`` makes tmux
+    type exactly one ``;``, whatever comes before it (``;;``, ``\\;``, a lone
+    ``;``). Only the last character matters: a ``;`` anywhere else in the word is
+    already typed as is. The word stays one ``send-keys``, so a piece still
+    arrives as one burst (#560, #872) and grows by one byte at most.
+    """
+    return chunk[:-1] + "\\;" if chunk.endswith(";") else chunk
+
+
 # #529: the cold-start prompt used to be typed at the pane's shell prompt as
 # part of the command line. oh-my-zsh binds ``url-quote-magic`` to
 # ``self-insert``, so zsh backslash-escaped ``?``/``=``/``&`` inside any URL as
@@ -851,6 +875,50 @@ def _holds_piece_fragment(box: str, piece: str) -> bool:
     )
 
 
+def _input_box_is_full(pane_text: str) -> bool:
+    """Is the input box at its maximum height, so that its top rows scroll away? (#1283)
+
+    Claude Code caps the box at ``pane rows // 2 - 5`` rows — measured on CLI
+    2.1.318 in an isolated tmux: 7 rows in a 24-row pane, 15 in 40, 25 in 60, at
+    80 and 160 columns alike. Text taller than that shows only its last rows. The
+    TUI wraps its own lines, so ``capture-pane -J`` counts the same rows. A box
+    with no top rule left is taller than the pane, so full too.
+    """
+    lines = pane_text.splitlines()
+    rules = [i for i, line in enumerate(lines) if _BOX_RULE_RE.match(line)]
+    if not rules:
+        return False
+    bottom = rules[-1]
+    above = [i for i in rules if i < bottom]
+    if not above:
+        return True
+    rows = bottom - above[-1] - 1
+    return rows > 1 and rows >= len(lines) // 2 - 5
+
+
+def _fold_and_text_add_up(box: str, piece: str, new: dict[int, int | None]) -> bool:
+    """Do new folds plus the text after them make up the whole piece? (#1283)
+
+    A piece written in two bursts can fold its first part and show the rest as
+    text: ``[Pasted text #19 +17 lines]`` then the piece's last 3 lines (a piece
+    of 20). The box must be fold(s) followed by an end of the piece, and the
+    folds' lines must be the line breaks before that end.
+    """
+    head = re.match(r"(?:\[Pastedtext#\d+(?:\+\d+lines?)?\])+", box)
+    known = [c for c in new.values() if c is not None]
+    if head is None or len(known) < len(new):
+        return False
+    rest = box[head.end() :]
+    squashed = _squash(piece)
+    if not rest or len(rest) >= len(squashed) or not squashed.endswith(rest):
+        return False
+    kept = [i for i, ch in enumerate(piece) if _squash(ch)]
+    start = kept[-len(rest)]  # the first character shown as text
+    after = kept[-len(rest) - 1] + 1  # just past the last folded character
+    low = len(_LINE_BREAK_RE.findall(piece[:after]))
+    return low <= sum(known) <= len(_LINE_BREAK_RE.findall(piece[:start]))
+
+
 def _first_piece_state(pane_text: str, piece: str, before: str | None = None) -> str | None:
     """Did the first piece of a multi-piece message land whole? (#872, #1263)
 
@@ -866,7 +934,13 @@ def _first_piece_state(pane_text: str, piece: str, before: str | None = None) ->
       another size, or only its end / a U+FFFD in the box.
     * ``"empty"`` — no sign of the piece at all. The box may be empty or show
       a greyed hint or a suggestion, which ``capture-pane`` reads as text.
-    * ``None`` — no box to read (#544: never act without evidence).
+    * ``None`` — no box to read, or a box at its maximum height showing an end
+      of the piece as text: its start has scrolled away and cannot be seen
+      (#1283, the same reason as #1263; #544: never act without evidence).
+
+    A piece drawn in parts counts as landed too (#1283): new fold(s) followed
+    by the rest of the piece as text, when the folds' lines are the piece's
+    line breaks before that rest.
     """
     box = _input_box_text(pane_text)
     if box is None:
@@ -877,9 +951,11 @@ def _first_piece_state(pane_text: str, piece: str, before: str | None = None) ->
         known = [c for c in new.values() if c is not None]
         if len(known) < len(new) or sum(known) == len(_LINE_BREAK_RE.findall(piece)):
             return "landed"
-        return "lost"
+        return "landed" if _fold_and_text_add_up(box, piece, new) else "lost"
     if _squash(piece)[:_PAYLOAD_FINGERPRINT] and _squash(piece)[:_PAYLOAD_FINGERPRINT] in box:
         return "landed"
+    if box and _squash(piece).endswith(box) and _input_box_is_full(pane_text):
+        return None
     return "lost" if _holds_piece_fragment(box, piece) else "empty"
 
 
@@ -2786,7 +2862,7 @@ class TmuxSessionManager:
             # resetting the terminal and typing nothing. The first chunk of a
             # bulleted menu answer and any later chunk of a long message can both
             # start with ``-``.
-            result = _run(["tmux", "send-keys", "-l", "-t", target, "--", chunk])
+            result = _run(["tmux", "send-keys", "-l", "-t", target, "--", _argv_word(chunk)])
             if result.returncode != 0:
                 error = result.stderr.strip()
                 logger.warning(
@@ -3259,6 +3335,14 @@ class TmuxSessionManager:
                 self._note_send_failure(thread_id, errors)
                 return False
             state = self._read_first_piece(target, piece, before)
+            if state is None:
+                # #678/#1283: say that the check could not see, not just pass.
+                logger.info(
+                    "%s send_input: could not see the start of the first part in the input "
+                    "box (no box, or a full box showing its end); sending without the "
+                    "check (#544, #1283)",
+                    log_ctx(thread_id=thread_id),
+                )
             if state in (None, "landed"):
                 if attempt > 1:
                     logger.info(

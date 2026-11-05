@@ -1,0 +1,60 @@
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Opus 5.5 · Claude Ultra
+ ▝▝   ▝▝   /…/-home-yousan-c-lord-sessions-1505747831447883806-1565257080468807710/ad6b2411-9a80-4fbe-aacd-9eec20e92c64/scratchpad/review16/1276_work · /rc
+
+⚠ Your login expires in 3 days · run /login to renew
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                         ctrl+g to edit in Vim
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ - 項目036: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目037: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目038: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                   
+  - 項目039: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目040: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目041: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目042: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                   
+  - 項目043: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目044: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目045: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目046: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                   
+  - 項目047: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目048: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目049: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目050: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                   
+  - 項目051: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目052: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目053: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目054: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                   
+  - 項目055: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目056: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目057: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+  - 項目058: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                   
+  - 項目059: c_lord/tmux.py の send_input を直す (see docs/specs/input-delivery.md)。長い依頼の本文で、指示を書いた行です。                                     
+                                                                                                                                 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5.5  v2.1.318  Style: default  Ctx: 0  Context: [░░░░░░░░░░░░░░░░] 0/1.0M (0%)  Ctx Used: 0.0%  Ctx(u) Used: 0.0%                            
+   Cost: $0.00  5h: 0.0%  Weekly: 85.0%  Session: <1m  Reset: 26m  Weekly Reset: 10hr 26m  Block: 4hr 33m  In: 0  Out: 0  Cached: 0  Total: 0  In: —  Out...
