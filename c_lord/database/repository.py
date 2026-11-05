@@ -103,6 +103,10 @@ class SessionRepository:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        # #1212: a thread's first turn records its trigger before the session
+        # row exists (the row comes with the turn's SYSTEM event), so the
+        # UPDATE had nothing to write. Held here until ``save`` creates the row.
+        self._pending_triggers: dict[int, int] = {}
 
     async def get(self, thread_id: int) -> SessionRecord | None:
         """Get session by Discord thread ID. A swept tombstone (#818) is not one."""
@@ -179,6 +183,12 @@ class SessionRepository:
                     SWEPT_REASON,
                 ),
             )
+            pending = self._pending_triggers.pop(thread_id, None)
+            if pending is not None:
+                await db.execute(
+                    "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
+                    (pending, thread_id),
+                )
             await db.commit()
 
         record = await self.get(thread_id)
@@ -404,11 +414,18 @@ class SessionRepository:
         user's message (Issue #115).
         """
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+            cursor = await db.execute(
                 "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
                 (message_id, thread_id),
             )
             await db.commit()
+        if cursor.rowcount == 0:
+            # #1212: no row yet (first turn) — written by ``save`` when it comes.
+            self._pending_triggers[thread_id] = message_id
+            while len(self._pending_triggers) > 1000:
+                self._pending_triggers.pop(next(iter(self._pending_triggers)))
+        else:
+            self._pending_triggers.pop(thread_id, None)
 
     async def set_mirror_replied_uuid(self, thread_id: int, uuid: str) -> None:
         """Persist the uuid of the last final answer the mirror delivered.
