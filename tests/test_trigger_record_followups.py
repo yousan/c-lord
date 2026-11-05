@@ -11,6 +11,10 @@ still named the wrong person:
   and its send fails. A2's trigger was dropped as "never delivered" (#1262) and
   nothing was left: A1's answer was not a reply to A1, and after a restart the
   ❌ pinged the owner instead of A1's author.
+* #1271: A's send was refused (``send_input`` returned False — nothing reached
+  the pane) and the turn was then cancelled (a shutdown) while the runner asked
+  the pane why. The send had begun, so the trigger was kept as "may have
+  landed": after a restart the ❌ pinged A for a prompt the pane never got.
 
 Real SQLite throughout (``SessionRepository``), real ``ClaudeChatCog._run_claude``.
 """
@@ -18,13 +22,16 @@ Real SQLite throughout (``SessionRepository``), real ``ClaudeChatCog._run_claude
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sqlite3
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
 from c_lord import turn_events
+from c_lord.claude.tmux_runner import TmuxClaudeRunner
 from c_lord.database.models import init_db
 from c_lord.database.repository import SessionRepository
 from tests.test_trigger_on_record import _api_error, _bot, _msg
@@ -258,3 +265,82 @@ async def test_a2_undelivered_after_a_skill_restores_nothing(tmp_path, monkeypat
         turn_events.reset()
     assert mirror.trigger_message(42) is None
     assert _row_trigger(repo.db_path) is None
+
+
+# -- #1271: a refused send, then cancelled before the turn ended --------------------
+
+
+async def test_refused_send_then_cancelled_drops_trigger(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The real TmuxClaudeRunner on a fake tmux: send_input is refused, and the
+    turn is cancelled while the runner asks the pane why (``input_box_holds``).
+    Nothing reached the pane, so A's trigger is dropped like any undelivered
+    turn's, and a restart's ❌ does not ping A."""
+    _quiet(monkeypatch)
+    repo, _b, _c, mirror = await _setup(tmp_path)
+    asking, release = threading.Event(), threading.Event()
+
+    def holds(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        asking.set()
+        release.wait(10)
+        return False
+
+    mgr = MagicMock()
+    mgr.capture_pane.return_value = ""
+    mgr.is_claude_running.return_value = True
+    mgr.send_input.return_value = False  # tmux refused: nothing reached the pane
+    mgr.input_box_holds.side_effect = holds
+    mgr.duplicate_window_names.return_value = []
+    mgr.session_name = "clord"
+    mgr.create_session.return_value = "w1"
+
+    cog = _make_chat_cog()
+    cog.repo = repo
+    cog.bot.transcript_mirror_cog = mirror
+    cog._resolve_session_dir_manager = AsyncMock(  # type: ignore[method-assign]
+        return_value=MagicMock(create_session_dir=MagicMock(return_value="/tmp/work"))
+    )
+    cog._resolve_tmux_manager = AsyncMock(return_value=mgr)  # type: ignore[method-assign]
+    cog._get_dashboard = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cog._get_coordination = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cog._get_current_model = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    cog._apply_thread_naming = AsyncMock()  # type: ignore[method-assign]
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = 42
+    thread.parent_id = 500
+    thread.send = AsyncMock(return_value=MagicMock())
+    message = _chat_message()
+    message.id = 556
+    message.webhook_id = None
+
+    async def run(config) -> None:  # noqa: ANN001 — the hook wiring of _run_helper._run_turn
+        runner = config.runner
+        runner.on_prompt_sent = config.on_prompt_sent
+        runner.on_send_started = config.on_send_started
+        turn_events.begin_turn(config.thread, config.started_by or turn_events.StartedBy("user"))
+        async for ev in runner.run(config.prompt, session_id=config.session_id):
+            if ev.session_id:
+                await repo.save(42, "sess-1")
+            if ev.is_complete:
+                return
+
+    try:
+        with (
+            patch("c_lord.cogs.claude_chat.run_claude_with_config", side_effect=run),
+            patch.object(TmuxClaudeRunner, "peek_pending_ask", AsyncMock(return_value=None)),
+        ):
+            task = asyncio.create_task(cog._run_claude(message, thread, "hi", None))
+            for _ in range(500):
+                if task.done() or asking.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert asking.is_set(), "never reached the refusal diagnosis"
+            task.cancel()  # bot shutdown
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        mem, row = mirror.trigger_message(42), _row_trigger(repo.db_path)
+        after = await _after_restart(repo.db_path)
+    finally:
+        release.set()
+        turn_events.reset()
+    assert mem != 556 and row != 556, ("A's trigger kept after a refused send", mem, row)
+    assert not after.endswith(f"<@{B}>"), ("restart ❌ pings A", after)

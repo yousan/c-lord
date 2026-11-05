@@ -4448,7 +4448,8 @@ class ClaudeChatCog(commands.Cog):
         ``send_input`` may still have been running in the worker thread (#1169
         can take ~20s), the keys may well have landed and Claude may answer
         after the restart — so the trigger stays. A turn cancelled before the
-        send began delivered nothing and is dropped like any other (W57 r14).
+        send began delivered nothing and is dropped like any other (W57 r14),
+        as is one whose send tmux refused before the cancel (#1271).
 
         Dropped means replaced by the trigger of the turn delivered last when
         nothing newer was recorded (#1270), else forgotten.
@@ -4911,7 +4912,11 @@ class ClaudeChatCog(commands.Cog):
                 await self._end_trigger_in_flight(
                     thread.id,
                     user_message.id,
-                    send_may_have_landed=run_cancelled and send_began.is_set(),
+                    # #1271: a send tmux refused (ok=False) delivered nothing,
+                    # even when the cancel came while the runner asked why.
+                    send_may_have_landed=run_cancelled
+                    and send_began.is_set()
+                    and getattr(runner, "send_refused", False) is not True,
                 )
 
                 with contextlib.suppress(Exception):
