@@ -855,6 +855,15 @@ def _read_last_silent(project_dir: Path) -> str | None:
 def _silent_text_at_end(path: Path, end: int | None = None) -> str | None:
     """The uuid of the open turn's last text that went out silently, at *end* (#1187).
 
+    See :func:`_silent_at_end`, which also gives the text.
+    """
+    found = _silent_at_end(path, end)
+    return None if found is None else found[0]
+
+
+def _silent_at_end(path: Path, end: int | None = None) -> tuple[str, str] | None:
+    """``(uuid, text)`` of the open turn's last text that went out silently, at *end*.
+
     The live loop's ``_last_silent`` (#1125) replayed over what the old process
     read: a text followed by a tool call or a thinking block was posted silently
     as an intermediate. ``None`` when the turn's last text is still held (the old
@@ -865,8 +874,8 @@ def _silent_text_at_end(path: Path, end: int | None = None) -> str | None:
         lines = list(_read_back_lines(path, end))
     except OSError:
         return None
-    silent: str | None = None
-    held: str | None = None
+    silent: tuple[str, str] | None = None
+    held: tuple[str, str] | None = None
     for raw in lines:
         try:
             event = json.loads(raw)
@@ -896,7 +905,9 @@ def _silent_text_at_end(path: Path, end: int | None = None) -> str | None:
                 continue
             if held is not None:
                 silent = held
-            held = event.get("uuid") or None
+            uuid = event.get("uuid")
+            # #1224: the text too — the live loop posts it if nobody did.
+            held = (uuid, _format_body(rendered)) if isinstance(uuid, str) and uuid else None
     return None if held is not None else silent
 
 
@@ -1048,9 +1059,11 @@ class TranscriptMirror:
         # #1011/#1012: restored at startup — the tail starts at the end of a
         # transcript the old process was reading, so learn where it stood.
         self._resumed = resumed
-        # #1187: the restored turn's text the old process posted silently, for
-        # ``_run`` to take as its ``_last_silent`` (set by ``_read_back``).
-        self._read_back_silent: str | None = None
+        # #1187: the restored turn's text that went out silently, for ``_run``
+        # to take as its ``_last_silent`` (set by ``_read_back``): ``(uuid,
+        # None)`` when the old process says it posted it, ``(uuid, text)`` when
+        # nobody did (#1224 — Claude wrote it while no process was reading).
+        self._read_back_silent: tuple[str, str | None] | None = None
 
     def note_turn_started(self, trigger_id: int | None = None) -> None:
         """Tell the progress line a turn just began (#539).
@@ -1203,12 +1216,15 @@ class TranscriptMirror:
             # #1187: the text before the turn's last tool call is its answer at
             # the turn end (#1125) — the old process's memory of it is gone.
             try:
-                silent = await asyncio.to_thread(_silent_text_at_end, jsonl, end)
+                silent = await asyncio.to_thread(_silent_at_end, jsonl, end)
                 posted = await asyncio.to_thread(_read_last_silent, Path(self.project_dir))
                 # Only a text the old process says it posted: one Claude wrote
                 # while no process was reading was posted by nobody, and taking
                 # it as delivered would lose it for good (review of #1187).
-                self._read_back_silent = silent if silent is not None and silent == posted else None
+                # #1224: such a text keeps its words, so this process can post it.
+                if silent is not None:
+                    uuid, text = silent
+                    self._read_back_silent = (uuid, None if uuid == posted else text)
             except Exception:
                 logger.warning(
                     "%s TranscriptMirror: could not read back the turn's last text (#1187)",
@@ -1319,7 +1335,14 @@ class TranscriptMirror:
         # turn ends with no text held, that text *was* its last word: the answer
         # (the same one the #215 rescue would pick), so it takes the answer's
         # place instead of being re-posted by the next restart.
-        _last_silent: tuple[str, object] | None = None
+        # #1225: the third item is the text itself when nobody posted it (the
+        # post failed) — such a text is never adopted as delivered.
+        _last_silent: tuple[str, object, str | None] | None = None
+        # #1224: ``(uuid, text)`` of a finished turn's answer that nobody posted
+        # (an unposted ``_last_silent`` at its end). Posted when the next turn
+        # starts — waiting for the restart rescue alone lost it for good once
+        # that next turn ended first (the rescue only looks at the last turn).
+        _owed: tuple[str, str] | None = None
         # #631 AC9: has this turn already reported the plan limit?  The CLI
         # retries internally and writes the same refusal again on each attempt —
         # six times in one turn on 2026-09-04 — and every copy says exactly the
@@ -1328,15 +1351,45 @@ class TranscriptMirror:
 
         def _adopt_last_silent_as_answer() -> None:
             """#1125: a turn whose last text preceded its last tool call answered with it."""
-            nonlocal _delivered_uuid, _last_silent
+            nonlocal _delivered_uuid, _last_silent, _owed
             silent, _last_silent = _last_silent, None
             if silent is None or _delivered_uuid is not None:
+                return
+            if silent[2] is not None:
+                # #1225: its post failed — taking it as delivered moved the cursor
+                # past a text the thread never showed, so no rescue posted it.
+                logger.warning(
+                    "%s TranscriptMirror: the turn's last text before its last tool call "
+                    "was never posted — posting it when the next turn starts, or the "
+                    "restart rescue does (#1224/#1225)",
+                    log_ctx(thread_id=self.thread_id),
+                )
+                _owed = (silent[0], silent[2])
                 return
             _delivered_uuid = silent[0]
             if silent[1] is not None:
                 from ..skills import reply_tracker
 
                 reply_tracker.record_reply_message(self.thread_id, cast(Any, silent[1]))
+
+        async def _deliver_owed() -> None:
+            """#1224: post the turn before's answer nobody posted, then record it."""
+            nonlocal _owed, _delivered_uuid
+            owed, _owed = _owed, None
+            if owed is None:
+                return
+            logger.info(
+                "%s TranscriptMirror: posting the previous turn's answer, which never "
+                "reached the thread (#1224)",
+                log_ctx(thread_id=self.thread_id),
+            )
+            # Not quoted: the request it answers is not the one that just came in.
+            if self._reply_sink is not None:
+                await self._try_reply_sink(owed[1], quote=False)
+            else:
+                await self._try_sink(owed[1])
+            _delivered_uuid = owed[0]
+            await _commit_cursor()
 
         async def _commit_cursor() -> None:
             nonlocal _delivered_uuid
@@ -1360,7 +1413,13 @@ class TranscriptMirror:
             # #747: a loop's copy is counted in one message instead of posted.
             if not await self._fold.offer(_pending_text):
                 sent = await self._try_sink(_pending_text)
-                _last_silent = (_pending_uuid, sent) if _pending_uuid else None
+                if not _pending_uuid:
+                    _last_silent = None
+                elif sent is None:
+                    # #1225: the sink failed (it returns the message, or None).
+                    _last_silent = (_pending_uuid, None, _pending_text)
+                else:
+                    _last_silent = (_pending_uuid, sent, None)
                 if _pending_uuid and sent is not None:
                     # #1187: proof for the next process that this one posted it.
                     await asyncio.to_thread(
@@ -1497,7 +1556,7 @@ class TranscriptMirror:
 
                 if self._read_back_silent is not None:
                     # #1187: the read-back runs before the first row is queued.
-                    _last_silent = (self._read_back_silent, None)
+                    _last_silent = (self._read_back_silent[0], None, self._read_back_silent[1])
                     self._read_back_silent = None
 
                 # #1041: one row this loop cannot handle must not end it — the mirror is
@@ -1581,6 +1640,7 @@ class TranscriptMirror:
                             # #1125: a new turn's answer is its own (a notice
                             # inside a turn leaves the turn — and its text — as is).
                             _last_silent = None
+                            await _deliver_owed()
                         if started_by is not None:
                             self._turn_open = True
                             self._model_spoke = False
