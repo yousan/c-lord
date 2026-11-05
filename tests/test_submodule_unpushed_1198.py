@@ -935,12 +935,9 @@ def test_upstream_tag_on_no_branch_is_kept_known_over_keep(tmp_path: Path) -> No
     assert _delete(ws).removed
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known limit: a branch pushed and then deleted on the remote still has a stale "
-    "local tracking ref; telling that apart needs the network (pre-existing, spec)",
-)
 def test_stale_tracking_ref_branch_deleted_on_remote(tmp_path: Path) -> None:
+    """#1245 (was a known limit): the submodule's remote is asked whether the
+    branch behind a tracking ref still exists. More in test_stale_tracking_ref_1245."""
     ws, subr = _workspace(tmp_path)
     git(ws / "sub", "checkout", "-q", "-b", "work")
     sha = _commit(ws / "sub", "w.txt")
@@ -951,7 +948,8 @@ def test_stale_tracking_ref_branch_deleted_on_remote(tmp_path: Path) -> None:
     git(subr, "gc", "-q", "--prune=now")
     assert not _object_exists(subr, sha)
     assert git(ws, "status", "--porcelain").strip() == ""
-    _kept(ws)
+    res = _kept(ws)
+    assert "sub: 1 unpushed commit(s) (remote branch deleted or rewritten)" in res.reason
 
 
 # ---- review of 77df9cc: the workspace's own tags kept pushed workspaces ----
@@ -1041,16 +1039,19 @@ def test_a_timed_out_ls_remote_leaves_no_child_running(tmp_path: Path, monkeypat
     git(ws, "checkout", "-q", "-b", "feature")
     _commit(ws, "f.txt")  # an unpushed commit, so the remote is asked
     pidfile = tmp_path / "upload.pid"
-    fake = tmp_path / "slow-upload-pack"
+    fake = tmp_path / "slow-ssh"
     fake.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nsleep 20\n")
     fake.chmod(0o755)
-    git(ws, "config", "remote.origin.uploadpack", str(fake))
+    # The transport comes from the bot's environment: since the review of
+    # 3eaa7da the workspace's own ``remote.origin.uploadpack`` is not used.
+    monkeypatch.setenv("GIT_SSH_COMMAND", str(fake))
+    git(ws, "remote", "set-url", "origin", "ssh://example.invalid/repo.git")
     sd._ls_remote_cache.clear()
     monkeypatch.setattr(sd, "_LS_REMOTE_TIMEOUT_SECONDS", 1.0)
     try:
         st = worktree_status(str(ws))
         assert st.remote_unchecked, describe_changes(st)
-        assert pidfile.exists(), "setup: the slow upload-pack should have started"
+        assert pidfile.exists(), "setup: the slow transport should have started"
         pid = int(pidfile.read_text())
         deadline = time.monotonic() + 3
         while _pid_alive(pid) and time.monotonic() < deadline:
