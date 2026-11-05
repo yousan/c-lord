@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
@@ -129,6 +130,11 @@ class SessionRepository:
         # it) — what lands is "nothing on record", as if it had been written and
         # cleared, not the older message it would have replaced.
         self._unwritten_triggers: dict[int, int | None] = {}
+        # #1254: the order trigger writes started in, and per thread the latest
+        # one that landed or was kept — an older write refused after a newer
+        # one landed must not be kept to be written over it.
+        self._write_order = itertools.count()
+        self._latest_write: dict[int, int] = {}
 
     async def get(self, thread_id: int) -> SessionRecord | None:
         """Get session by Discord thread ID. A swept tombstone (#818) is not one."""
@@ -256,7 +262,21 @@ class SessionRepository:
             return [_record(row) for row in rows]
 
     async def delete(self, thread_id: int) -> bool:
-        """Delete a session mapping. Returns True if a row was deleted."""
+        """Delete a session mapping. Returns True if a row was deleted.
+
+        The thread's in-memory trigger state goes with it (#1254): a kept write,
+        a pending one or a waiting clear must not land on the row a later
+        session makes for the same thread.
+        """
+        for held in (
+            self._unwritten_triggers,
+            self._pending_triggers,
+            self._unapplied_clears,
+            self._sent_triggers,
+            self._in_flight,
+            self._latest_write,
+        ):
+            held.pop(thread_id, None)
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "DELETE FROM sessions WHERE thread_id = ?",
@@ -463,6 +483,7 @@ class SessionRepository:
         the caller to log. Left on the row, the older message's author would be
         the one pinged after a restart.
         """
+        order = next(self._write_order)
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
@@ -471,11 +492,15 @@ class SessionRepository:
                 )
                 await db.commit()
         except Exception:
-            self._pending_triggers.pop(thread_id, None)
-            self._unwritten_triggers[thread_id] = message_id
-            while len(self._unwritten_triggers) > 1000:
-                self._unwritten_triggers.pop(next(iter(self._unwritten_triggers)))
+            # Kept only when no write that started after it landed or was kept.
+            if self._note_latest_write(thread_id, order):
+                self._pending_triggers.pop(thread_id, None)
+                self._unwritten_triggers[thread_id] = message_id
+                while len(self._unwritten_triggers) > 1000:
+                    self._unwritten_triggers.pop(next(iter(self._unwritten_triggers)))
             raise
+        if not self._note_latest_write(thread_id, order):
+            return  # a newer write is kept and still waiting to land
         self._unwritten_triggers.pop(thread_id, None)
         if cursor.rowcount == 0:
             # #1212: no row yet (first turn) — written by ``save`` when it comes.
@@ -484,6 +509,16 @@ class SessionRepository:
                 self._pending_triggers.pop(next(iter(self._pending_triggers)))
         else:
             self._pending_triggers.pop(thread_id, None)
+
+    def _note_latest_write(self, thread_id: int, order: int) -> bool:
+        """Whether the trigger write started at *order* is the newest one for
+        *thread_id* to land or be kept so far (and note it as such) — #1254."""
+        if order < self._latest_write.get(thread_id, -1):
+            return False
+        self._latest_write[thread_id] = order
+        while len(self._latest_write) > 1000:
+            self._latest_write.pop(next(iter(self._latest_write)))
+        return True
 
     def pending_trigger(self, thread_id: int) -> int | None:
         """The first-turn trigger still waiting for *thread_id*'s row, if any."""

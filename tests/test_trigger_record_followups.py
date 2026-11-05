@@ -201,6 +201,62 @@ async def test_a_refused_write_that_is_cleared_is_not_written(tmp_path) -> None:
     assert _row_trigger(repo.db_path) is None
 
 
+async def test_an_older_refused_write_does_not_override_a_newer_one(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A's write (556) waits on the lock while B's later write (557) lands; A's
+    write is then refused. 557 is the newer trigger: A's refusal must not keep
+    556 for the next save to write over it."""
+    from c_lord.database import repository as repository_mod
+
+    repo = await _p_on_record(tmp_path)
+    real_connect = repository_mod.aiosqlite.connect
+    gate = asyncio.Event()
+    waiting = asyncio.Event()
+    calls = 0
+
+    class _Refused:
+        async def __aenter__(self):  # noqa: ANN204
+            waiting.set()
+            await gate.wait()
+            raise sqlite3.OperationalError("database is locked")
+
+        async def __aexit__(self, *exc) -> None:  # noqa: ANN002
+            return None
+
+    def connect(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        nonlocal calls
+        calls += 1
+        return _Refused() if calls == 1 else real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(repository_mod.aiosqlite, "connect", connect)
+    a_write = asyncio.create_task(repo.update_trigger_message(42, 556))
+    await waiting.wait()
+    await repo.update_trigger_message(42, 557)  # B's write lands
+    gate.set()
+    with contextlib.suppress(sqlite3.OperationalError):
+        await a_write
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id == 557, record.trigger_message_id
+    await repo.save(42, "sess-1")
+    assert _row_trigger(repo.db_path) == 557
+
+
+async def test_a_deleted_thread_forgets_its_kept_trigger_state(tmp_path) -> None:  # noqa: ANN001
+    """A refused write kept for thread 42 must not land on the row a later
+    session makes for that thread after ``delete()``."""
+    repo = await _p_on_record(tmp_path)
+    await _refused_update(repo, 556)
+    repo.note_trigger_sent(42, 555)
+    repo.note_trigger_in_flight(42, 557)
+    await repo.delete(42)
+    assert repo.sent_trigger(42) is None
+    assert not repo.trigger_in_flight(42, 557)
+    assert repo.pending_trigger(42) is None
+    await repo.save(42, "sess-2")
+    assert _row_trigger(repo.db_path) is None
+    record = await repo.get(42)
+    assert record is not None and record.trigger_message_id is None
+
+
 # -- #1270: an undelivered A2 dropped while A1 is being answered --------------------
 
 
