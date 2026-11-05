@@ -408,6 +408,10 @@ class ResidentCapLoop:
         # keeps it (another c-lord's pane, our own window with an old owner in
         # another session) can then no longer take the front for good.
         self._attempted: dict[int, int] = {}
+        # ``last_used_at`` of each attempted / deferred thread when it was
+        # attempted. A deferred thread whose ``last_used_at`` has changed since —
+        # its user came back — is an ordinary candidate again (review of 5b35a64).
+        self._attempt_last_used: dict[int, str | None] = {}
         self._failures = 0
         # Whether the last ``_sleep_one`` got as far as the sleep itself (#1219).
         self._sleep_reached = False
@@ -482,7 +486,8 @@ class ResidentCapLoop:
     async def _left_residents(self, thread_id: int) -> bool | None:
         """Whether a fresh read **answers** that *thread_id* is no longer resident (#1219).
 
-        ``True``: gone. ``False``: still there (the #1192 case — made up for).
+        ``True``: gone. ``False``: still there (the #1192 case — the thread is
+        deferred, and the next tick's next candidate makes up for it).
         ``None``: tmux did not answer, so nothing can be said. Run off the event
         loop: the read is ``tmux -V`` plus ``list-panes`` with 30 s timeouts each,
         and it is asked once per failed victim (review of e971435).
@@ -762,6 +767,14 @@ class ResidentCapLoop:
             return 0
 
         records = await self._repo.list_all(limit=1000)  # type: ignore[attr-defined]
+        last_used = {rec.thread_id: rec.last_used_at for rec in records}
+        # Someone used a deferred workspace since it was attempted: its place in
+        # the queue is its idle time again, not the back (review of 5b35a64).
+        for t in [t for t in self._deferred if last_used.get(t) != self._attempt_last_used.get(t)]:
+            del self._deferred[t]
+        self._attempt_last_used = {
+            t: v for t, v in self._attempt_last_used.items() if t in self._deferred
+        }
 
         # Count only what **this** instance owns. One tmux server is shared by
         # every c-lord on the host (and by the operator's own hand-made
@@ -838,7 +851,13 @@ class ResidentCapLoop:
             self._deferred.pop(thread_id, None)
             self._failures += 1
             self._attempted[thread_id] = self._failures
+            self._attempt_last_used[thread_id] = last_used.get(thread_id)
             outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
+            if outcome:
+                # Slept. Still counted next tick means its user woke it, not that
+                # our checks cannot see it — it keeps its idle-time place (review
+                # of 5b35a64: it stayed at the back for good).
+                self._attempted.pop(thread_id, None)
             if outcome is False and not self._sleep_reached:
                 # Not an attempt: the thread could not be resolved (or the cog is
                 # missing), so no kill was sent and nothing can have died behind

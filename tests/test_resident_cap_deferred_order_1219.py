@@ -303,3 +303,86 @@ async def test_fuzz_cap_through_real_readers(seed: int, elsewhere: bool) -> None
         limit,
         sorted(alive),
     )
+
+
+# --- review of 5b35a64: a slept-then-woken workspace must not stay at the back ---
+#
+# "Attempted last tick and still counted -> deferred" also caught a workspace that
+# was slept fine and woken by its user within a tick. It stayed behind every
+# other candidate for good, and hours later — the longest idle — the cap slept a
+# younger one instead.
+
+
+def _repo_of(hours: dict[int, float]) -> MagicMock:
+    repo = MagicMock()
+    repo.list_all = AsyncMock(
+        side_effect=lambda **_: [_rec(t, hours_ago=h) for t, h in hours.items()]
+    )
+    return repo
+
+
+async def test_a_slept_and_woken_workspace_is_not_kept_at_the_back() -> None:
+    resident = {1, 2, 3}
+    hours = {1: 1.0, 2: 2.0, 3: 3.0}  # 3 is the longest idle
+    slept: list[int] = []
+    fail: set[int] = set()
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        if channel.id in fail:
+            return False
+        slept.append(channel.id)
+        resident.discard(channel.id)
+        return True
+
+    loop = ResidentCapLoop(
+        _bot(cog=_cog(AsyncMock(side_effect=impl))),
+        _repo_of(hours),
+        limit=2,
+        resident_fn=lambda: set(resident),
+        in_flight_fn=set,
+        mem_fn=lambda: OK,
+        activity_fn=lambda r: None,
+    )
+    with patch("c_lord.tmux.pane_turn_states", return_value=NONE):
+        await loop.tick()  # sleeps 3
+        resident.add(3)  # its user writes: woken, and now the most recent
+        hours[3] = 0.0
+        await loop.tick()  # sleeps 2
+        resident.add(2)  # 2 is woken too
+        hours[2] = 0.0
+        hours.update({1: 5.0, 2: 1.0, 3: 10.0})  # hours later: 3 is the longest idle again
+        await loop.tick()
+    assert slept == [3, 2, 3], f"slept {slept}: a woken workspace was kept at the back"
+
+
+async def test_a_failed_victim_that_its_user_touches_is_no_longer_deferred() -> None:
+    """A deferred victim whose activity moved forward is a fresh candidate again."""
+    resident = {1, 2, 3}
+    hours = {1: 1.0, 2: 2.0, 3: 3.0}
+    slept: list[int] = []
+    hiccup = {3}
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        if channel.id in hiccup:
+            hiccup.discard(channel.id)
+            return False  # one failed kill; the window stays
+        slept.append(channel.id)
+        resident.discard(channel.id)
+        return True
+
+    loop = ResidentCapLoop(
+        _bot(cog=_cog(AsyncMock(side_effect=impl))),
+        _repo_of(hours),
+        limit=2,
+        resident_fn=lambda: set(resident),
+        in_flight_fn=set,
+        mem_fn=lambda: OK,
+        activity_fn=lambda r: None,
+    )
+    with patch("c_lord.tmux.pane_turn_states", return_value=NONE):
+        await loop.tick()  # 3 fails: deferred
+        await loop.tick()  # 2 is slept in its place
+        resident.add(2)
+        hours.update({1: 5.0, 2: 1.0, 3: 10.0})  # 3 was used since, then idle the longest
+        await loop.tick()
+    assert slept == [2, 3], f"slept {slept}: 3 stayed deferred after its user touched it"

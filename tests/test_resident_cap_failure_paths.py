@@ -359,10 +359,10 @@ class TestOneBadVictimDoesNotTakeOthersDown:
             # 超えて眠らせない。4 の失敗は次の tick で補う（4 は最後に回す）
             assert await loop.tick() == 1
             assert _slept(cog) == [4, 3]
-            # 常駐一覧が古いまま {1..4}。前の tick で試した 4 と 3 はまだ数えられて
-            # いるので最後に回る（#1219 のレビュー）: 2 と 1
+            # 常駐一覧が古いまま {1..4}。眠らせ損ねた 4 だけが最後に回る（眠らせた
+            # 3 は回さない — #1219 のレビュー）: 3 と 2
             assert await loop.tick() == 2
-        assert _slept(cog) == [4, 3, 2, 1]
+        assert _slept(cog) == [4, 3, 3, 2]
         assert any(
             r.levelno == logging.ERROR and "failed to sleep thread=4" in r.getMessage()
             for r in caplog.records
