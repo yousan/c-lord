@@ -92,9 +92,12 @@ class TurnEndBus:
         self._threads: dict[int, _ThreadTurns] = {}
         self._tailing: set[int] = set()
         # #1223: a transcript c-lord named that has not appeared (keyed by the
-        # name and when it was written), and the one turn it was granted.
+        # name and when it was written), the one turn that spent it, and which
+        # turn is running now (a token, so a displaced turn ending late cannot
+        # clear the turn that displaced it).
         self._pending_claim: dict[int, str] = {}
         self._claim_turn: dict[int, tuple[str, float]] = {}
+        self._running_turn: dict[int, object] = {}
 
     def _record(self, thread_id: int) -> _ThreadTurns:
         record = self._threads.get(thread_id)
@@ -202,29 +205,49 @@ class TurnEndBus:
         """The mirror's named transcript has not appeared yet (*key*), or that ended (#1223).
 
         *key* names the claim and when it was written, so a new claim — another
-        wake, another fresh start — is a new key.
+        wake, another fresh start — is a new key. A key that first appears while
+        a turn is running is that turn's: on a fresh start ``start_claude`` names
+        the session after the turn began, and a mirror started with the turn may
+        see a wake's name only after it began.
         """
         if key is None:
+            # The spent names stay on record: a stat that failed once must not
+            # hand an old name a second turn when it comes back (#1190).
             self._pending_claim.pop(thread_id, None)
-            self._claim_turn.pop(thread_id, None)
-        else:
-            self._pending_claim[thread_id] = key
-
-    def note_turn_started(self, thread_id: int) -> None:
-        """c-lord is about to send *thread_id* an instruction (#1223).
-
-        A named transcript appears only with the first instruction, so the grace
-        for "about to appear" counts from here — not from when the name was
-        written, which for a wake (``start_claude(prompt=None)``) can be long
-        before. Once per name: a name whose transcript never came after its
-        first turn does not hold every later turn (#1190).
-        """
-        key = self._pending_claim.get(thread_id)
-        if key is None:
             return
+        self._pending_claim[thread_id] = key
+        if thread_id in self._running_turn:
+            self._grant(thread_id, key)
+
+    def _grant(self, thread_id: int, key: str) -> None:
+        """Give *key* its one turn of grace, unless a turn already spent it."""
         granted = self._claim_turn.get(thread_id)
         if granted is None or granted[0] != key:
             self._claim_turn[thread_id] = (key, time.monotonic())
+
+    def note_turn_started(self, thread_id: int) -> object:
+        """c-lord is about to send *thread_id* an instruction (#1223).
+
+        A named transcript appears only with the first instruction, so the grace
+        for "about to appear" counts from the first turn that runs under the
+        name — not from when the name was written, which for a wake
+        (``start_claude(prompt=None)``) can be long before. Once per name: a
+        name whose transcript never came after its first turn does not hold any
+        later turn (#1190).
+
+        Returns the token to hand :meth:`note_turn_ended`.
+        """
+        token = object()
+        self._running_turn[thread_id] = token
+        key = self._pending_claim.get(thread_id)
+        if key is not None:
+            self._grant(thread_id, key)
+        return token
+
+    def note_turn_ended(self, thread_id: int, token: object) -> None:
+        """The turn :meth:`note_turn_started` returned *token* for is over (#1223)."""
+        if self._running_turn.get(thread_id) is token:
+            del self._running_turn[thread_id]
 
     def is_tailing(self, thread_id: int) -> bool:
         """Whether a mirror is tailing *thread_id*'s transcript (#1132).
@@ -259,6 +282,7 @@ class TurnEndBus:
         self._tailing.discard(thread_id)
         self._pending_claim.pop(thread_id, None)
         self._claim_turn.pop(thread_id, None)
+        self._running_turn.pop(thread_id, None)
 
     def size(self) -> int:
         """How many threads are on record — for the bound's own test."""

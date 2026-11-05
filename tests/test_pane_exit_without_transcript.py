@@ -220,3 +220,51 @@ def test_a_named_transcript_that_never_came_holds_only_its_first_turn(
 
     bus.note_pending_claim(THREAD, None)  # the transcript appeared, or the mirror stopped
     assert not bus.is_tailing(THREAD)
+
+
+def test_a_fresh_start_spends_its_name_on_its_own_first_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of #1223 (1): on a fresh start ``start_claude`` writes the name *after*
+    the turn began, so the name appears mid-turn. That turn is the name's first and
+    takes the grace; turn 2, ten minutes later, must not take it again and wait
+    120 s for a transcript that never came (#1190 coming back on turn 2)."""
+    from c_lord import turn_end_bus as bus_mod
+
+    now = {"t": 1000.0}
+    monkeypatch.setattr(bus_mod.time, "monotonic", lambda: now["t"])
+    bus = bus_mod.TurnEndBus()
+
+    bus.note_turn_started(THREAD)  # turn 1 begins; start_claude names the session...
+    bus.note_pending_claim(THREAD, "s@1")  # ...and the tail sees the name mid-turn
+    assert bus.is_tailing(THREAD), "the name's first turn is due its transcript"
+    now["t"] += 600
+    bus.note_turn_started(THREAD)  # turn 2: the transcript never came
+    assert not bus.is_tailing(THREAD), "turn 2 re-granted a name turn 1 already spent"
+
+
+async def test_first_prompt_after_a_wake_holds_even_if_the_mirror_starts_with_the_turn(
+    tmux_manager: MagicMock,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """Review of #1223 (2): after idle-sleep, a wake and a first message > 120 s later,
+    the mirror is created just before the turn runs. Its first poll may publish the
+    name only after the turn began; the turn is still the name's first and holds."""
+    import os
+
+    from c_lord.transcript.claim import claim_path
+    from c_lord.transcript.resolver import CLAIM_GRACE_SECONDS
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    write_claim(project, SESSION_ID)
+    woke = time.time() - CLAIM_GRACE_SECONDS - 60
+    os.utime(claim_path(project), (woke, woke))
+    mirror = TranscriptMirror(thread_id=THREAD, project_dir=project, sink=_sink, poll_interval=0.05)
+    mirror.start()
+    try:
+        events, calls, _ = await _run(tmux_manager, _script, start_grace=0.5)
+        assert [e.error for e in events if e.is_complete] == [None]
+        assert calls["n"] >= 40, f"closed early at poll {calls['n']} (#1132 is back)"
+    finally:
+        await mirror.stop()
