@@ -305,6 +305,9 @@ def _message_and_title(data: dict[str, Any]) -> tuple[str, str | None, web.Respo
         return "", None, web.json_response({"error": "message is required"}, status=400)
     if not isinstance(message, str):
         return "", None, web.json_response({"error": "message must be a string"}, status=400)
+    if _is_blank(message):
+        # #1288: an embed of zero-width spaces was posted (notify) or queued (schedule).
+        return "", None, web.json_response({"error": "message is required"}, status=400)
     title = data.get("title")
     if title is not None and not isinstance(title, str):
         return "", None, web.json_response({"error": "title must be a string"}, status=400)
@@ -912,7 +915,8 @@ class ApiServer:
         if err is not None:
             return err
         message = (raw_message or "").strip()
-        if not message:
+        # #1288: invisible-only text was posted to the lounge — the #1258 test.
+        if _is_blank(message):
             return web.json_response({"error": "message is required"}, status=400)
 
         raw_label, err = _text(data, "label")  # #1208
@@ -1213,7 +1217,8 @@ class ApiServer:
         if err is not None:
             return err
         content = (raw_content or "").strip()
-        if not content:
+        # #1288: invisible-only text was posted to the thread — the #1258 test.
+        if _is_blank(content):
             return web.json_response({"error": "content is required"}, status=400)
 
         raw_source, err = _text(data, "source")  # #1208
@@ -1276,7 +1281,7 @@ class ApiServer:
         if err is not None:
             return err
         content = (raw_content or "").strip()
-        if not content:
+        if _is_blank(content):  # #1288
             return web.json_response({"error": "content is required"}, status=400)
 
         # Optional attachment — resolve and validate before touching Discord.
@@ -1447,7 +1452,7 @@ class ApiServer:
         if err is not None:
             return err
         question = (raw_question or "").strip()
-        if not question:
+        if _is_blank(question):  # #1288
             return web.json_response({"error": "question is required"}, status=400)
 
         choices = data.get("choices")
@@ -1467,7 +1472,7 @@ class ApiServer:
                         {"error": f"choices[{i}].{key} must be a string"}, status=400
                     )
             label = (raw_label or "").strip()
-            if not label:
+            if _is_blank(label):  # #1288: nothing visible to reply with
                 return web.json_response({"error": f"choices[{i}].label is required"}, status=400)
             desc = (raw_desc or "").strip()
             normalized.append((label, desc))
