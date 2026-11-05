@@ -587,3 +587,66 @@ async def test_run_claude_with_config_hands_on_prompt_sent_to_the_runner(monkeyp
         turn_events.reset()
         _run_helper._IN_FLIGHT.clear()
     assert calls == ["hook"]
+
+
+# -- Shutdown: refused clears are written before the process stops ----------
+
+
+async def test_a_refused_clear_is_written_at_shutdown(tmp_path) -> None:  # noqa: ANN001
+    """A refused clear waits in memory. At shutdown (the DB free again) the chat
+    cog's unload writes it, so a real restart does not bring P's trigger back."""
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.update_trigger_message(42, 555)
+    await repo.save(42, "sess-1")
+    await _refused_clear(repo, {555})
+    assert _row_trigger(db) == 555
+    cog = _make_chat_cog()
+    cog.repo = repo
+    await cog.cog_unload()
+    assert _row_trigger(db) is None
+    assert not repo.clear_is_waiting(42, 555)
+
+
+async def test_the_shutdown_lamp_write_back_skips_a_forgotten_trigger(tmp_path) -> None:  # noqa: ANN001
+    """#870 writes a running turn's lamp message back at shutdown. One whose clear
+    is still waiting (a /skill forgot it) is not written back."""
+    db = str(tmp_path / "s.db")
+    await init_db(db)
+    repo = SessionRepository(db)
+    await repo.update_trigger_message(42, 555)
+    await repo.save(42, "sess-1")
+    await _refused_clear(repo, {555})
+    cog = _make_chat_cog()
+    cog.repo = repo
+    cog._resume_repo = MagicMock(mark=AsyncMock())
+    cog._active_runners[42] = MagicMock()
+    cog._turn_triggers[42] = 555
+    written: list[int] = []
+    real_update = repo.update_trigger_message
+
+    async def update(thread_id: int, message_id: int) -> None:
+        written.append(message_id)
+        await real_update(thread_id, message_id)
+
+    repo.update_trigger_message = update  # type: ignore[method-assign]
+    await cog.cog_unload()
+    assert written == []
+    assert _row_trigger(db) is None
+    cog._resume_repo.mark.assert_awaited()
+
+
+async def test_a_turn_that_fails_before_its_run_is_not_left_in_flight(tmp_path) -> None:  # noqa: ANN001
+    """The in-flight mark is set before the trigger is recorded; a turn that
+    fails before ``run_claude_with_config`` (here: building its RunConfig) must
+    not leave it, or a later /skill would never forget that trigger."""
+    import pytest
+
+    repo, _bot_, _ch, mirror = await _setup(tmp_path)
+    with (
+        patch("c_lord.cogs.claude_chat.RunConfig", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError),
+    ):
+        await _chat_turn(repo, mirror, 556)
+    assert not repo.trigger_in_flight(42, 556)

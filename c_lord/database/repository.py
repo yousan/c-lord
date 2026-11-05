@@ -8,6 +8,8 @@ from dataclasses import dataclass, fields
 
 import aiosqlite
 
+from ..utils.logger import log_ctx
+
 logger = logging.getLogger(__name__)
 
 
@@ -532,6 +534,33 @@ class SessionRepository:
             self._unapplied_clears[thread_id] = left
         else:
             self._unapplied_clears.pop(thread_id, None)
+
+    def clear_is_waiting(self, thread_id: int, message_id: int) -> bool:
+        """Whether *message_id* is a refused clear still waiting to land (#1262)."""
+        return message_id in self._unapplied_clears.get(thread_id, ())
+
+    async def flush_unapplied_clears(self) -> None:
+        """Try to land every refused clear now — at shutdown (#1262).
+
+        They are held in memory, so a process that stops with one waiting would
+        bring the forgotten trigger back after the restart. Exact ids only; one
+        that still fails is logged and left (the next process cannot know it).
+        """
+        for thread_id, among in list(self._unapplied_clears.items()):
+            try:
+                async with aiosqlite.connect(self.db_path) as db:
+                    await self._execute_clear(db, thread_id, among)
+                    await db.commit()
+            except Exception:
+                logger.warning(
+                    "%s could not forget the trigger message(s) %s at shutdown (#1262)",
+                    log_ctx(thread_id=thread_id),
+                    sorted(among),
+                    exc_info=True,
+                )
+                continue
+            if self._unapplied_clears.get(thread_id) == among:
+                del self._unapplied_clears[thread_id]
 
     @staticmethod
     async def _execute_clear(

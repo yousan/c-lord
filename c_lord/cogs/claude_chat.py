@@ -2759,6 +2759,24 @@ class ClaudeChatCog(commands.Cog):
         return thread
 
     async def cog_unload(self) -> None:
+        """Record the mid-run sessions for a restart notice, then flush clears.
+
+        #1262: the trigger clears the database refused (locked) are held in
+        memory and would die with the process — written last, after the #870
+        lamp write-back, so nothing written here puts a cleared trigger back.
+        """
+        try:
+            await self._record_sessions_for_restart()
+        finally:
+            try:
+                await self.repo.flush_unapplied_clears()
+            except Exception:
+                logger.warning(
+                    "could not flush the waiting trigger clears at shutdown (#1262)",
+                    exc_info=True,
+                )
+
+    async def _record_sessions_for_restart(self) -> None:
         """Record all mid-run Claude sessions so they get a restart notice.
 
         Called by discord.py whenever the cog is removed — including during a
@@ -2803,6 +2821,12 @@ class ClaudeChatCog(commands.Cog):
                 lamp_message = self._adopted_lamps.get(thread_id) or self._turn_triggers.get(
                     thread_id
                 )
+                # #1262: a trigger a /skill turn forgot (its clear still waiting
+                # on a locked DB) must not be written back.
+                if lamp_message is not None and (
+                    self.repo.clear_is_waiting(thread_id, lamp_message) is True
+                ):
+                    lamp_message = None
                 if lamp_message is not None:
                     try:
                         await self.repo.update_trigger_message(thread_id, lamp_message)
@@ -4702,71 +4726,80 @@ class ClaudeChatCog(commands.Cog):
                         exc_info=True,
                     )
             # #1262: from here until its prompt is in the pane (or the turn
-            # ends), a /skill sent meanwhile does not take this trigger away.
+            # ends), a /skill sent meanwhile does not take this trigger away. The
+            # run's ``finally`` removes the mark; this one covers the steps before.
             with contextlib.suppress(Exception):
                 self.repo.note_trigger_in_flight(thread.id, user_message.id)
-            # Record the trigger message so TranscriptMirror / ApiServer can
-            # thread the final answer back as a Discord reply (Issue #115).
-            if transcript_cog is not None:
-                with contextlib.suppress(Exception):
-                    transcript_cog.set_trigger_message(thread.id, user_message.id)
-            with contextlib.suppress(Exception):
-                await self.repo.update_trigger_message(thread.id, user_message.id)
-
-            stop_view = self._make_stop_view(runner, thread)
-            # #632: the Stop-button notice is decoration too. If Discord refuses
-            # it (rate limit, revoked permission, closed session) the turn must
-            # still run — StopView already treats a missing message as "nothing
-            # to delete", so the only thing lost is the button.
-            notice = (
-                f"{STOP_MESSAGE_PREFIX} (`{window_name}`)" if window_name else STOP_MESSAGE_PREFIX
-            )
             try:
-                stop_view.set_message(await thread.send(notice, view=stop_view))
-            except Exception:
-                logger.warning(
-                    "%s could not post the Stop-button notice; continuing the turn",
-                    log_ctx(thread_id=thread.id),
-                    exc_info=True,
-                )
+                # Record the trigger message so TranscriptMirror / ApiServer can
+                # thread the final answer back as a Discord reply (Issue #115).
+                if transcript_cog is not None:
+                    with contextlib.suppress(Exception):
+                        transcript_cog.set_trigger_message(thread.id, user_message.id)
+                with contextlib.suppress(Exception):
+                    await self.repo.update_trigger_message(thread.id, user_message.id)
 
-            # #562: kept in a variable so the turn-end ping below can read the
-            # run's outcome — a turn that produced nothing must not be announced
-            # as finished.
-            run_config = RunConfig(
-                thread=thread,
-                runner=runner,
-                repo=self.repo,
-                prompt=prompt,
-                session_id=session_id,
-                status=status,
-                registry=self._registry,
-                ask_repo=self._ask_repo,
-                lounge_repo=self._lounge_repo,
-                settings_repo=self._settings_repo,
-                stop_view=stop_view,
-                session_dir_manager=session_dir_manager,
-                tmux_manager=tmux_manager,
-                image_paths=image_paths,
-                working_dir=working_dir or None,
-                authorizer=self._authorizer,
-                # #480: ping the requester of THIS turn when an
-                # interactive prompt (permission/plan/elicitation/ask)
-                # blocks it — a mid-turn pause never reaches the
-                # turn-end mention.
-                notify_user_id=notify_user_id,
-                # #681: who hears about a turn that ended in an error. The ❌
-                # embed carries the cause; this is what makes it push.
-                failure_notify_id=failure_notify_id,
-                # #856: persist the naming pass's stash the moment the row
-                # exists, not on a next naming pass that may never come.
-                on_session_saved=self.on_session_saved,
-                started_by=started_by,
-                # #1262: when this message's prompt is really in the pane, it is
-                # the turn the pane answers — a /skill sent before it no longer
-                # takes this trigger away, one sent after it does.
-                on_prompt_sent=self._prompt_sent_noter(thread.id, user_message.id),
-            )
+                stop_view = self._make_stop_view(runner, thread)
+                # #632: the Stop-button notice is decoration too. If Discord refuses
+                # it (rate limit, revoked permission, closed session) the turn must
+                # still run — StopView already treats a missing message as "nothing
+                # to delete", so the only thing lost is the button.
+                notice = (
+                    f"{STOP_MESSAGE_PREFIX} (`{window_name}`)"
+                    if window_name
+                    else STOP_MESSAGE_PREFIX
+                )
+                try:
+                    stop_view.set_message(await thread.send(notice, view=stop_view))
+                except Exception:
+                    logger.warning(
+                        "%s could not post the Stop-button notice; continuing the turn",
+                        log_ctx(thread_id=thread.id),
+                        exc_info=True,
+                    )
+
+                # #562: kept in a variable so the turn-end ping below can read the
+                # run's outcome — a turn that produced nothing must not be announced
+                # as finished.
+                run_config = RunConfig(
+                    thread=thread,
+                    runner=runner,
+                    repo=self.repo,
+                    prompt=prompt,
+                    session_id=session_id,
+                    status=status,
+                    registry=self._registry,
+                    ask_repo=self._ask_repo,
+                    lounge_repo=self._lounge_repo,
+                    settings_repo=self._settings_repo,
+                    stop_view=stop_view,
+                    session_dir_manager=session_dir_manager,
+                    tmux_manager=tmux_manager,
+                    image_paths=image_paths,
+                    working_dir=working_dir or None,
+                    authorizer=self._authorizer,
+                    # #480: ping the requester of THIS turn when an
+                    # interactive prompt (permission/plan/elicitation/ask)
+                    # blocks it — a mid-turn pause never reaches the
+                    # turn-end mention.
+                    notify_user_id=notify_user_id,
+                    # #681: who hears about a turn that ended in an error. The ❌
+                    # embed carries the cause; this is what makes it push.
+                    failure_notify_id=failure_notify_id,
+                    # #856: persist the naming pass's stash the moment the row
+                    # exists, not on a next naming pass that may never come.
+                    on_session_saved=self.on_session_saved,
+                    started_by=started_by,
+                    # #1262: when this message's prompt is really in the pane, it is
+                    # the turn the pane answers — a /skill sent before it no longer
+                    # takes this trigger away, one sent after it does.
+                    on_prompt_sent=self._prompt_sent_noter(thread.id, user_message.id),
+                )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    self.repo.end_trigger_in_flight(thread.id, user_message.id)
+                raise
+
             try:
                 await run_claude_with_config(run_config)
             finally:
