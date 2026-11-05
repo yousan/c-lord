@@ -1,0 +1,40 @@
+[38;5;246m[48;5;237m❯ [38;5;231mRun exactly this Bash command as[39m 
+  [38;5;231mONE Bash call with a literal [39m    
+  [38;5;231mnewline between the two lines [39m   
+  [38;5;231m(do not change it): first line: [39m 
+  [38;5;231mecho one   second line: rm -rf [39m  
+  [38;5;231m./junk[39m                           
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command 
+  ⎿  Interrupte· What should Claude
+
+✻[39m [38;5;246mWorked for 5s · done 5:49 AM
+
+[48;5;237m❯ [38;5;231mUse the Edit tool to change [39m     
+  [38;5;231mhello to goodbye in ./a_rather_l[39m 
+  [38;5;231mong_directory_name/another_long_[39m 
+  [38;5;231mfile_name_for_wrapping.txt (read[39m 
+  [38;5;231mit first if required).[39m           
+
+[49m  [38;5;246mRead [1m1[0m[38;5;246m file 
+
+●[39m [1mUpdate[0m(]8;id=1715480;file:///tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1565257080468807710/ad6b2411-9a80-4fbe-aacd-9eec20e92c64/scratchpad/live1277/ws/a_rather_long_directory_name/another_long_file_name_for_wrapping.txt\…le_name_for_wrapping.txt]8;;\)
+
+[38;5;153m───────────────────────────────────
+[39m [1m[38;5;153mEdit file
+[0m [38;5;246m…_long_file_name_for_wrapping.txt
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[38;5;167m[48;5;52m 1 -[38;5;231mhello                          
+[38;5;77m[48;5;22m 1 +[38;5;231mgoodbye                        
+[38;5;239m[49m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to make this edit to
+ [1manother_long_file_name_for_wrappi
+[0m [1mng.txt[0m?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes
+[39m   [38;5;246m2. [39mYes, and switch to [1maccept 
+[0m      [1medits (auto-approve file 
+[0m      [1medits and common file 
+[0m      [1mcommands)[0m for this session
+   [38;5;246m3. [39mNo[1mhift+tab)
+
+[0m [38;5;246mEsc to cancel · Tab to amend

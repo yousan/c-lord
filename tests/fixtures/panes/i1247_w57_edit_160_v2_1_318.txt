@@ -1,0 +1,40 @@
+
+[38;5;220m⚠[39m [38;5;220mYour login expires in 3 days[38;5;246m · run /login to renew
+
+[48;5;237m❯ [38;5;231mUse the Write tool (not Edit, not Bash) to overwrite the existing file ./notes.txt with the single line bye. Do not read it first unless the tool requires [39m   
+  [38;5;231mit.[39m                                                                                                                                                           
+
+[38;5;211m[49m●[39m [1mWrite[0m(]8;id=gc1uof;file:///tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1565257080468807710/ad6b2411-9a80-4fbe-aacd-9eec20e92c64/scratchpad/live1277/ws/notes.txt\notes.txt]8;;\)
+[38;5;246m  ⎿  [38;5;239mUser rejected update to [1m]8;id=gc1uof;file:///tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1565257080468807710/ad6b2411-9a80-4fbe-aacd-9eec20e92c64/scratchpad/live1277/ws/notes.txt\notes.txt]8;;\
+[0m     [2m[38;5;167m[48;5;52m 1 -[38;5;231mhello                                                                                                                                           
+[0m     [2m[38;5;77m[48;5;22m 1 +[38;5;231mbye                                                                                                                                             
+
+[0m[38;5;246m✻[39m [38;5;246mChurned for 6s · done 5:48 AM
+
+[48;5;237m❯ [38;5;231mRun exactly this Bash command as ONE Bash call with a literal newline between the two lines (do not change it): first line: echo one   second line: rm -rf [39m   
+  [38;5;231m./junk[39m                                                                                                                                                        
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command 
+  ⎿  Interrupted · What should Claude do instead?
+
+✻[39m [38;5;246mWorked for 5s · done 5:49 AM
+
+[48;5;237m❯ [38;5;231mUse the Edit tool to change hello to goodbye in ./a_rather_long_directory_name/another_long_file_name_for_wrapping.txt (read it first if required).[39m           
+
+[49m  [38;5;246mRead [1m1[0m[38;5;246m file 
+
+●[39m [1mUpdate[0m(]8;id=1715480;file:///tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1565257080468807710/ad6b2411-9a80-4fbe-aacd-9eec20e92c64/scratchpad/live1277/ws/a_rather_long_directory_name/another_long_file_name_for_wrapping.txt\a_rather_long_directory_name/another_long_file_name_for_wrapping.txt]8;;\)
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mEdit file
+[0m [38;5;246ma_rather_long_directory_name/another_long_file_name_for_wrapping.txt
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[38;5;167m[48;5;52m 1 -[38;5;231mhello                                                                                                                                                       
+[38;5;77m[48;5;22m 1 +[38;5;231mgoodbye                                                                                                                                                     
+[38;5;239m[49m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to make this edit to [1manother_long_file_name_for_wrapping.txt[0m?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes
+[39m   [38;5;246m2. [39mYes, and switch to [1maccept edits (auto-approve file edits and common file commands)[0m for this session [1m(shift+tab)
+[0m   [38;5;246m3. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend

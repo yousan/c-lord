@@ -1,0 +1,40 @@
+
+[38;5;246m✻[39m [38;5;246mChurned for 6s · done 5:48 AM
+
+[48;5;237m❯ [38;5;231mRun exactly this Bash command as [39m 
+  [38;5;231mONE Bash call with a literal [39m     
+  [38;5;231mnewline between the two lines (do[39m 
+  [38;5;231mnot change it): first line: echo[39m  
+  [38;5;231mone   second line: rm -rf ./junk[39m  
+
+[38;5;246m[49m●[39m Printing "one" and deleting the
+  junk directory
+[38;5;246m  ⎿  $ echo one
+[39m     [38;5;246mrm -rf ./junk
+
+[38;5;153m────────────────────────────────────
+[39m [1m[38;5;153mBash command
+[0m [1mTip: auto mode handles these 
+[0m [1mprompts for you — choose "switch 
+[0m [1mto auto mode" below
+[0m [38;5;246mPrint "one" and delete the junk 
+[39m [38;5;246mdirectory
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m [2m│[0m echo one
+ [2m│[0m rm -rf ./junk
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to proceed?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes
+[39m   [38;5;246m2. [39mYes, and always allow access
+      to
+      [1m/tmp/claude-1000/-home-yousan-
+[0m      [1mc-lord-sessions-15057478314478
+[0m      [1m83806-1565257080468807710/ad6b
+[0m      [1m2411-9a80-4fbe-aacd-9eec20e92c
+[0m      [1m64/scratchpad/live1277/ws/junk
+[0m   [38;5;246m3. [39mYes, and switch to auto mode[38;5;246m ·
+[39m      [38;5;246mauto mode handles these 
+[39m      [38;5;246mprompts for you
+[39m   [38;5;246m4. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend
