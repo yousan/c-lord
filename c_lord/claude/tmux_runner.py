@@ -1604,6 +1604,10 @@ class TmuxClaudeRunner:
         # send / start runs in a worker thread and can take ~20s, #1169). A turn
         # cancelled after this may still have delivered its keys.
         self.on_send_started: Callable[[], None] | None = None
+        # #1271: the last send / start this run began was refused (``ok=False`` —
+        # nothing reached the pane). A turn cancelled after that (while the
+        # runner asks the pane why) delivered nothing, though the send began.
+        self.send_refused = False
         self._last_capture: str = ""
         # #809: why the last menu answer did not reach the TUI, in words the
         # thread can be shown. Empty until an answer fails.
@@ -1753,6 +1757,7 @@ class TmuxClaudeRunner:
 
     def _note_send_started(self) -> None:
         """Tell :attr:`on_send_started` the prompt is being handed to tmux (#1262)."""
+        self.send_refused = False
         hook = self.on_send_started
         if hook is None:
             return
@@ -1892,6 +1897,7 @@ class TmuxClaudeRunner:
                 as_command=self._slash_command,
             )
             if not ok:
+                self.send_refused = True  # #1271: nothing reached the pane
                 refused = self._take_send_failure()
                 # #560: two very different failures reach this branch. Either the
                 # pane never took the input (#527), or the text is typed in and
@@ -1960,6 +1966,7 @@ class TmuxClaudeRunner:
                     as_command=self._slash_command,
                 )
                 if not ok:
+                    self.send_refused = True  # #1271: nothing reached the pane
                     yield StreamEvent(
                         raw={},
                         message_type=MessageType.RESULT,
@@ -1990,6 +1997,7 @@ class TmuxClaudeRunner:
                         as_command=self._slash_command,
                     )
                     if not ok:
+                        self.send_refused = True  # #1271: nothing reached the pane
                         yield StreamEvent(
                             raw={},
                             message_type=MessageType.RESULT,
@@ -2017,6 +2025,7 @@ class TmuxClaudeRunner:
                     as_command=self._slash_command,
                 )
                 if not ok:
+                    self.send_refused = True  # #1271: nothing reached the pane
                     yield StreamEvent(
                         raw={},
                         message_type=MessageType.RESULT,

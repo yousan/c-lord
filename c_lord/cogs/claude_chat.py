@@ -4448,7 +4448,11 @@ class ClaudeChatCog(commands.Cog):
         ``send_input`` may still have been running in the worker thread (#1169
         can take ~20s), the keys may well have landed and Claude may answer
         after the restart — so the trigger stays. A turn cancelled before the
-        send began delivered nothing and is dropped like any other (W57 r14).
+        send began delivered nothing and is dropped like any other (W57 r14),
+        as is one whose send tmux refused before the cancel (#1271).
+
+        Dropped means replaced by the trigger of the turn delivered last when
+        nothing newer was recorded (#1270), else forgotten.
         """
         try:
             unsent = self.repo.end_trigger_in_flight(thread_id, message_id) is True
@@ -4457,6 +4461,25 @@ class ClaudeChatCog(commands.Cog):
         if not unsent or send_may_have_landed:
             return
         mirror = getattr(self.bot, "transcript_mirror_cog", None)
+        # #1270: when nothing newer was recorded, the turn delivered last (still
+        # being answered, maybe) gets its trigger back — dropping to nothing
+        # would post its answer unquoted and ping the owner after a restart.
+        restored: int | None = None
+        try:
+            restored = await self.repo.restore_sent_trigger(thread_id, replacing=message_id)
+        except Exception:
+            logger.warning(
+                "%s could not give the trigger back to the turn delivered last; "
+                "forgetting the undelivered one instead (#1270)",
+                log_ctx(thread_id=thread_id),
+                exc_info=True,
+            )
+        if isinstance(restored, int):
+            restore = getattr(mirror, "restore_trigger_message", None)
+            if callable(restore):
+                with contextlib.suppress(Exception):
+                    restore(thread_id, restored, only=message_id)
+            return
         forget = getattr(mirror, "forget_trigger_message", None)
         if callable(forget):
             with contextlib.suppress(Exception):
@@ -4783,8 +4806,19 @@ class ClaudeChatCog(commands.Cog):
                 if transcript_cog is not None:
                     with contextlib.suppress(Exception):
                         transcript_cog.set_trigger_message(thread.id, user_message.id)
-                with contextlib.suppress(Exception):
+                try:
                     await self.repo.update_trigger_message(thread.id, user_message.id)
+                except Exception:
+                    # #1254: refused (locked) — the repository keeps it for the
+                    # next save / shutdown. Not silent (#678): left on the row,
+                    # the older message's author is who a restart's ❌ pings.
+                    logger.warning(
+                        "%s could not record the trigger message %s now; "
+                        "it is written with the next session save (#1254)",
+                        log_ctx(thread_id=thread.id),
+                        user_message.id,
+                        exc_info=True,
+                    )
 
                 stop_view = self._make_stop_view(runner, thread)
                 # #632: the Stop-button notice is decoration too. If Discord refuses
@@ -4878,7 +4912,11 @@ class ClaudeChatCog(commands.Cog):
                 await self._end_trigger_in_flight(
                     thread.id,
                     user_message.id,
-                    send_may_have_landed=run_cancelled and send_began.is_set(),
+                    # #1271: a send tmux refused (ok=False) delivered nothing,
+                    # even when the cancel came while the runner asked why.
+                    send_may_have_landed=run_cancelled
+                    and send_began.is_set()
+                    and getattr(runner, "send_refused", False) is not True,
                 )
 
                 with contextlib.suppress(Exception):
