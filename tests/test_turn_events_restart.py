@@ -128,3 +128,106 @@ async def test_an_unreadable_state_file_is_ignored(log):  # noqa: F811
     turn_events.note_turn_end(THREAD_ID, 0)
     await turn_events.drain()
     assert _lines(log) == []
+
+
+def _hold_for_agents(outstanding: int = 1) -> None:
+    info = turn_events.begin_turn(_thread(), StartedBy("webhook", "7", "Captain Hook"))
+    turn_events.note_turn_end(THREAD_ID, outstanding)
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info)
+
+
+async def test_a_restart_crossed_turn_and_a_restored_hold_send_one_completion(
+    log,  # noqa: F811
+    monkeypatch,
+):
+    """Review of #1249: the turn that crossed the restart is the thread's end.
+
+    Its ``restart_crossed`` completion and the restored hold must not both go
+    out — the receiver would be told twice that the thread finished.
+    """
+    _hold_for_agents()
+    await turn_events.drain()
+    turn_events.reset()
+
+    monkeypatch.setattr("c_lord.transcript.mirror.background_agents_running", lambda _thread_id: 0)
+    turn_events.announce_recovered_turn(
+        _thread(), StartedBy("user", "9"), started_at=None, failure_reason=None
+    )
+    turn_events.note_turn_end(THREAD_ID, 0)
+    await turn_events.drain()
+
+    events = [(e["kind"], e.get("reason")) for e in _lines(log)]
+    assert events == [("completion", "restart_crossed")], events
+    assert not turn_events.held_state_path().exists()
+
+
+async def test_a_menu_wait_hold_is_not_carried_over_a_restart(log):  # noqa: F811
+    """Review of #1249: the previous process's menus are retired at startup (#671).
+
+    Nobody can answer them, so a hold waiting on one must not come back as a
+    ``completion`` after the restart.
+    """
+    info = turn_events.begin_turn(_thread(), StartedBy("webhook", "7", "Captain Hook"))
+    turn_events.end_turn(info)
+    turn_events.finish_turn(info, awaiting_answer=True)
+    await turn_events.drain()
+    assert _lines(log) == []
+
+    turn_events.reset()
+    turn_events.note_turn_end(THREAD_ID, 0)
+    await turn_events.drain()
+    assert _lines(log) == []
+
+
+async def test_a_release_that_cannot_be_saved_says_a_restart_may_repeat_it(
+    log,  # noqa: F811
+    monkeypatch,
+    caplog,
+):
+    import logging
+
+    _hold_for_agents()
+
+    def broken(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise OSError("disk full")
+
+    # Releasing the only hold removes the file; that removal fails.
+    monkeypatch.setattr(turn_events.Path, "unlink", broken)
+    with caplog.at_level(logging.WARNING, logger="c_lord.turn_events"):
+        turn_events.note_turn_end(THREAD_ID, 0)
+        await turn_events.drain()
+
+    assert len(_lines(log)) == 1
+    assert "may be sent again after a restart" in caplog.text
+
+
+async def test_startup_restores_the_held_completions(log, monkeypatch):  # noqa: F811
+    """The real startup path (``TranscriptMirrorCog.on_ready``) reads the holds back.
+
+    Without it, a hold whose limit ran out while c-lord was down would wait for
+    a turn event that may never come.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from c_lord.cogs import transcript_mirror as cog_module
+
+    monkeypatch.setenv(turn_events.ENV_DEFER_MAX, "60")
+    _hold_for_agents()
+    await turn_events.drain()
+    turn_events.reset()
+    real = time.time
+    monkeypatch.setattr(turn_events.time, "time", lambda: real() + 120)
+
+    monkeypatch.setattr(cog_module, "live_claude_panes", lambda: set())
+    monkeypatch.setattr(cog_module, "notify_host_restart_stops", AsyncMock(return_value=0))
+    repo = MagicMock()
+    repo.list_all = AsyncMock(return_value=[])
+    cog = cog_module.TranscriptMirrorCog(MagicMock(), session_repo=repo)
+    try:
+        await cog.on_ready()
+        await turn_events.drain()
+    finally:
+        await cog.cog_unload()
+
+    assert [e.get("reason") for e in _lines(log)] == ["background_agents_unresolved"]

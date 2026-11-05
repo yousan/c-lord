@@ -496,6 +496,14 @@ def announce_recovered_turn(
     """
     if not enabled():
         return
+    # Review of #1249: a hold restored from disk is this thread's earlier end;
+    # this turn's own event replaces it, or the receiver hears "done" twice.
+    _ensure_held_loaded()
+    restored = _HELD.pop(thread.id, None)
+    if restored is not None:
+        if restored.timer is not None:
+            restored.timer.cancel()
+        _save_held()
     info = _info_for(thread, started_by)
     info.baseline_reply_id = 0
     if started_at is not None:
@@ -575,7 +583,12 @@ def _release(thread_id: int, reason: str | None) -> bool:
         return False
     if held.timer is not None:
         held.timer.cancel()
-    _save_held()
+    if not _save_held():
+        logger.warning(
+            "%s the released completion is still on disk — it may be sent again after "
+            "a restart (#1249)",
+            log_ctx(thread_id=thread_id),
+        )
     _spawn(_deliver("completion", held.info, reason=reason or held.reason))
     return True
 
@@ -641,8 +654,13 @@ def _info_from_dict(raw: dict[str, Any]) -> TurnInfo:
     )
 
 
-def _save_held() -> None:
-    """Write every held completion to disk. Never raises: a failure only loses the carry-over."""
+def _save_held() -> bool:
+    """Write the held completions to disk; whether that worked. Never raises.
+
+    Only holds for background agents are written. A hold waiting on a menu
+    answer (#1170) is not: the next process retires the old menus (#671), so
+    nobody could answer it, and the time it was posted (``_BLOCKED_AT``) is gone.
+    """
     path = held_state_path()
     entries = [
         {
@@ -652,11 +670,12 @@ def _save_held() -> None:
             "deadline": held.deadline,
         }
         for held in _HELD.values()
+        if held.expires
     ]
     try:
         if not entries:
             path.unlink(missing_ok=True)
-            return
+            return True
         path.parent.mkdir(parents=True, exist_ok=True)
         body = json.dumps({"v": _HELD_FILE_VERSION, "held": entries}, ensure_ascii=False)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -668,6 +687,8 @@ def _save_held() -> None:
             path,
             exc_info=True,
         )
+        return False
+    return True
 
 
 def _ensure_held_loaded() -> None:
