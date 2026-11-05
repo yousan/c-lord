@@ -617,8 +617,9 @@ task's `prompt: ["x"]` ran as the instruction `['x']`). Absent or `null` is the 
 field out (`label` falls back to `AI`, `source` to `cli`, `reason` to `self_restart`; a `PATCH` with
 `"prompt": null` does not touch the prompt). An empty `prompt` is a `400 {"error": "prompt is
 required"}` on `PATCH` as on `POST`, and the saved prompt stays as it was (#1229 — before, `PATCH`
-saved `""` with a 200 and every run after that sent Claude an empty instruction). `name` cannot be
-changed with `PATCH`. The same holds for each choice's `label` / `description`
+saved `""` with a 200 and every run after that sent Claude an empty instruction). A `prompt` (or a
+`POST`'s `name`) of only spaces, tabs or newlines counts as empty, as on `/api/spawn` (#1238 —
+before, `"   "` was saved with a 201 / 200). `name` cannot be changed with `PATCH`. The same holds for each choice's `label` / `description`
 on `/api/prompt-choice` (`choices[0].label must be a string`; a `null` label is "label is required").
 
 Integers must also fit SQLite's 64-bit `INTEGER` (−2^63 … 2^63−1): a larger `interval_seconds`,

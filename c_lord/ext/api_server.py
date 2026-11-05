@@ -680,9 +680,13 @@ class ApiServer:
                 return web.json_response({"error": f"{field} is required"}, status=400)
         for field in ("name", "prompt"):
             # #1208: ``["x"]`` was saved through ``str()`` as the prompt ``['x']``.
-            _, err = _text(data, field)
+            text, err = _text(data, field)
             if err is not None:
                 return err
+            if not (text or "").strip():
+                # #1238: ``"   "`` was saved and woke Claude with no instruction
+                # on every run; /api/spawn already strips before this check.
+                return web.json_response({"error": f"{field} is required"}, status=400)
         run_immediately = data.get("run_immediately", True)
         if not isinstance(run_immediately, bool):
             return _not_a_boolean("run_immediately")
@@ -761,9 +765,10 @@ class ApiServer:
             prompt, err = _text(data, "prompt")  # #1208: no more str(["x"]) -> "['x']"
             if err is not None:
                 return err
-            if not prompt:
+            if not (prompt or "").strip():
                 # #1229: POST refuses an empty prompt; PATCH saved it with a 200,
                 # and every run after that woke Claude with no instruction.
+                # #1238: whitespace only is empty too, as for POST and /api/spawn.
                 return web.json_response({"error": "prompt is required"}, status=400)
             patch_kwargs["prompt"] = prompt
         if "interval_seconds" in data:
