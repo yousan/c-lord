@@ -394,6 +394,11 @@ class ResidentCapLoop:
         # windows are closed rather than skipped — skipped, each one held a
         # slot forever and a live workspace was slept in its place (#1086).
         self._gone: set[int] = set()
+        # Threads whose failed sleep got an unanswered re-read last tick (#1219,
+        # review of f15c8ee). Tried last on the next tick: otherwise two stuck
+        # oldest ones used up the tick's make-up every time and held the cap
+        # above its limit for good.
+        self._unanswered_last_tick: set[int] = set()
         self._task: object | None = None
 
     @property
@@ -756,6 +761,8 @@ class ResidentCapLoop:
             )
             if tid not in self._unresolvable
         ]
+        deferred = self._unanswered_last_tick
+        victims = [t for t in victims if t not in deferred] + [t for t in victims if t in deferred]
         if not victims:
             # Say so: "over the cap and doing nothing" must not look like "fine".
             # Sampled, because a fleet that is entirely busy stays over the cap
@@ -784,6 +791,7 @@ class ResidentCapLoop:
         label = f"{self._limit}本"
         slept = 0
         unanswered = 0  # failed sleeps whose re-read tmux did not answer (#1219)
+        self._unanswered_last_tick = set()
         for thread_id in victims:
             if slept >= over:
                 break
@@ -818,6 +826,7 @@ class ResidentCapLoop:
                     # failure per tick is made up for; a second ends the tick
                     # (about over+1 at worst), and the next tick counts again.
                     unanswered += 1
+                    self._unanswered_last_tick.add(thread_id)
                     quiet = self._quiet.sample("cap-reread-unanswered")
                     if quiet.emit:
                         logger.warning(

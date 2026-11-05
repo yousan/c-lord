@@ -243,3 +243,28 @@ async def test_sleep_impl_failed_kill_stays_failed_unless_tmux_says_gone() -> No
         with patch("c_lord.tmux.is_resident_anywhere", return_value=elsewhere):
             out = await cog._sleep_workspace_impl(channel=_thread3(), reason=MagicMock())
         assert out is False, (second_look, elsewhere)
+
+
+async def test_two_stuck_oldest_with_unanswered_re_reads_do_not_hold_the_cap() -> None:
+    """Review of f15c8ee: with the two oldest stuck (kill always fails, re-read never
+    answers), the oldest used the one make-up and the next ended the tick — every
+    tick, so nothing behind them was ever slept. They go to the end of the next
+    tick's order, so the ones behind them get tried."""
+    resident = {1, 2, 3, 4, 5, 6}
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        if channel.id in (5, 6):
+            return False
+        resident.discard(channel.id)
+        return True
+
+    loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, 6, 3)
+    with (
+        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
+        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        for _ in range(50):
+            await loop.tick()
+    assert len(resident) <= 3, f"still {sorted(resident)} resident after 50 ticks (limit 3)"
+    assert {5, 6} <= resident
