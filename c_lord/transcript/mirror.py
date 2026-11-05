@@ -972,6 +972,10 @@ class TranscriptMirror:
         # #908/#1131: the CLI's API-error text when the open turn's latest reply
         # is one (None once Claude answers past it).
         self._turn_api_error: str | None = None
+        # #1251: the API-error lines already posted in the open turn. A turn the
+        # safeguards refuse request after request wrote the same error 4 times in
+        # 23 s, and each one became the same line in the thread.
+        self._turn_api_error_lines: set[str] = set()
         # tool_use ids already delivered — a transcript line re-read after a
         # rewrite (#433) must not attach the same files a second time.
         self._delivered_user_files: set[str] = set()
@@ -1054,6 +1058,7 @@ class TranscriptMirror:
         self._turn_open = True
         self._turn_by_notification = False
         self._turn_self_started = False
+        self._turn_api_error_lines.clear()
 
     async def _on_unresolved(self, report: UnresolvedTranscript) -> None:
         """Say out loud that this thread's transcript cannot be found (#773/#585).
@@ -1539,6 +1544,9 @@ class TranscriptMirror:
                         turn_end_bus.note_prompt(self.thread_id, at=_event_time(event))
                         _limit_reported = False
                         usage_limit_notices.clear_thread(self.thread_id)
+                        # #1251: a prompt typed into the pane after an interrupted
+                        # turn (no turn_duration, no note_turn_started) starts afresh.
+                        self._turn_api_error_lines.clear()
                         # #913: a notification only *starts* a turn between turns;
                         # one that lands in a person's turn leaves it theirs. A
                         # scheduled wakeup is the same kind of start (#1092).
@@ -1632,6 +1640,7 @@ class TranscriptMirror:
                                 at=_event_time(event),
                             )
                             self._turn_api_error = None
+                            self._turn_api_error_lines.clear()
                             turn_end_bus.mark(self.thread_id, at=_event_time(event))
                         continue
 
@@ -1797,12 +1806,22 @@ class TranscriptMirror:
                         # ("Double press esc…") is for someone at the terminal. One
                         # line of what happened; the runner reports the turn as ❌
                         # with what to do from Discord.
+                        line = f"-# ⚠️ {headline(failed)}"
+                        # #1251: once per turn per distinct line. The repeat is
+                        # still logged at INFO (#678) — only the post is skipped.
+                        repeated = line in self._turn_api_error_lines
                         logger.info(
-                            "TranscriptMirror: folded API error thread=%d: %s",
+                            "TranscriptMirror: folded API error thread=%d%s: %s",
                             self.thread_id,
+                            " (same line already posted this turn, not posted again)"
+                            if repeated
+                            else "",
                             headline(failed)[:200],
                         )
-                        await self._try_sink(f"-# ⚠️ {headline(failed)}")
+                        # Counted as posted only when the post went out: a failed
+                        # one must not silence the next repeat in this turn.
+                        if not repeated and await self._try_sink(line) is not None:
+                            self._turn_api_error_lines.add(line)
                         continue
                     if rendered.kind == "assistant_text":
                         limit = banner_only(rendered.body)
