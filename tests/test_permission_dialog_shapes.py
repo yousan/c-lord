@@ -37,6 +37,7 @@ from tests.test_permission_dialog_hold import (  # noqa: F401 — fixture re-exp
     ANSWERED_PANE,
     DONE_PANE,
     PERMISSION_PANE,
+    THREAD_ID,
     _fast,
     _keys_pressed,
     _runner,
@@ -247,3 +248,114 @@ async def test_slash_command_refuses_on_the_new_shapes(name: str) -> None:
     assert refusal is not None and "許可ダイアログ" in refusal
     tmux.send_literal.assert_not_called()
     tmux.send_keys.assert_not_called()
+
+
+# --- Review of efd4350 --------------------------------------------------------
+# Variants of the real NotebookEdit dialog (``i1247_notebook_insert_…``), edited on
+# its normalised text the way a narrower pane or a status line draws it. Its
+# question ("Do you want to insert this cell into nb.ipynb?") matches no marker, so
+# only the shape detector can see these.
+
+REAL_FOOTER = "Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents"
+
+
+def _real_dialog_lines() -> list[str]:
+    from c_lord.claude.tmux_runner import _normalize_capture
+
+    raw = (PANES / "i1247_notebook_insert_v2_1_318.txt").read_text(encoding="utf-8")
+    lines = _normalize_capture(raw).rstrip().splitlines()
+    assert lines[-1].strip() == REAL_FOOTER
+    return [line.rstrip() for line in lines]
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return [f" {row}" for row in textwrap.wrap(text, width, break_long_words=True)]
+
+
+def test_footer_wrapped_over_four_rows_still_holds() -> None:
+    """LOW 1: below ~26 columns the footer itself wraps."""
+    rows = _wrap(REAL_FOOTER, 22)
+    assert len(rows) >= 4
+    pane = "\n".join(_real_dialog_lines()[:-1] + rows)
+    assert pane_shows_permission_dialog(pane) is True
+
+
+def test_status_rows_under_the_dialog_still_hold() -> None:
+    """LOW 1: three status rows drawn under the footer."""
+    status = [
+        "  Model: Opus 5.5  v2.1.318  Ctx: 46.1k",
+        "  Cost: $0.33  5h: 0.0%  Weekly: 78.0%",
+        "  ⏸ manual mode on · /tasks to see subagents",
+    ]
+    pane = "\n".join(_real_dialog_lines() + status)
+    assert pane_shows_permission_dialog(pane) is True
+
+
+def test_question_wrapped_over_seven_rows_still_holds() -> None:
+    """LOW 2: a ~150-char absolute path in the question at ~26 columns."""
+    path = "/home/someone/projects/" + "a_very_long_directory_name/" * 4 + "file_name.txt"
+    assert len(path) >= 140
+    question = _wrap(f"Do you want to insert this cell into {path}?", 24)
+    assert len(question) >= 7
+    lines = _real_dialog_lines()
+    q = next(i for i, line in enumerate(lines) if "Do you want to insert" in line)
+    pane = "\n".join(lines[:q] + question + lines[q + 1 :])
+    assert pane_shows_permission_dialog(pane) is True
+
+
+def test_footer_with_esc_after_a_separator_holds() -> None:
+    """LOW 4: "Tab to amend · Esc to cancel" as the last row block."""
+    pane = "\n".join(_real_dialog_lines()[:-1] + [" Tab to amend · Esc to cancel"])
+    assert pane_shows_permission_dialog(pane) is True
+
+
+def test_an_input_box_under_the_footer_is_not_a_dialog() -> None:
+    """LOW 5: a dialog's footer is never above the live input box."""
+    rule = "─" * 80
+    pane = "\n".join(_real_dialog_lines() + [rule, "❯ ", rule, "  ? for shortcuts"])
+    assert pane_shows_permission_dialog(pane) is False
+
+
+@pytest.mark.asyncio
+async def test_dialog_behind_an_ask_menu_is_not_typed_into(tmux_manager) -> None:
+    """MEDIUM: dialog → (answered) → ask menu → #358's Esc → the next dialog: hold again."""
+    state = {"n": 0, "esc": False, "after_esc": 0}
+    typed_into: list[str] = []
+
+    def pane_now() -> str:
+        if typed_into:
+            return DONE_PANE
+        if state["esc"]:
+            state["after_esc"] += 1
+            return PERMISSION_PANE if state["after_esc"] <= 3 else ANSWERED_PANE
+        state["n"] += 1
+        return PERMISSION_PANE if state["n"] <= 3 else ASK_PANE
+
+    shown = {"pane": ""}
+
+    def capture(*_a: object, **_k: object) -> str:
+        shown["pane"] = pane_now()
+        return shown["pane"]
+
+    def send_keys(_tid: int, key: str) -> bool:
+        assert shown["pane"] is ASK_PANE, f"{key} pressed while the pane was not the ask menu"
+        state["esc"] = True
+        return True
+
+    def send_input(_tid: int, _prompt: str, **_kw: object) -> bool:
+        typed_into.append(shown["pane"])
+        return True
+
+    tmux_manager.capture_pane.side_effect = capture
+    tmux_manager.send_keys.side_effect = send_keys
+    tmux_manager.send_input.side_effect = send_input
+    runner = _runner(tmux_manager)
+    events = []
+    with _fast(), patch("c_lord.tmux._run"):
+        async for event in runner.run("<text>"):
+            events.append(event)
+
+    assert typed_into == [ANSWERED_PANE], "the request was typed into the dialog behind the menu"
+    tmux_manager.send_keys.assert_called_once_with(THREAD_ID, "Escape")

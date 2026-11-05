@@ -223,6 +223,10 @@ _POST_STARTUP_DELAY = 1.0
 # ``_PERMISSION_HOLD_POLL`` seconds and sends the request once a human has
 # answered, or ends the turn unsent after ``_PERMISSION_HOLD_TIMEOUT``.
 _PERMISSION_HOLD_POLL = 2.0
+# How many open menus (#358) the pre-send check dismisses with Esc before it
+# sends anyway — each Esc is followed by a fresh look at the pane, because a
+# permission dialog can be queued behind the menu it closed.
+_PRE_SEND_MENU_DISMISSALS = 3
 _PERMISSION_HOLD_TIMEOUT = 30 * 60.0
 # How much of the dialog (its command / summary rows) the thread is shown.
 _PERMISSION_SUMMARY_MAX = 300
@@ -848,24 +852,51 @@ _HOLD_MARKERS = _PERMISSION_PROMPT_MARKERS + _EDIT_PERMISSION_MARKERS
 # question above the 15-row zone. AskUserQuestion's footer starts "Enter to
 # select", the trust / bypass dialogs' "Enter to confirm", so neither matches.
 _DIALOG_FOOTER_RE = re.compile(r"^\s*Esc to cancel\b")
+# The same footer with "Esc to cancel" after a separator ("Tab to amend · Esc to
+# cancel"); never AskUserQuestion's "Enter to select · … · Esc to cancel".
+_DIALOG_FOOTER_TAIL_RE = re.compile(r"·\s*Esc to cancel\b")
+# Non-blank rows from the bottom the footer may start in: its own wrapped rows
+# below ~26 columns, plus status rows a statusline draws under the dialog.
+_DIALOG_FOOTER_SCAN_ROWS = 8
 _DIALOG_YES_RE = re.compile(r"^\s*(?:❯\s*)?1\.\s+Yes\b")
 _DIALOG_QUESTION_RE = re.compile(r"^Do you want to\b.*\?$")
 # Rows from the footer up to "1. Yes": a 30-column Bash dialog's options take ~15.
 _DIALOG_OPTIONS_MAX_ROWS = 60
-# Rows a wrapped question may take.
-_DIALOG_QUESTION_MAX_ROWS = 6
+# Rows a wrapped question may take: a ~150-character absolute path at ~26 columns.
+_DIALOG_QUESTION_MAX_ROWS = 12
+
+
+_OPTION_ROW_RE = re.compile(r"^\s*(?:❯\s*)?\d+\.")
+
+
+def _dialog_footer_row(lines: list[str]) -> int | None:
+    """Row where a permission dialog's footer starts, near the bottom (#1247).
+
+    The bottom-most row that starts "Esc to cancel", or that carries
+    "· Esc to cancel" (joined with the next row, in case that tail wrapped) and
+    is neither an option row nor AskUserQuestion's "Enter to select …" footer.
+    """
+    rows = [i for i, line in enumerate(lines) if line.strip()][-_DIALOG_FOOTER_SCAN_ROWS:]
+    for idx in range(len(rows) - 1, -1, -1):
+        row = lines[rows[idx]].strip()
+        if _DIALOG_FOOTER_RE.match(row):
+            return rows[idx]
+        if _OPTION_ROW_RE.match(row) or row.startswith("Enter to"):
+            continue
+        head = " ".join(lines[k].strip() for k in rows[idx : idx + 2])
+        if _DIALOG_FOOTER_TAIL_RE.search(head):
+            return rows[idx]
+    return None
 
 
 def _structural_question_row(lines: list[str]) -> int | None:
     """First row of a tool-permission dialog's question, by its shape (#1247)."""
-    end = len(lines)
-    while end and not lines[end - 1].strip():
-        end -= 1
-    footer = next(
-        (i for i in range(end - 1, max(-1, end - 4), -1) if _DIALOG_FOOTER_RE.match(lines[i])),
-        None,
-    )
+    footer = _dialog_footer_row(lines)
     if footer is None:
+        return None
+    # The footer is the last block: a live input box under it means the "dialog"
+    # is scrollback above an idle prompt.
+    if any(row > footer for row in _input_box_rows(lines)):
         return None
     for yes in range(footer - 1, max(-1, footer - 1 - _DIALOG_OPTIONS_MAX_ROWS), -1):
         if not _DIALOG_YES_RE.match(lines[yes]):
@@ -2079,29 +2110,30 @@ class TmuxClaudeRunner:
             # instead of clicking a button means "I'm not answering that menu, do
             # this instead", so dismiss the menu (Esc) first and let the TUI
             # settle back to the input prompt before delivering the message.
-            pending = await self.peek_pending_ask()
             # #1247: a permission dialog left open between turns (a background
             # sub-agent's Bash call) has the keyboard. Typing the request would
             # answer it "Yes" with the Enter and lose the text, so hold the
             # request — no text, no key — until a human answers it in the pane.
-            # Judged on the pane the peek above just read (no extra capture), and
-            # again on the re-peek after every hold: the next agent's dialog can
-            # open the moment this one is answered. A menu (``pending``) is
-            # #358's business, whatever its question says.
-            while (
-                pending is None
-                and not self._stopped
-                and (peeked := self._last_peek_pane) is not None
-                and _permission_dialog_open(peeked)
-            ):
-                async for held in self._hold_for_permission_dialog(peeked):
-                    yield held
-                    if held.message_type == MessageType.RESULT:
-                        return
-                if self._stopped:
-                    break
+            # Judged on the pane each peek just read, and re-read after every
+            # hold AND after every #358 Esc: the next agent's dialog can be
+            # queued behind the one just answered, or behind the menu just
+            # dismissed. A menu (``pending``) is #358's business, whatever its
+            # question says. The hold's one deadline bounds the dialogs; menus
+            # get ``_PRE_SEND_MENU_DISMISSALS`` Esc presses, then the send goes
+            # ahead as it did before #1247.
+            dismissals = 0
+            while not self._stopped:
                 pending = await self.peek_pending_ask()
-            if pending is not None:
+                peeked = self._last_peek_pane
+                if pending is None and peeked is not None and _permission_dialog_open(peeked):
+                    async for held in self._hold_for_permission_dialog(peeked):
+                        yield held
+                        if held.message_type == MessageType.RESULT:
+                            return
+                    continue
+                if pending is None or dismissals >= _PRE_SEND_MENU_DISMISSALS:
+                    break
+                dismissals += 1
                 logger.info(
                     "Open menu detected before delivering new input; dismissing it "
                     "(Esc) so the message is not consumed as a menu selection (thread=%d)",
