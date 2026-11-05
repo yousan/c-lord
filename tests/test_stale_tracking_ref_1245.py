@@ -79,12 +79,39 @@ def test_pushed_branch_still_on_remote_is_clean(tmp_path: Path) -> None:
     assert _delete(ws).removed
 
 
-def test_remote_branch_moved_on_beyond_what_was_fetched_is_clean(tmp_path: Path) -> None:
-    """Control: upstream ``main`` advanced since the submodule was cloned. The new
-    head is not here; the branch still exists, so the old tracking ref vouches."""
-    ws, subr = _workspace(tmp_path)
+def test_remote_branch_moved_to_a_commit_not_fetched_is_unknown(tmp_path: Path) -> None:
+    """Review of 43caee1: upstream ``main`` moved to a commit this clone never
+    fetched. Fast-forward or force-push cannot be told without a fetch, and a
+    fetch is not made — unknown, kept (an accepted over-keep)."""
+    ws, _ = _workspace(tmp_path)
     _commit(tmp_path / "subremote-seed", "later.txt")
     git(tmp_path / "subremote-seed", "push", "-q", "origin", "HEAD:main")
+    res = _kept(ws)
+    assert "sub: unpushed commits unknown (remote branch moved to a commit not here)" in res.reason
+
+
+def test_branch_deleted_and_recreated_elsewhere_is_unknown(tmp_path: Path) -> None:
+    """``work`` deleted on the remote and recreated on other history, not fetched."""
+    ws, subr = _workspace(tmp_path)
+    sha = _pushed_then_deleted_on_remote(ws, subr)
+    git(ws / "sub", "update-ref", "refs/remotes/origin/work", sha)  # the stale view
+    seed = tmp_path / "subremote-seed"
+    git(seed, "checkout", "-q", "--orphan", "fresh")
+    _commit(seed, "fresh.txt")
+    git(seed, "push", "-q", "origin", "HEAD:work")
+    assert not _kept(ws).removed
+
+
+def test_remote_branch_moved_and_the_new_head_is_here_is_clean(tmp_path: Path) -> None:
+    """Control: the new head is here and descends from the tracking ref — the
+    old tracking ref's commits are on the live branch."""
+    ws, _ = _workspace(tmp_path)
+    _commit(tmp_path / "subremote-seed", "later.txt")
+    git(tmp_path / "subremote-seed", "push", "-q", "origin", "HEAD:main")
+    # The new head's objects arrive without moving origin/main (no refmap) and
+    # without a local ref holding them.
+    git(ws / "sub", "fetch", "-q", "--refmap=", "origin", "main:refs/tmp/upstream")
+    git(ws / "sub", "update-ref", "-d", "refs/tmp/upstream")
     st = worktree_status(str(ws))
     assert st.clean, describe_changes(st)
 
@@ -133,4 +160,43 @@ def test_one_ls_remote_per_submodule_remote(tmp_path: Path, monkeypatch) -> None
     calls = _count_ls_remote(monkeypatch)
     assert worktree_status(str(ws)).clean
     assert worktree_status(str(ws)).clean
+    assert len(calls) == 1, calls
+
+
+# ---- review of 43caee1: the ls-remote cache ----
+
+
+def _bare(tmp: Path, name: str) -> Path:
+    from .test_submodule_unpushed_1198 import _bare_with_commit
+
+    return _bare_with_commit(tmp, name)
+
+
+def test_same_relative_url_in_two_repos_does_not_share_an_answer(tmp_path: Path) -> None:
+    answers = []
+    for side in ("a", "b"):
+        d = tmp_path / side
+        d.mkdir()
+        _bare(d, "r")  # d/r.git, each with its own commit
+        _commit(d / "r-seed", f"{side}.txt")
+        git(d / "r-seed", "push", "-q", "origin", "HEAD:main")
+        repo = d / "repo"
+        git(d, "init", "-q", str(repo))
+        git(repo, "remote", "add", "origin", "../r.git")
+        answers.append(sd._ls_remote_refs(str(repo), "origin", "../r.git", ["git"]))
+    assert answers[0] and answers[1]
+    assert answers[0] != answers[1], "two repos' ../r.git shared one cached answer"
+
+
+def test_a_failed_ls_remote_is_cached_as_unknown(tmp_path: Path, monkeypatch) -> None:
+    """An offline host waits for each URL once per TTL, not once per workspace."""
+    calls = _count_ls_remote(monkeypatch)
+    repos = []
+    for side in ("a", "b"):
+        repo = tmp_path / side
+        git(tmp_path, "init", "-q", str(repo))
+        git(repo, "remote", "add", "origin", str(tmp_path / "gone.git"))
+        repos.append(repo)
+    for repo in repos:
+        assert sd._ls_remote_refs(str(repo), "origin", str(tmp_path / "gone.git"), ["git"]) is None
     assert len(calls) == 1, calls

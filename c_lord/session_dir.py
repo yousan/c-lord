@@ -300,21 +300,47 @@ def _ignored_dir_holds_work(path: str, rel: str) -> bool:
 _LS_REMOTE_TTL_SECONDS = 60.0
 #: A remote that does not answer within this is "could not check" — keep.
 _LS_REMOTE_TIMEOUT_SECONDS = 20.0
-_ls_remote_cache: dict[str, tuple[float, dict[str, str]]] = {}
+#: Keyed by :func:`_ls_remote_key`. A failure is cached too, as ``None``: an
+#: offline host waits out the timeout once per URL per TTL, not once per
+#: workspace.
+_ls_remote_cache: dict[str, tuple[float, dict[str, str] | None]] = {}
 _ls_remote_lock = threading.Lock()
+
+#: ``scheme://…`` or scp-like ``[user@]host:path`` — the same remote from any repo.
+_NETWORK_URL_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://|[^/:]+:)")
+
+
+def _ls_remote_key(cwd: str, url: str) -> str:
+    """The cache key: a network URL as is, a local path resolved against *cwd*.
+
+    ``../sub.git`` in two repos is two remotes; one cached answer for both
+    would vouch for the wrong one's branches. A ``file://`` URL is absolute.
+    """
+    if _NETWORK_URL_RE.match(url):
+        return url
+    return os.path.normpath(os.path.join(os.path.realpath(cwd), url))
 
 
 def _ls_remote_refs(cwd: str, name: str, url: str, pre: list[str]) -> dict[str, str] | None:
     """``refs/heads/<branch>`` → object name on remote *name*, cached by *url* (#903).
 
     ``None`` when the remote could not be asked (failed, timed out) — the
-    caller then keeps. *pre* is the ``git`` prefix (``--git-dir=…`` for a
-    module git dir whose checkout is gone, #1245).
+    caller then keeps; that answer is cached for the TTL too. *pre* is the
+    ``git`` prefix (``--git-dir=…`` for a module git dir whose checkout is
+    gone, #1245).
     """
+    key = _ls_remote_key(cwd, url)
     with _ls_remote_lock:
-        cached = _ls_remote_cache.get(url)
+        cached = _ls_remote_cache.get(key)
     if cached is not None and time.monotonic() - cached[0] < _LS_REMOTE_TTL_SECONDS:
         return cached[1]
+    heads = _ask_ls_remote(cwd, name, pre)
+    with _ls_remote_lock:
+        _ls_remote_cache[key] = (time.monotonic(), heads)
+    return heads
+
+
+def _ask_ls_remote(cwd: str, name: str, pre: list[str]) -> dict[str, str] | None:
     # Through _run (#1198): on a timeout the transport child (ssh,
     # remote-https, upload-pack) is killed with git, not left running.
     try:
@@ -333,8 +359,6 @@ def _ls_remote_refs(cwd: str, name: str, url: str, pre: list[str]) -> dict[str, 
         sha, _, ref = line.partition("\t")
         if sha.strip() and ref.strip():
             heads[ref.strip()] = sha.strip()
-    with _ls_remote_lock:
-        _ls_remote_cache[url] = (time.monotonic(), heads)
     return heads
 
 
@@ -698,16 +722,25 @@ def _worktree_tips(git_dir: Path) -> list[str] | None:
     work, never "nothing to lose". No ``worktrees/`` at all is ``[]``.
     """
     try:
-        entries = sorted(p for p in (git_dir / "worktrees").iterdir() if p.is_dir())
+        listed = sorted((git_dir / "worktrees").iterdir())
     except (FileNotFoundError, NotADirectoryError):
         return []
     except OSError:
         return None
+    # Through _kind: ``Path.is_dir()`` raised PermissionError on a 000 entry
+    # (Python 3.10-3.12, and for ``refs`` on 3.13) — or read it as "no refs".
+    kinds = [_kind(p) for p in listed]
+    if None in kinds:
+        return None
+    entries = [p for p, kind in zip(listed, kinds, strict=True) if kind == "dir"]
     tips: list[str] = []
     for entry in entries:
         files = [entry / "HEAD"]
         refs = entry / "refs"
-        if refs.is_dir() and not _ref_files(refs, files, set()):
+        refs_kind = _kind(refs)
+        if refs_kind is None:
+            return None
+        if refs_kind == "dir" and not _ref_files(refs, files, set()):
             return None
         for f in files:
             try:
@@ -849,9 +882,11 @@ def _stale_tracking_note(repo: _Repo) -> str | None:
     - the branch is still on the remote at the same commit;
     - or it moved, and the remote's commit is here: that commit vouches for
       what it reaches (a fast-forward covers the old commits, a force-push
-      does not);
-    - or it moved to a commit this clone never fetched: trusted, as a
-      fast-forward — telling a force-push apart needs a fetch (known limit).
+      does not).
+
+    A branch that moved to a commit this clone does not have (fast-forward,
+    force-push, or deleted and recreated — indistinguishable without a fetch,
+    and nothing is fetched) is unknown: kept.
 
     A branch gone from the remote, and a tracking ref of no configured remote,
     vouch for nothing. Any remote that cannot be asked is unknown — kept.
@@ -914,8 +949,13 @@ def _stale_tracking_note(repo: _Repo) -> str | None:
         present = {
             line.split()[0] for line in check.stdout.splitlines() if line.endswith(" commit")
         }
+    if any(now not in present for _, now in moved):
+        # Fast-forward or force-push (or deleted and recreated) cannot be told
+        # without the commit, and nothing is fetched: unknown, kept.
+        return f"{repo.name}: unpushed commits unknown (remote branch moved to a commit not here)"
+    # A moved branch's new head vouches for what it reaches, and only that: the
+    # old tracking ref's commits count unless they are its ancestors.
     vouch |= present
-    vouch |= {sha for sha, now in moved if now not in present}
     extra = _worktree_tips(repo.own_git_dir)
     if extra is None:
         return f"{repo.name}: unpushed commits unknown ({_WORKTREE_UNREADABLE})"
@@ -1058,11 +1098,22 @@ def _ignored_repo_notes(path: str, rel: str, pushed: list[_Repo]) -> list[str]:
 
 def _ignored_repo_work(repo: Path, name: str, pushed: list[_Repo]) -> list[str]:
     found = _repo_notes(repo, name, depth=1, seen=set(), pushed=pushed)
-    status = _run(["git", "status", "--porcelain", "-z", "--untracked-files=normal"], cwd=str(repo))
+    # --ignored (review of 43caee1): the repo's own ignored files (a local
+    # ``.env``) are in no commit either. What a tool rebuilds is not work, by
+    # the workspace's own rule; any other ignored file or dir is.
+    status = _run(
+        ["git", "status", "--porcelain", "-z", "--untracked-files=normal", "--ignored=matching"],
+        cwd=str(repo),
+    )
     if status.returncode != 0:
         found.append(f"{name}: status unknown (git failed)")
-    elif status.stdout.strip("\0").strip():
+        return found
+    for entry in status.stdout.split("\0"):
+        xy, rel = entry[:2], entry[3:]
+        if not entry.strip() or (xy == "!!" and _is_regenerable(rel)):
+            continue
         found.append(f"{name}: uncommitted changes")
+        break
     return found
 
 
@@ -1083,7 +1134,20 @@ def worktree_status(path: str, *, _depth: int = 0) -> WorktreeStatus:
     Safety invariant (module docstring): anything that *might* be the user's
     uncommitted work lands in ``user_changes``. Only files c-lord writes itself
     are set aside, and a Claude Code worktree only when it is itself clean.
+
+    Never raises ``OSError``: a file the checks cannot read is unknown — the
+    dir is kept, and a sweep goes on to the next one (review of 43caee1: a
+    ``PermissionError`` stopped ``cleanup_orphaned`` and failed
+    /workspace-delete with an exception).
     """
+    try:
+        return _worktree_status(path, _depth=_depth)
+    except OSError as exc:
+        logger.warning("worktree status of %s unknown: %s", path, exc)
+        return WorktreeStatus(is_repo=False, unknown=f"unreadable: {exc.strerror or exc}")
+
+
+def _worktree_status(path: str, *, _depth: int) -> WorktreeStatus:
     # -uall: a wholly untracked ``.claude/`` must be listed file by file, or the
     # injected SKILL.md and a user's own file would hide behind one line.
     # -z: paths come back unquoted, so spaces and non-ASCII names parse as-is.

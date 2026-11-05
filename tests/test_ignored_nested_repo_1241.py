@@ -65,3 +65,29 @@ def test_ignored_repo_fully_pushed_is_still_regenerable(tmp_path: Path) -> None:
     st = worktree_status(str(ws))
     assert st.clean, describe_changes(st)
     assert _delete(ws).removed
+
+
+def test_ignored_file_inside_an_ignored_repo_is_kept(tmp_path: Path) -> None:
+    """Review of 43caee1: the vendor repo's own ignored files (a local ``.env``)
+    are in no commit and nowhere else."""
+    ws, subr = _workspace(tmp_path)
+    _ignore(ws, "vendor/")
+    lib = ws / "vendor" / "lib"
+    git(tmp_path, "clone", "-q", str(subr), str(lib))
+    (lib / ".git" / "info" / "exclude").write_text("/.env\n")
+    (lib / ".env").write_text("TOKEN=local\n")
+    res = _kept(ws)
+    assert "vendor/lib: uncommitted changes" in res.reason, res.reason
+
+
+def test_regenerable_files_inside_an_ignored_repo_are_not_work(tmp_path: Path) -> None:
+    """Control: the same rule as the workspace's own — ``__pycache__`` is rebuilt."""
+    ws, subr = _workspace(tmp_path)
+    _ignore(ws, "vendor/")
+    lib = ws / "vendor" / "lib"
+    git(tmp_path, "clone", "-q", str(subr), str(lib))
+    (lib / ".git" / "info" / "exclude").write_text("__pycache__/\n")
+    (lib / "__pycache__").mkdir()
+    (lib / "__pycache__" / "m.pyc").write_bytes(b"\0")
+    st = worktree_status(str(ws))
+    assert st.clean, describe_changes(st)
