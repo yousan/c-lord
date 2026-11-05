@@ -86,20 +86,21 @@ async def test_a_stuck_oldest_with_unanswered_re_reads_does_not_hold_the_cap() -
     unanswered re-read picked the same victim first every tick and slept nothing
     behind it — 50 ticks later all 5 were still resident (limit 3)."""
     resident = {1, 2, 3, 4, 5}
+    stall = _Stall(resident)
 
     async def impl(*, channel, reason, idle_label):  # noqa: ANN001
         if channel.id == 5:
-            return False
+            return stall.failed()
         resident.discard(channel.id)
         return True
 
     loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, 5, 3)
     with (
-        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
-        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.resident_thread_ids", side_effect=stall.reader),
         patch("c_lord.tmux.pane_turn_states", return_value=NONE),
     ):
         for _ in range(50):
+            stall.on = False
             await loop.tick()
     assert len(resident) <= 3, f"still {sorted(resident)} resident after 50 ticks (limit 3)"
 
@@ -108,16 +109,40 @@ async def test_the_unanswered_re_read_warning_is_sampled(caplog) -> None:  # noq
     """Review of db65406: for as long as a stall lasts the WARNING came once per tick.
     Sampled like the loop's other repeated lines ("cap-stuck", "cap-short")."""
     resident = {1, 2, 3, 4, 5}
-    loop = _production_loop(_cog(AsyncMock(return_value=False)), resident, 5, 4)
+    stall = _Stall(resident)
+
+    async def impl(*, channel, reason, idle_label):  # noqa: ANN001
+        return stall.failed()
+
+    loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, 5, 4)
     with (
-        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
-        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.resident_thread_ids", side_effect=stall.reader),
         patch("c_lord.tmux.pane_turn_states", return_value=NONE),
     ):
         for _ in range(10):
+            stall.on = False
             await loop.tick()
     unanswered = [r for r in caplog.records if "did not answer the re-read" in r.getMessage()]
     assert len(unanswered) <= 1, f"{len(unanswered)} WARNINGs in 10 ticks"
+
+
+class _Stall:
+    """The count answers at the start of a tick; once a sleep has failed in the
+    tick, tmux stops answering (the re-read times out) until the next one. The
+    re-read uses the same reader as the count (review of 469a137)."""
+
+    def __init__(self, resident: set[int]) -> None:
+        self.resident = resident
+        self.on = False
+
+    def reader(self) -> set[int]:
+        if self.on:
+            raise RuntimeError("list-panes timed out")
+        return set(self.resident)
+
+    def failed(self) -> bool:
+        self.on = True
+        return False
 
 
 def _production_loop(cog, resident: set[int], n: int, limit: int) -> ResidentCapLoop:  # noqa: ANN001
@@ -147,14 +172,18 @@ async def test_the_re_read_after_a_failed_kill_does_not_block_the_event_loop() -
             beats["n"] += 1
             await asyncio.sleep(0.01)
 
-    def slow_re_read(thread_id: int) -> bool:
-        before = beats["n"]
-        time.sleep(0.3)
-        seen.append(beats["n"] - before)
-        return True  # still there
+    after_sleep = {"on": False}
+
+    def reader() -> set[int]:
+        if after_sleep["on"]:  # the re-read after the failed sleep: slow
+            before = beats["n"]
+            time.sleep(0.3)
+            seen.append(beats["n"] - before)
+        return set(resident)
 
     async def impl(*, channel, reason, idle_label):  # noqa: ANN001
         if channel.id == 3:
+            after_sleep["on"] = True
             return False
         resident.discard(channel.id)
         return True
@@ -163,8 +192,7 @@ async def test_the_re_read_after_a_failed_kill_does_not_block_the_event_loop() -
     task = asyncio.create_task(heartbeat())
     try:
         with (
-            patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
-            patch("c_lord.tmux.is_resident_anywhere", side_effect=slow_re_read),
+            patch("c_lord.tmux.resident_thread_ids", side_effect=reader),
             patch("c_lord.tmux.pane_turn_states", return_value=NONE),
         ):
             assert await loop._enforce_cap() == 0  # no make-up within the tick
@@ -201,20 +229,21 @@ async def test_two_stuck_oldest_with_unanswered_re_reads_do_not_hold_the_cap() -
     tick, so nothing behind them was ever slept. They go to the end of the next
     tick's order, so the ones behind them get tried."""
     resident = {1, 2, 3, 4, 5, 6}
+    stall = _Stall(resident)
 
     async def impl(*, channel, reason, idle_label):  # noqa: ANN001
         if channel.id in (5, 6):
-            return False
+            return stall.failed()
         resident.discard(channel.id)
         return True
 
     loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, 6, 3)
     with (
-        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
-        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.resident_thread_ids", side_effect=stall.reader),
         patch("c_lord.tmux.pane_turn_states", return_value=NONE),
     ):
         for _ in range(50):
+            stall.on = False
             await loop.tick()
     assert len(resident) <= 3, f"still {sorted(resident)} resident after 50 ticks (limit 3)"
     assert {5, 6} <= resident
@@ -224,27 +253,29 @@ def _attempt_counting_loop(n: int, limit: int, stuck: set[int], *, happens: bool
     """n residents; kills of *stuck* always report failure (and are carried out
     when *happens*); every re-read is unanswered (a sustained stall)."""
     resident = set(range(1, n + 1))
+    stall = _Stall(resident)
 
     async def impl(*, channel, reason, idle_label):  # noqa: ANN001
         if channel.id in stuck or happens:
             if happens:
                 resident.discard(channel.id)
-            return False
+            return stall.failed()
         resident.discard(channel.id)
         return True
 
     loop = _production_loop(_cog(AsyncMock(side_effect=impl)), resident, n, limit)
-    return loop, resident
+    return loop, stall
 
 
-async def _ticks(loop, resident: set[int], limit: int, ticks: int) -> None:  # noqa: ANN001
+async def _ticks(loop, stall: _Stall, limit: int, ticks: int) -> None:  # noqa: ANN001
+    resident = stall.resident
     with (
-        patch("c_lord.tmux.resident_thread_ids", side_effect=lambda: set(resident)),
-        patch("c_lord.tmux.is_resident_anywhere", return_value=None),
+        patch("c_lord.tmux.resident_thread_ids", side_effect=stall.reader),
         patch("c_lord.tmux.pane_turn_states", return_value=NONE),
     ):
         for tick in range(ticks):
             before = len(resident)
+            stall.on = False
             await loop.tick()
             over = max(0, before - limit)
             assert before - len(resident) <= over, f"tick {tick}: slept more than over={over}"
@@ -256,8 +287,9 @@ async def test_stuck_oldest_with_unanswered_re_reads_converge(n: int, stuck: int
     (limit 6) — the cap must still reach its limit, never sleeping more than over."""
     limit = 6
     stuck_ids = set(range(n - stuck + 1, n + 1))  # the oldest
-    loop, resident = _attempt_counting_loop(n, limit, stuck_ids, happens=False)
-    await _ticks(loop, resident, limit, 50)
+    loop, stall = _attempt_counting_loop(n, limit, stuck_ids, happens=False)
+    resident = stall.resident
+    await _ticks(loop, stall, limit, 50)
     assert len(resident) <= limit, f"still {sorted(resident)} resident after 50 ticks"
     assert stuck_ids <= resident
 
@@ -266,8 +298,9 @@ async def test_kills_that_fail_but_happen_never_sleep_more_than_the_excess() -> 
     """Every kill reports failure but is carried out, and tmux never answers the
     re-read. Per tick no more than over; overall no more than the true excess."""
     n, limit = 8, 5
-    loop, resident = _attempt_counting_loop(n, limit, set(), happens=True)
-    await _ticks(loop, resident, limit, 50)
+    loop, stall = _attempt_counting_loop(n, limit, set(), happens=True)
+    resident = stall.resident
+    await _ticks(loop, stall, limit, 50)
     assert len(resident) == limit, f"{sorted(resident)} resident (limit {limit})"
 
 

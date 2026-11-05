@@ -402,6 +402,12 @@ class ResidentCapLoop:
         # branch review of 79fc532). Kept until the sleep succeeds, tmux answers
         # "gone", or the thread leaves the residents.
         self._deferred: dict[int, int] = {}
+        # Victims attempted last tick, by attempt order (review of 469a137). Any
+        # of them still counted next tick is deferred whatever its answer was:
+        # a window our checks keep reading as gone or slept while the count
+        # keeps it (another c-lord's pane, our own window with an old owner in
+        # another session) can then no longer take the front for good.
+        self._attempted: dict[int, int] = {}
         self._failures = 0
         # Whether the last ``_sleep_one`` got as far as the sleep itself (#1219).
         self._sleep_reached = False
@@ -481,18 +487,11 @@ class ResidentCapLoop:
         loop: the read is ``tmux -V`` plus ``list-panes`` with 30 s timeouts each,
         and it is asked once per failed victim (review of e971435).
         """
-        if self._resident_fn is not None:
-            try:
-                return thread_id not in set(self._resident_fn())  # type: ignore[operator]
-            except Exception:
-                return None
-        from .tmux import is_resident_anywhere
-
-        try:
-            still = await asyncio.to_thread(is_resident_anywhere, thread_id)
-        except Exception:
-            return None
-        return None if still is None else not still
+        # The same population as the count — every owner (review of 469a137).
+        # Read owned-only, our own window with an old ``@clord_owner`` (#503)
+        # whose kill failed read as gone and was never deferred.
+        answer = await asyncio.to_thread(self._resident_answer)
+        return None if answer is None else thread_id not in answer
 
     async def _turns_in_flight(self, candidates: set[int]) -> set[int]:
         """Everything in *candidates* with a turn running, by both kinds of evidence.
@@ -753,6 +752,10 @@ class ResidentCapLoop:
         resident = answer - self._gone
         # Bounded by the residents (#1219).
         self._deferred = {t: n for t, n in self._deferred.items() if t in resident}
+        for t, n in self._attempted.items():
+            if t in resident:
+                self._deferred[t] = max(n, self._deferred.get(t, 0))
+        self._attempted = {}
         # Cheap upper bound first: the ownership filter below can only shrink
         # this set, so a scan under the limit needs no database read at all.
         if len(resident) <= self._limit:
@@ -833,6 +836,8 @@ class ResidentCapLoop:
             if attempts >= over:
                 break
             self._deferred.pop(thread_id, None)
+            self._failures += 1
+            self._attempted[thread_id] = self._failures
             outcome = await self._sleep_one(thread_id, WorkspaceReason.CAP, label)
             if outcome is False and not self._sleep_reached:
                 # Not an attempt: the thread could not be resolved (or the cog is

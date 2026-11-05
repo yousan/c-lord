@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 import c_lord.tmux as T
 from c_lord.resident_cap import ResidentCapLoop
@@ -147,6 +146,9 @@ def _foreign_elsewhere(argv: list[str]) -> MagicMock:
 
 
 async def test_another_instances_window_does_not_make_us_sleep_ours() -> None:
+    """The tick that meets the foreign pane sleeps none of ours for it. (On a later
+    tick the cap converges by sleeping one of ours — the known trade-off, see
+    ``test_foreign_window_elsewhere_holds_cap_above_limit_forever``.)"""
     resident = {1, 2, 3}
     slept: list[int] = []
     real = _real_impl_cog(_new_session_mgr())
@@ -190,44 +192,34 @@ def test_is_resident_anywhere_ignores_another_instances_pane() -> None:
         assert T.is_resident_anywhere(3) is False
 
 
-# --- whole-branch review of 79fc532: the count and the sleep must agree on owners ---
+# --- another c-lord's pane carrying one of our thread ids (known trade-off) ---
 #
-# The sleep's host-wide check counts only this instance's panes, but the count
-# (``resident_thread_ids``) counted every pane. Another bot's pane carrying one of
-# our thread ids was counted, every attempt on it answered "gone", and the cap sat
-# at limit+1 for good with no "still over" line.
+# The count reads every owner (our own windows survive a restart with an old
+# ``@clord_owner``, #503), the sleep's host-wide check only ours. Another bot's
+# pane for one of our thread ids is counted and reads as "gone" to every sleep.
+# It used to take the tick's attempt for good, holding the cap at limit+1 with no
+# "still over" line. Since the review of 469a137 any victim still counted on the
+# next tick goes behind the others, so the cap converges — at the cost of
+# sleeping one of ours in its place (needs two instances sharing a thread id).
 
 
-def _listing_with_a_foreign_pane(argv: list[str]) -> MagicMock:
-    if argv[:2] == ["tmux", "-V"]:
-        return MagicMock(returncode=0, stdout="tmux 3.4", stderr="")
-    if argv[:3] == ["tmux", "list-panes", "-a"]:
-        if any(T.OWNER_OPTION in a for a in argv):
-            out = "1\tclaude\t%1\tthis-bot\n2\tclaude\t%2\t\n3\tclaude\t%3\tother-bot\n"
-        else:
-            out = "1\tclaude\t%1\n2\tclaude\t%2\n3\tclaude\t%3\n"
-        return MagicMock(returncode=0, stdout=out, stderr="")
-    return MagicMock(returncode=0, stdout="", stderr="")  # our session: no window for 3
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="known limit (docs/specs/resident-cap.md): the count counts every owner, so "
-    "our own windows with an old @clord_owner are not missed (#503); a pane of another "
-    "c-lord carrying one of our thread ids needs two instances sharing a thread id",
-)
 async def test_foreign_window_elsewhere_holds_cap_above_limit_forever() -> None:
-    """Limit 2, our residents 1 and 2, and 3's only pane belongs to another bot.
-    Adapted from the review: the count is the real reader (no ``resident_fn``),
-    since the bug is in what it counts. We are at the limit: nothing is tried."""
+    resident = {1, 2, 3}  # 3 = oldest, its only pane is another bot's, in another session
     real = _real_impl_cog(_new_session_mgr())
     calls: list[int] = []
 
     async def impl(*, channel: object, reason: object, idle_label: object) -> bool | None:
         calls.append(channel.id)  # type: ignore[attr-defined]
-        return await real._sleep_workspace_impl(
-            channel=channel, reason=reason, idle_label=idle_label
-        )
+        if channel.id == 3:  # type: ignore[attr-defined]
+            with (
+                patch("c_lord.tmux._run", side_effect=_foreign_elsewhere),
+                patch("c_lord.tmux.instance_owner", return_value="this-bot"),
+            ):
+                return await real._sleep_workspace_impl(
+                    channel=channel, reason=reason, idle_label=idle_label
+                )
+        resident.discard(channel.id)  # type: ignore[attr-defined]
+        return True
 
     cog = MagicMock()
     cog._sleep_workspace_impl = AsyncMock(side_effect=impl)
@@ -237,19 +229,16 @@ async def test_foreign_window_elsewhere_holds_cap_above_limit_forever() -> None:
         _bot(cog=cog, channels=ch),
         _repo([_rec(i, hours_ago=i) for i in range(1, 4)]),
         limit=2,
+        resident_fn=lambda: set(resident),  # every owner, like resident_thread_ids
         in_flight_fn=set,
         mem_fn=lambda: OK,
         activity_fn=lambda r: None,
     )
-    with (
-        patch("c_lord.tmux._run", side_effect=_listing_with_a_foreign_pane),
-        patch("c_lord.tmux.instance_owner", return_value="this-bot"),
-        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
-    ):
+    with patch("c_lord.tmux.pane_turn_states", return_value=NONE):
         for _ in range(10):
             await loop.tick()
-        assert T.resident_thread_ids() == {1, 2}
-    assert calls == [], f"another bot's pane was counted as ours: tried {calls}"
+    assert len(resident) <= 2, f"{sorted(resident)} resident after 10 ticks (limit 2)"
+    assert calls == [3, 2], calls  # the foreign pane once, then it goes behind
 
 
 # --- review of 4d5c777: our own windows with an old owner must still count ---

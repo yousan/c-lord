@@ -22,9 +22,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 
+import c_lord.tmux as T
 from c_lord.resident_cap import ResidentCapLoop
 from c_lord.tmux import PaneTurnStates
 from tests.test_resident_cap_failure_paths import OK, _bot, _cog, _rec, _repo
+from tests.test_resident_cap_stalled_lookup_1206 import _real_impl_cog
 
 NONE = PaneTurnStates(frozenset(), frozenset())
 
@@ -166,3 +168,138 @@ async def test_fuzz_cap(seed: int) -> None:
     )
     if not unkillable and all(k in ("ok", "self_gone") for k in kind.values()):
         assert len(resident) == min(limit, n), (seed, kind, limit, sorted(resident))
+
+
+# --- review of 469a137: our own windows with an old owner livelocked the cap ---
+#
+# The count reads every owner (our windows survive a restart with an old
+# ``@clord_owner``, #503), but the checks after a sleep read only this instance's
+# panes. An old-owner window of ours whose kill failed read as "gone", was never
+# deferred, and — being the oldest — took the tick's one attempt for good. The
+# fuzz below drives the real readers and the real sleep through a fake tmux.
+
+
+class _FakeTmux:
+    """One tmux server: windows of threads, in our session or another one."""
+
+    def __init__(self, threads: dict[int, tuple[str, str, str]]) -> None:
+        # thread -> (owner, where: bound|elsewhere, kill: ok|stuck|timeout_done)
+        self.threads = threads
+        self.alive = set(threads)
+        self.killed_this_tick: list[int] = []
+
+    def _bound_alive(self) -> list[int]:
+        return sorted(t for t in self.alive if self.threads[t][1] == "bound")
+
+    def run(self, argv: list[str]) -> MagicMock:
+        def ok(out: str = "") -> MagicMock:
+            return MagicMock(returncode=0, stdout=out, stderr="")
+
+        if argv[:2] == ["tmux", "-V"]:
+            return ok("tmux 3.4")
+        if argv[:3] == ["tmux", "list-panes", "-a"]:
+            own = any(T.OWNER_OPTION in a for a in argv)
+            lines = [
+                f"{t}\tclaude\t%{t}" + (f"\t{self.threads[t][0]}" if own else "")
+                for t in sorted(self.alive)
+            ]
+            return ok("".join(f"{line}\n" for line in lines))
+        if argv[:2] == ["tmux", "list-windows"] and "-a" not in argv:
+            return ok("".join(f"@{t}\tw{t}\t{t}\t/x/{t}\n" for t in self._bound_alive()))
+        if argv[:2] == ["tmux", "show-option"]:
+            t = int(argv[argv.index("-t") + 1].lstrip("@"))
+            if t in self.alive and self.threads[t][1] == "bound":
+                return ok(f"{t}\n")
+            return MagicMock(returncode=1, stdout="", stderr="no such window")
+        if argv[:2] == ["tmux", "kill-window"]:
+            t = int(argv[argv.index("-t") + 1].lstrip("@"))
+            kind = self.threads[t][2]
+            if kind == "stuck" or t not in self.alive:
+                return MagicMock(returncode=1, stdout="", stderr="failed")
+            self.alive.discard(t)
+            self.killed_this_tick.append(t)
+            if kind == "timeout_done":
+                return MagicMock(returncode=T._RUN_TIMEOUT_RETURNCODE, stdout="", stderr="")
+            return ok()
+        return ok()
+
+
+def _thread(tid: int) -> MagicMock:
+    th = MagicMock(spec=discord.Thread)
+    th.id = tid
+    th.parent_id = 10
+    return th
+
+
+async def _drive(threads: dict[int, tuple[str, str, str]], limit: int, ticks: int) -> _FakeTmux:
+    tmux = _FakeTmux(threads)
+    cog = _real_impl_cog(T.TmuxSessionManager(session_name="ours", mapping_path=""))
+    n = len(threads)
+    loop = ResidentCapLoop(
+        _bot(cog=cog, channels={t: _thread(t) for t in threads}),
+        _repo([_rec(i, hours_ago=i) for i in range(1, n + 1)]),
+        limit=limit,
+        in_flight_fn=set,
+        mem_fn=lambda: OK,
+        activity_fn=lambda r: None,
+    )
+    with (
+        patch("c_lord.tmux._run", side_effect=tmux.run),
+        patch("c_lord.tmux.instance_owner", return_value="mine"),
+        patch("c_lord.tmux.pane_turn_states", return_value=NONE),
+    ):
+        for tick in range(ticks):
+            over = max(0, len(tmux.alive) - limit)
+            tmux.killed_this_tick.clear()
+            await loop.tick()
+            assert len(tmux.killed_this_tick) <= over, (tick, threads, limit, over)
+    return tmux
+
+
+async def test_old_owner_window_with_a_failing_kill_does_not_hog_the_cap() -> None:
+    """The review's case: the oldest is ours, bound, with an old owner, and its
+    kill always fails. Limit 1 of 3: the two behind it must still be slept."""
+    threads = {1: ("mine", "bound", "ok"), 2: ("", "bound", "ok"), 3: ("old", "bound", "stuck")}
+    tmux = await _drive(threads, limit=1, ticks=10)
+    assert tmux.alive == {3}, sorted(tmux.alive)
+
+
+async def test_old_owner_window_left_in_another_session_does_not_hog_the_cap() -> None:
+    """Our old-owner window in another session reads as "gone" to the sleep every
+    time, while the count keeps it. It must not take the front for good."""
+    threads = {
+        1: ("mine", "bound", "ok"),
+        2: ("mine", "bound", "ok"),
+        3: ("old", "elsewhere", "ok"),
+    }
+    tmux = await _drive(threads, limit=2, ticks=10)
+    assert len(tmux.alive) <= 2, sorted(tmux.alive)
+
+
+@pytest.mark.parametrize("elsewhere", [False, True], ids=["bound", "bound+elsewhere"])
+@pytest.mark.parametrize("seed", range(120))
+async def test_fuzz_cap_through_real_readers(seed: int, elsewhere: bool) -> None:
+    """From the review of 469a137 (seeded, smaller): owners mine / empty / old,
+    windows in our session or (variant 2) another one, kills ok / stuck /
+    timeout_done. Converges, never killing more than over in a tick."""
+    rng = random.Random(seed * 2 + int(elsewhere))
+    n = rng.randint(2, 10)
+    limit = rng.randint(1, n)
+    threads = {
+        t: (
+            rng.choice(["mine", "", "old"]),
+            rng.choice(["bound", "elsewhere"]) if elsewhere else "bound",
+            rng.choice(["ok", "stuck", "timeout_done"]),
+        )
+        for t in range(1, n + 1)
+    }
+    tmux = await _drive(threads, limit, 3 * n + 5)
+    unkillable = {
+        t for t, (_, where, kill) in threads.items() if where != "bound" or kill == "stuck"
+    }
+    alive = tmux.alive
+    assert len(alive) <= max(limit, len(unkillable & alive)) or not (alive - unkillable), (
+        threads,
+        limit,
+        sorted(alive),
+    )
