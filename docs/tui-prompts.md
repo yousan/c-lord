@@ -83,24 +83,34 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 
 **ターンとターンの間に開いたダイアログには依頼を打ち込まない (#1247)。** 自動承認（上の `_accept_permission_prompt`）は、runner がターンの中でペインを見ている間だけの動き。親のターンが終わったあとにバックグラウンドのサブエージェントの Bash が許可を求めると、ダイアログはターンの外で開いたままになる（実キャプチャ: `tests/fixtures/panes/i1247_permission_dialog_background_agent_v2_1_318.txt`、Claude Code 2.1.318、`Bash command · from the general-purpose agent` / `This command requires approval` / `Do you want to proceed?` / `❯ 1. Yes` … `4. No`。入力欄は描かれない）。以前はこの状態で次の依頼が来ると、本文と Enter をそのまま打ち込み、**Enter がダイアログを「Yes」で承認し、依頼の本文は Claude に届かなかった**（本番では `safetyCheck` / `dangerousRemoval` の付いた削除が人の判断なしに通った）。
 
-Edit / Write の許可ダイアログも同じ形で出る（default モード。実キャプチャ: `i1247_edit_dialog_background_agent_v2_1_318.txt` の `Edit file · from the general-purpose agent` / `Do you want to make this edit to notes.txt?`、`i1247_create_dialog_background_agent_v2_1_318.txt` の `Create file …` / `Do you want to create created.txt?`）。
+ツールの許可ダイアログはどれも同じ形をしている（Claude Code 2.1.318 の実キャプチャ。すべて `tests/fixtures/panes/i1247_*`）:
 
-**守っているのはターンとターンの間だけ。** 送る直前（次の依頼、`/compact`・`/clear`）にペインを見て、許可ダイアログが開いていれば保留する。**ターンの中で開いた許可ダイアログは、これまでどおり決定 4 の自動承認（`_accept_permission_prompt`）が Enter で答える** — バックグラウンドのサブエージェントのものも、`dangerousRemoval` のような安全確認付きのものも含む。「すべての許可ダイアログに c-lord は答えない」わけではない。ターン中の扱いは別 Issue。
+```
+ <ツール> · from the general-purpose agent      ← Bash command / Edit file / Overwrite file / Create file / Edit notebook / Read file …
+ <説明・コマンド・差分>
+ <理由の行>                                      ← 無いことも、文言が違うこともある（"This command requires approval" / "rm path argument is runtime-determined"）
+ Do you want to <動詞> <対象>?                   ← proceed / make this edit to / overwrite / create / insert this cell into …（狭いペインでは折り返す）
+ ❯ 1. Yes
+   2. …                                          ← 狭いペインでは何行にも折り返す
+ Esc to cancel · Tab to amend …                  ← 最後の行
+```
 
-許可ダイアログが開いているかの判定（`_permission_dialog_open`）:
+許可ダイアログが開いているかの判定（`_permission_dialog_open`。保留と `/compact`・`/clear` の確認だけが使う）:
 
-- 下の行（`_PERMISSION_SCAN_LINES`）に問いの行がある。問いは `_PERMISSION_PROMPT_MARKERS` と、保留のときだけ使う `_EDIT_PERMISSION_MARKERS`（`Do you want to make this edit to ` / `Do you want to create `）。後者はターン中の自動承認には**入れていない**ので、ターン中の Edit / Write ダイアログはこれまでどおり「Unknown TUI prompt」の通知になる（自動では答えない）
-- **問いの行より下に**入力欄が無い — Claude 自身の文の「Do you want to proceed?」の下には入力欄があるので拾わない。問いより上（コマンドの中）の `>` や `❯` だけの行は入力欄と見なさない
+- **形で見る**（`_structural_question_row`）: 最後の行が `Esc to cancel` で始まり、その上に `1. Yes`、そのすぐ上の行（折り返しは連結してから）が `Do you want to … ?`。動詞を並べたマーカーでは、上書きの `overwrite`、折り返しで末尾の空白が落ちた Edit の問い、30 桁で下 15 行より上に押し出された Bash の問いを取りこぼした（W57 の実キャプチャ `i1247_w57_*`）。AskUserQuestion の最後の行は `Enter to select`、trust / bypass は `Enter to confirm` で始まるので当たらない
+- 形に当たらなければ、従来どおり下 15 行のマーカー（`_PERMISSION_PROMPT_MARKERS` と `_EDIT_PERMISSION_MARKERS`）で見る。そのときは**問いの行より下に**入力欄が無いことも条件 — Claude 自身の文の「Do you want to proceed?」の下には入力欄がある。問いより上（コマンドの中）の `>` や `❯` だけの行は入力欄と見なさない
 - AskUserQuestion / plan のメニューとして読めない — 問いの文がたまたま同じでも、メニューは #358 どおり Esc で閉じてから送る
+- **ターン中の自動承認（決定 4）の判定 `_has_permission_prompt` は変えていない**。ターン中の Edit / Write / NotebookEdit のダイアログはこれまでどおり「Unknown TUI prompt」の通知になる（自動では答えない）
 
 開いていれば:
 
 - **何も打たない・キーも押さない**（本文も Enter も C-c も）。c-lord はこのダイアログに答えない
 - スレッドに「⏸️ 許可ダイアログが開いているため、依頼をまだ送っていません」を、**ダイアログ 1 つにつき 1 回**出す。ダイアログの行（ツール・依頼元・コマンドや差分。約 300 字まで、URL の認証情報は伏せる）を引用し、ペインで答えるか `/workspace-stop` で止めるよう書く
+- 保留中に AskUserQuestion / plan のメニューが開いたら、保留をやめて #358 どおり（Esc で閉じてから依頼を送る）
 - 2 秒ごと（`_PERMISSION_HOLD_POLL`）にペインを見直す。**問いの行が消え、かつ入力欄が戻ったら**答えられたと見なし、もう一度ペインを見てから送る。別のエージェントのダイアログがすぐ開いていたら、それにも同じく保留する（どちらも無い描き直しの途中は、答えとは見なさない）
-- 30 分（`_PERMISSION_HOLD_TIMEOUT`。ターン内のダイアログ全部で 1 つの期限）たっても答えが無ければ、**依頼を送らずに**ターンをエラーで終える（エラー文に「依頼は Claude に送られていません」と書くので、もう一度送ればよい）
+- 30 分（`_PERMISSION_HOLD_TIMEOUT`。ターン内のダイアログ全部で 1 つの期限）たっても答えが無ければ、**依頼を送らずに**ターンをエラーで終える（エラー文に「依頼は Claude に送られていません」と書くので、もう一度送ればよい）。ダイアログは閉じたのに入力欄が戻らなかったときは、「ダイアログが開いたまま」ではなくそう書く
 - 待っている間の停止・次のメッセージでの割り込みは効く。割り込みでも C-c は押さない（ダイアログに答えてしまうため）
-- `/compact`・`/clear` は待たずに断る:「`/compact` は送っていません — Claude のペインで許可ダイアログが開いています …先にペインでダイアログに答えてから、もう一度実行してください」
+- `/compact`・`/clear`（どちらも確認画面は出さず、そのまま入力欄に戻る — 実キャプチャ `i1247_idle_after_compact_…` / `i1247_idle_after_clear_…`）は待たずに断る:「`/compact` は送っていません — Claude のペインで許可ダイアログが開いています …先にペインでダイアログに答えてから、もう一度実行してください」
 
 ### 2-2. Plan Mode Approval（ExitPlanMode）
 

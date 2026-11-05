@@ -309,9 +309,20 @@ def permission_hold_minutes() -> int:
     return max(1, round(_PERMISSION_HOLD_TIMEOUT / 60))
 
 
-def _permission_hold_timed_out() -> str:
-    """User-facing text for a request that a permission dialog kept from Claude (#1247)."""
+def _permission_hold_timed_out(*, dialog_open: bool = True) -> str:
+    """User-facing text for a request that a permission dialog kept from Claude (#1247).
+
+    *dialog_open* False: the dialog was answered but Claude's input box never
+    came back — saying "the dialog stayed open" then would send the reader to
+    a pane with no dialog in it.
+    """
     minutes = permission_hold_minutes()
+    if not dialog_open:
+        return (
+            f"依頼は Claude に送られていません — 許可ダイアログは閉じましたが、{minutes} 分たっても"
+            "Claude の入力欄に戻りませんでした。ペインの様子を確かめてから、"
+            "依頼をもう一度送ってください。"
+        )
     return (
         f"依頼は Claude に送られていません — Claude のペインで許可ダイアログが {minutes} 分以上"
         "開いたままでした。c-lord はこのダイアログに答えません（依頼を打ち込むと、その Enter が"
@@ -827,35 +838,87 @@ _EDIT_PERMISSION_MARKERS = ("Do you want to make this edit to ", "Do you want to
 _HOLD_MARKERS = _PERMISSION_PROMPT_MARKERS + _EDIT_PERMISSION_MARKERS
 
 
-def _dialog_question_row(lines: list[str]) -> int | None:
-    """Index of the last dialog-question row in the bottom zone, or None (#1247)."""
+# #1247 (review 16): the shape every tool-permission dialog shares, whatever its
+# verb and however narrow the pane — a "Do you want to …?" question, possibly
+# wrapped over several rows, then the options starting at "1. Yes", then a
+# footer starting "Esc to cancel" as the last row. Markers alone missed real
+# dialogs: "Do you want to overwrite notes.txt?" (no marker), an Edit question
+# wrapped before the file name (the marker's trailing space is lost in the
+# capture), and a Bash dialog at 30 columns whose wrapped options pushed the
+# question above the 15-row zone. AskUserQuestion's footer starts "Enter to
+# select", the trust / bypass dialogs' "Enter to confirm", so neither matches.
+_DIALOG_FOOTER_RE = re.compile(r"^\s*Esc to cancel\b")
+_DIALOG_YES_RE = re.compile(r"^\s*(?:❯\s*)?1\.\s+Yes\b")
+_DIALOG_QUESTION_RE = re.compile(r"^Do you want to\b.*\?$")
+# Rows from the footer up to "1. Yes": a 30-column Bash dialog's options take ~15.
+_DIALOG_OPTIONS_MAX_ROWS = 60
+# Rows a wrapped question may take.
+_DIALOG_QUESTION_MAX_ROWS = 6
+
+
+def _structural_question_row(lines: list[str]) -> int | None:
+    """First row of a tool-permission dialog's question, by its shape (#1247)."""
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    footer = next(
+        (i for i in range(end - 1, max(-1, end - 4), -1) if _DIALOG_FOOTER_RE.match(lines[i])),
+        None,
+    )
+    if footer is None:
+        return None
+    for yes in range(footer - 1, max(-1, footer - 1 - _DIALOG_OPTIONS_MAX_ROWS), -1):
+        if not _DIALOG_YES_RE.match(lines[yes]):
+            continue
+        parts: list[str] = []
+        for k in range(yes - 1, max(-1, yes - 1 - _DIALOG_QUESTION_MAX_ROWS), -1):
+            row = lines[k].strip()
+            if not row:
+                break
+            parts.insert(0, row)
+            if _DIALOG_QUESTION_RE.match(" ".join(parts)):  # rejoin the wrapped question
+                return k
+        return None
+    return None
+
+
+def _marker_question_row(lines: list[str]) -> int | None:
+    """Last marker row in the bottom zone (the shapes without that footer, e.g. y/N)."""
     end = len(lines)
     while end and not lines[end - 1].strip():
         end -= 1
     for i in range(end - 1, max(0, end - _PERMISSION_SCAN_LINES) - 1, -1):
         if any(marker in lines[i] for marker in _HOLD_MARKERS):
+            # A dialog draws no input box under its question; prose does.
+            if TmuxClaudeRunner._has_input_prompt("\n".join(lines[i + 1 :])):
+                return None
             return i
     return None
+
+
+def _dialog_question_row(lines: list[str]) -> int | None:
+    """Row where an open permission dialog's question starts, or None (#1247)."""
+    row = _structural_question_row(lines)
+    return row if row is not None else _marker_question_row(lines)
 
 
 def _permission_dialog_open(pane: str) -> bool:
     """True when a permission dialog — not prose, not a menu — has the keyboard (#1247).
 
-    A marker alone reads Claude's own last sentence ("Do you want to proceed?")
-    as a dialog (#156); before a send that would hold the request for half an
-    hour. A real dialog draws no input box under its question (verified on the
-    ``i1247_*_dialog_background_agent_v2_1_318.txt`` captures), so only the rows
-    *below* the question are searched for one — a bare ``>`` or ``❯`` line in
-    the command above it is not an input box. An AskUserQuestion / plan menu
-    whose question happens to be a marker is a menu: #358 handles those.
+    Judged by the dialog's shape (``_structural_question_row``), else by a
+    marker with no input box *below* it — Claude's own sentence "Do you want to
+    proceed?" sits above the input box (#156), and a bare ``>`` / ``❯`` row in
+    the command above the question is not an input box. An AskUserQuestion /
+    plan menu whose question happens to read the same is a menu: #358's.
     """
-    lines = pane.splitlines()
-    row = _dialog_question_row(lines)
-    if row is None:
+    if _dialog_question_row(pane.splitlines()) is None:
         return False
-    if TmuxClaudeRunner._has_input_prompt("\n".join(lines[row + 1 :])):
-        return False
-    return (_parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)) is None
+    return not _pane_shows_menu(pane)
+
+
+def _pane_shows_menu(pane: str) -> bool:
+    """An AskUserQuestion / plan menu — #358's business, not a permission dialog."""
+    return (_parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)) is not None
 
 
 def _permission_dialog_closed(pane: str) -> bool:
@@ -864,9 +927,7 @@ def _permission_dialog_closed(pane: str) -> bool:
     Both, because a redraw between two states shows neither — that is not an
     answer, and the next agent's dialog can be one frame away.
     """
-    return _dialog_question_row(pane.splitlines()) is None and TmuxClaudeRunner._has_input_prompt(
-        pane
-    )
+    return not _permission_dialog_open(pane) and TmuxClaudeRunner._has_input_prompt(pane)
 
 
 def pane_shows_permission_dialog(raw: object) -> bool:
@@ -888,19 +949,30 @@ def _permission_dialog_summary(pane: str) -> str:
     end = _dialog_question_row(lines)
     if end is None:
         return ""
-    # The first question row (Bash dialogs have two: "requires approval" + "proceed?").
+    # The reason row above the question ("This command requires approval").
     zone_start = max(0, end - _PERMISSION_SCAN_LINES)
     while end > zone_start and any(m in lines[end - 1] for m in _HOLD_MARKERS):
         end -= 1
-    rows: list[str] = []
+    block: list[str] = []
     for line in reversed(lines[zone_start:end]):
         stripped = line.strip()
         if stripped.startswith("─") and _DIALOG_RULE_RE.match(stripped):
             break  # the rule above the dialog: everything higher is conversation
-        if not stripped or _DIALOG_RULE_RE.match(stripped) or stripped.startswith("Tip:"):
+        if stripped and not _DIALOG_RULE_RE.match(stripped):
+            block.insert(0, stripped)
+    rows: list[str] = []
+    tip: str | None = None
+    for row in block:
+        # The "Tip: … below" line wraps in a narrow pane; drop all of it.
+        if row.startswith("Tip:"):
+            tip = row
             continue
-        rows.append(stripped)
-    text = redact_credentials("\n".join(reversed(rows))).replace("`", "ˋ")
+        if tip is not None and not tip.endswith("below") and len(tip) < 200:
+            tip = f"{tip} {row}"
+            continue
+        tip = None
+        rows.append(row)
+    text = redact_credentials("\n".join(rows)).replace("`", "ˋ")
     if len(text) > _PERMISSION_SUMMARY_MAX:
         text = text[: _PERMISSION_SUMMARY_MAX - 1] + "…"
     return text
@@ -3174,6 +3246,10 @@ class TmuxClaudeRunner:
                             message_type=MessageType.SYSTEM,
                             permission_dialog_hold=summary,
                         )
+                elif _pane_shows_menu(pane):
+                    # An AskUserQuestion / plan menu opened instead: the caller's
+                    # re-peek sends it the #358 way (Esc, then the request).
+                    return
                 elif _permission_dialog_closed(pane):
                     logger.info(
                         "%s permission dialog answered; checking the pane again before "
@@ -3192,7 +3268,7 @@ class TmuxClaudeRunner:
                         raw={},
                         message_type=MessageType.RESULT,
                         is_complete=True,
-                        error=_permission_hold_timed_out(),
+                        error=_permission_hold_timed_out(dialog_open=_permission_dialog_open(pane)),
                     )
                     return
                 await asyncio.sleep(_PERMISSION_HOLD_POLL)

@@ -294,7 +294,7 @@ TRANSIENT_PANE = '● Agent "Delete junk directory" is running…\n\n  ⎿  Bash
 
 
 async def _scripted_run(
-    tmux_manager: MagicMock, script: list[str]
+    tmux_manager: MagicMock, script: list[str], *, allowed_keys: tuple[str, ...] = ()
 ) -> tuple[list[StreamEvent], list[str]]:
     """Run a turn whose pane shows ``script`` capture by capture (last one repeats).
 
@@ -322,7 +322,8 @@ async def _scripted_run(
     with _fast(), patch("c_lord.tmux._run") as raw_tmux:
         async for event in runner.run("<text>"):
             events.append(event)
-    assert _keys_pressed(tmux_manager, raw_tmux) == [], "c-lord must not answer a dialog"
+    pressed = [k for k in _keys_pressed(tmux_manager, raw_tmux) if k not in allowed_keys]
+    assert pressed == [], "c-lord must not answer a dialog"
     return events, typed_into
 
 
