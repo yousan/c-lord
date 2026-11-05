@@ -288,3 +288,172 @@ async def test_owed_answer_is_not_lost_behind_a_pane_bang_answer(tmp_path, log):
     assert _body_order(run) == ["A", "BANG"], run.posted
     assert run.cursor == ["a1", "bang1"], run.cursor
     assert final_answer_needs_recovery(project, run.cursor[-1]) is None
+
+
+# -- review of 26e8649: a retry that fails, the order of silent posts, how it is posted --
+
+_NOTIFICATION = (
+    "<task-notification>\n<task-id>b1</task-id>\n<status>running</status>\n"
+    '<summary>Monitor event: "run"</summary>\n</task-notification>'
+)
+_BANG_LABEL = "-# ペインで打った `!ls` への返事"
+
+
+async def _replay_failing(
+    tmp_path: Path, steps, *, silent_fails: set[str], reply_fails: dict[str, int] | None = None
+) -> tuple[_Run, Path]:
+    """`_replay` with the silent sink failing for *silent_fails* and the reply sink
+    failing the first *n* times for each text in *reply_fails*."""
+    project = tmp_path / "p"
+    run = _Run()
+    orig_sink, orig_reply = run.sink, run.reply_sink
+    left = dict(reply_fails or {})
+
+    async def sink(text: str):
+        if text.rsplit("\n", 1)[-1] in silent_fails:
+            raise RuntimeError("discord 503")
+        return await orig_sink(text)
+
+    async def reply_sink(text: str, **kw: object) -> None:
+        if left.get(text, 0) > 0:
+            left[text] -= 1
+            raise RuntimeError("discord 503")
+        await orig_reply(text, **kw)
+
+    run.sink = sink  # type: ignore[method-assign]
+    run.reply_sink = reply_sink  # type: ignore[method-assign]
+    import tests.transcript.test_answer_cursor_replay as mod
+
+    real_run = mod._Run
+    mod._Run = lambda: run  # type: ignore[assignment]
+    try:
+        out = await _replay(project, steps)
+    finally:
+        mod._Run = real_run  # type: ignore[assignment]
+    return out, project
+
+
+_A_FAILS_THEN_ENDS = [
+    (_user("依頼", "u0"), 0.05),
+    (_text("A", "a1"), 0.05),
+    (_tool("t1", "a2"), 0.05),
+    (_result("t1", "u1"), 0.05),
+    (END, 0.1),
+]
+
+
+async def test_owed_answer_stays_owed_when_its_retry_fails(tmp_path, log):
+    """A's silent post failed; its retry at the next turn's start fails too (Discord
+    still down). It was dropped from memory and the cursor committed to a1 — A never
+    posted, no rescue left. It stays owed, the cursor waits behind it, and it goes
+    out (then the cursor moves on) once a post succeeds."""
+    steps = [
+        *_A_FAILS_THEN_ENDS,
+        (_user("次の依頼", "u2"), 0.05),  # retry 1 fails
+        (_text("B", "b1"), 0.05),
+        (dict(END, uuid="end-2"), 0.1),  # retry 2 (before B's flush) fails
+        (_user("三つ目", "u3"), 0.1),  # retry 3 succeeds
+    ]
+    run, project = await _replay_failing(tmp_path, steps, silent_fails={"A"}, reply_fails={"A": 2})
+    assert ("reply", "A") in run.posted, run.posted
+    assert run.cursor == ["a1", "b1"], run.cursor
+    assert final_answer_needs_recovery(project, run.cursor[-1]) is None
+
+
+async def test_cursor_does_not_pass_an_answer_still_owed(tmp_path, log):
+    """Same, but Discord stays down for A: the cursor never moves past it."""
+    steps = [
+        *_A_FAILS_THEN_ENDS,
+        (_user("次の依頼", "u2"), 0.05),
+        (_text("B", "b1"), 0.05),
+        (dict(END, uuid="end-2"), 0.1),
+    ]
+    run, _ = await _replay_failing(tmp_path, steps, silent_fails={"A"}, reply_fails={"A": 99})
+    assert ("reply", "B") in run.posted
+    assert run.cursor == [], run.cursor
+
+
+async def test_owed_answer_goes_out_before_a_later_silent_text(tmp_path, log):
+    """A owed; the pane's ``!ls`` is answered with BANG and a tool call: BANG went out
+    silently ahead of the older A (posted [silent BANG, reply A])."""
+    steps = [
+        *_A_FAILS_THEN_ENDS,
+        (_user("<bash-input>ls</bash-input>", "bi1"), 0.05),
+        (_user("<bash-stdout>a.txt</bash-stdout><bash-stderr></bash-stderr>", "bo1"), 0.05),
+        (_text("BANG", "bang1"), 0.05),
+        (_tool("t2", "bang2"), 0.1),
+    ]
+    run, _ = await _replay_failing(tmp_path, steps, silent_fails={"A"})
+    assert _body_order(run) == ["A", "BANG"], run.posted
+
+
+async def test_owed_answer_of_a_notification_turn_stays_silent(tmp_path, log):
+    """#913: a notification turn's answer is posted silently, never as a pinging reply."""
+    steps = [
+        (dict(END, uuid="end-0"), 0.05),  # the turn _replay opened is over
+        (_user(_NOTIFICATION, "n0"), 0.05),
+        (_text("A", "a1"), 0.05),
+        (_tool("t1", "a2"), 0.05),
+        (_result("t1", "u1"), 0.05),
+        (END, 0.1),
+        (_user("次の依頼", "u2"), 0.1),
+    ]
+    project = tmp_path / "p"
+    run = _Run()
+    orig = run.sink
+    fails = {"A": 1}
+
+    async def sink(text: str):
+        if fails.get(text, 0) > 0:
+            fails[text] -= 1
+            raise RuntimeError("discord 503")
+        return await orig(text)
+
+    run.sink = sink  # type: ignore[method-assign]
+    import tests.transcript.test_answer_cursor_replay as mod
+
+    real_run = mod._Run
+    mod._Run = lambda: run  # type: ignore[assignment]
+    try:
+        out = await _replay(project, steps)
+    finally:
+        mod._Run = real_run  # type: ignore[assignment]
+    assert ("silent", "A") in out.posted, out.posted
+    assert ("reply", "A") not in out.posted
+    assert out.cursor == ["a1"], out.cursor
+
+
+async def test_owed_answer_to_a_pane_bang_keeps_its_label(tmp_path, log):
+    """#1052: an answer to ``!ls`` says which command it answers, and is not a reply."""
+    steps = [
+        (dict(END, uuid="end-0"), 0.05),  # the turn _replay opened is over
+        (_user("<bash-input>ls</bash-input>", "bi1"), 0.05),
+        (_user("<bash-stdout>a.txt</bash-stdout><bash-stderr></bash-stderr>", "bo1"), 0.05),
+        (_text("BANG", "bang1"), 0.05),
+        (_tool("t2", "bang2"), 0.05),
+        (_result("t2", "u1"), 0.05),
+        (END, 0.1),
+        (_user("次の依頼", "u2"), 0.1),
+    ]
+    project = tmp_path / "p"
+    run = _Run()
+    orig = run.sink
+    fails = {"BANG": 1}
+
+    async def sink(text: str):
+        if fails.get(text, 0) > 0:
+            fails[text] -= 1
+            raise RuntimeError("discord 503")
+        return await orig(text)
+
+    run.sink = sink  # type: ignore[method-assign]
+    import tests.transcript.test_answer_cursor_replay as mod
+
+    real_run = mod._Run
+    mod._Run = lambda: run  # type: ignore[assignment]
+    try:
+        out = await _replay(project, steps)
+    finally:
+        mod._Run = real_run  # type: ignore[assignment]
+    assert ("silent", f"{_BANG_LABEL}\nBANG") in out.posted, out.posted
+    assert out.cursor == ["bang1"], out.cursor

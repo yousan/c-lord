@@ -35,7 +35,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from .. import turn_events
 from ..api_error import api_error_text, headline
@@ -816,6 +816,18 @@ def _turn_state_at_end(
     return opened_by, opened_at, agents
 
 
+class _Owed(NamedTuple):
+    """A finished turn's answer nobody posted (#1224/#1225), and how its turn posts it."""
+
+    uuid: str
+    text: str
+    #: Posted with the plain sink — a notification turn (#913) or the answer to a
+    #: ``!`` typed in the pane (#1052, *text* already carries its label).
+    silent: bool
+    #: The reply sink's keywords otherwise (``reply_to`` / ``quote``).
+    target: dict[str, int | bool]
+
+
 #: The uuid of the last text this process posted silently (#1187), so the next
 #: process can tell "the old process posted it" from "Claude wrote it while no
 #: process was reading" — read-back alone cannot (the tail resumes at the end).
@@ -1338,11 +1350,15 @@ class TranscriptMirror:
         # #1225: the third item is the text itself when nobody posted it (the
         # post failed) — such a text is never adopted as delivered.
         _last_silent: tuple[str, object, str | None] | None = None
-        # #1224: ``(uuid, text)`` of a finished turn's answer that nobody posted
-        # (an unposted ``_last_silent`` at its end). Posted when the next turn
-        # starts — waiting for the restart rescue alone lost it for good once
-        # that next turn ended first (the rescue only looks at the last turn).
-        _owed: tuple[str, str] | None = None
+        # #1224: finished turns' answers nobody posted (an unposted
+        # ``_last_silent`` at the turn end), oldest first. Posted before anything
+        # later — waiting for the restart rescue alone lost them for good once the
+        # next turn ended first (the rescue only looks at the last turn). One stays
+        # here until a post of it succeeds.
+        _owed: list[_Owed] = []
+        # The newest delivered uuid held back while an answer is still owed: the
+        # cursor never passes an owed answer (a restart's rescue is its fallback).
+        _cursor_after_owed: str | None = None
         # #631 AC9: has this turn already reported the plan limit?  The CLI
         # retries internally and writes the same refusal again on each attempt —
         # six times in one turn on 2026-09-04 — and every copy says exactly the
@@ -1351,7 +1367,7 @@ class TranscriptMirror:
 
         def _adopt_last_silent_as_answer() -> None:
             """#1125: a turn whose last text preceded its last tool call answered with it."""
-            nonlocal _delivered_uuid, _last_silent, _owed
+            nonlocal _delivered_uuid, _last_silent
             silent, _last_silent = _last_silent, None
             if silent is None or _delivered_uuid is not None:
                 return
@@ -1360,11 +1376,11 @@ class TranscriptMirror:
                 # past a text the thread never showed, so no rescue posted it.
                 logger.warning(
                     "%s TranscriptMirror: the turn's last text before its last tool call "
-                    "was never posted — posting it when the next turn starts, or the "
+                    "was never posted — posting it before anything later, or the "
                     "restart rescue does (#1224/#1225)",
                     log_ctx(thread_id=self.thread_id),
                 )
-                _owed = (silent[0], silent[2])
+                _owed.append(self._owed_answer(silent[0], silent[2]))
                 return
             _delivered_uuid = silent[0]
             if silent[1] is not None:
@@ -1373,53 +1389,74 @@ class TranscriptMirror:
                 reply_tracker.record_reply_message(self.thread_id, cast(Any, silent[1]))
 
         async def _deliver_owed() -> None:
-            """#1224: post the turn before's answer nobody posted, then record it.
+            """#1224: post the answers nobody posted, oldest first, then record them.
 
-            Called before anything later is posted as an answer or committed (a
-            new turn, a reply flush, a pane-bridged text, a turn end): posted
-            after one, the thread reads out of order, and committed after one,
-            the cursor moves back and a restart re-posts that later answer.
+            Called before anything later is posted or committed (a new turn, a
+            silent or reply flush, a pane-bridged text, a turn end): posted after
+            one, the thread reads out of order; committed after one, the cursor
+            moved back and a restart re-posted that later answer. An answer whose
+            post fails again stays owed (the cursor waits behind it).
             """
-            nonlocal _owed, _delivered_uuid
-            owed, _owed = _owed, None
-            if owed is None:
+            nonlocal _delivered_uuid, _cursor_after_owed
+            if not _owed:
                 return
-            # Anything already marked delivered is later than the owed text —
-            # commit the owed one first, then keep that (the cursor only moves on).
-            later = _delivered_uuid
-            logger.info(
-                "%s TranscriptMirror: posting the previous turn's answer, which never "
-                "reached the thread (#1224)",
-                log_ctx(thread_id=self.thread_id),
-            )
-            # Not quoted: the request it answers is not the one that just came in.
-            if self._reply_sink is not None:
-                await self._try_reply_sink(owed[1], quote=False)
-            else:
-                await self._try_sink(owed[1])
-            _delivered_uuid = owed[0]
-            await _commit_cursor()
+            # Anything already marked delivered is later than the owed texts —
+            # commit those first, then keep it (the cursor only moves on).
+            later, _delivered_uuid = _delivered_uuid, None
+            while _owed:
+                owed = _owed[0]
+                if not await self._post_owed(owed):
+                    logger.warning(
+                        "%s TranscriptMirror: could not post the previous turn's answer, "
+                        "which never reached the thread — still owed (#1224)",
+                        log_ctx(thread_id=self.thread_id),
+                    )
+                    break
+                logger.info(
+                    "%s TranscriptMirror: posted the previous turn's answer, which never "
+                    "reached the thread (#1224)",
+                    log_ctx(thread_id=self.thread_id),
+                )
+                _owed.pop(0)
+                await _write_cursor(owed.uuid)
+            if not _owed and _cursor_after_owed is not None:
+                # What was held back behind them; a newer ``later`` supersedes it.
+                if later is None:
+                    await _write_cursor(_cursor_after_owed)
+                _cursor_after_owed = None
             _delivered_uuid = later
 
+        async def _write_cursor(uuid: str) -> None:
+            if self._reply_cursor_sink is None:
+                return
+            try:
+                await self._reply_cursor_sink(uuid)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "TranscriptMirror cursor sink failed for thread=%d",
+                    self.thread_id,
+                    exc_info=True,
+                )
+
         async def _commit_cursor() -> None:
-            nonlocal _delivered_uuid
-            if self._reply_cursor_sink is not None and _delivered_uuid:
-                try:
-                    await self._reply_cursor_sink(_delivered_uuid)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.warning(
-                        "TranscriptMirror cursor sink failed for thread=%d",
-                        self.thread_id,
-                        exc_info=True,
-                    )
-            _delivered_uuid = None
+            nonlocal _delivered_uuid, _cursor_after_owed
+            uuid, _delivered_uuid = _delivered_uuid, None
+            if not uuid:
+                return
+            if _owed:
+                # #1224: never past an answer still owed — held until it is out.
+                _cursor_after_owed = uuid
+                return
+            await _write_cursor(uuid)
 
         async def _flush_pending_silently() -> None:
             nonlocal _pending_text, _pending_progress, _pending_uuid, _last_silent
             if _pending_text is None:
                 return
+            # #1224: an older answer nobody posted goes out ahead of this text.
+            await _deliver_owed()
             # #747: a loop's copy is counted in one message instead of posted.
             if not await self._fold.offer(_pending_text):
                 sent = await self._try_sink(_pending_text)
@@ -2253,6 +2290,34 @@ class TranscriptMirror:
                     exc_info=True,
                 )
         return "api_error"
+
+    def _owed_answer(self, uuid: str, text: str) -> _Owed:
+        """How the turn ending now would have posted *text* as its answer (#1224).
+
+        The same choices as :meth:`_flush_as_reply`, kept for a post that comes
+        later: by then another turn may be open with other flags.
+        """
+        if self._answering_bang is not None:
+            return _Owed(uuid, f"{_pane_bang_label(self._answering_bang)}\n{text}", True, {})
+        if self._turn_by_notification:
+            return _Owed(uuid, text, True, {})
+        if self._turn_self_started or self._turn_trigger is None:
+            return _Owed(uuid, text, False, {"quote": False})
+        # #912: it answers the request it was written for, not the next one.
+        return _Owed(uuid, text, False, {"reply_to": self._turn_trigger})
+
+    async def _post_owed(self, owed: _Owed) -> bool:
+        """Post an owed answer (#1224); whether it reached the thread."""
+        if owed.silent or self._reply_sink is None:
+            return await self._try_sink(owed.text) is not None
+        # The reply sinks return nothing and swallow their failures; a post that
+        # went out is the one the reply tracker now holds (the cog records it).
+        from ..skills import reply_tracker
+
+        before = reply_tracker.get_last_reply_message(self.thread_id)
+        await self._try_reply_sink(owed.text, **owed.target)
+        after = reply_tracker.get_last_reply_message(self.thread_id)
+        return after is not None and after is not before
 
     async def _try_reply_sink(self, body: str, **target: int | bool) -> None:
         await self._progress.note_output()
