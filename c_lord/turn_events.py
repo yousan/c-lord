@@ -522,6 +522,39 @@ def announce_recovered_turn(
         _spawn(_deliver("completion", info, reason="restart_crossed"))
 
 
+def note_read_back_at_rest(thread_id: int) -> None:
+    """A restored mirror read *thread_id*'s transcript back and found it at rest (#1281).
+
+    No turn open, no background agent out, and the turn Claude started on the
+    last agent's report has ended. When that all happened while c-lord was down,
+    the tail (which resumes at the end of the transcript) never sees the turn end
+    that would release a completion held before the restart (#1249), so it is
+    released here — the request's own ``started_by`` and reason, not
+    ``background_agents_unresolved`` an hour later. A hold waiting on a menu
+    answer (#1170) is the answer's to release, and is left alone.
+    """
+    if not enabled():
+        return
+    try:
+        _ensure_held_loaded()
+        held = _HELD.get(thread_id)
+        if held is None or not held.expires or thread_id in _ACTIVE:
+            return
+        logger.info(
+            "%s held completion released — the agents reported back and the turn ended "
+            "while c-lord was down (#1281)",
+            log_ctx(thread_id=thread_id),
+        )
+        _release(thread_id, reason=None)
+    except Exception:
+        # Runs inside the mirror's read-back: a bug here must not stop delivery.
+        logger.warning(
+            "%s could not release the held completion (#1281)",
+            log_ctx(thread_id=thread_id),
+            exc_info=True,
+        )
+
+
 def _as_utc(moment: datetime) -> datetime:
     return moment.replace(tzinfo=_UTC) if moment.tzinfo is None else moment.astimezone(_UTC)
 

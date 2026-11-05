@@ -773,21 +773,38 @@ def _turn_state_at_end(
 ) -> tuple[str | None, str | None, set[str]]:
     """Who opened the turn still open at *end* of *path*, when, and the agents still out.
 
+    :func:`_read_back_state` without its last item.
+    """
+    opened_by, opened_at, agents, _ = _read_back_state(path, end)
+    return opened_by, opened_at, agents
+
+
+def _read_back_state(
+    path: Path, end: int | None = None
+) -> tuple[str | None, str | None, set[str], bool]:
+    """Who opened the turn still open at *end* of *path*, when, the agents still out,
+    and whether an agent's report is still waiting for a turn end (#1281).
+
     ``("person" | "notification" | "wakeup" | None, its timestamp, agent ids)``.
     Replays the live loop's own rules (#913/#979/#917/#1092) over what the old
     process already read, so a mirror restored after a restart picks up where it
     left off (#1011/#1012/#1093). *end* is where the tail starts (#1018); ``None``
-    reads to the end of file. Blocking; ``(None, None, set())`` when the file
-    cannot be read.
+    reads to the end of file. Blocking; ``(None, None, set(), False)`` when the
+    file cannot be read.
+
+    The last item is true from an agent's ``<task-notification>`` until the
+    next turn end: the turn Claude starts on the report — the one that carries
+    the answer — has not ended yet (#1281).
     """
     try:
         lines = list(_read_back_lines(path, end))
     except OSError:
-        return None, None, set()
+        return None, None, set(), False
     opened_by: str | None = None
     opened_at: str | None = None
     spoke = False
     agents: set[str] = set()
+    report_pending = False
     for raw in lines:
         try:
             event = json.loads(raw)
@@ -796,7 +813,10 @@ def _turn_state_at_end(
         if not isinstance(event, dict):
             continue
         agents.update(_launched_agent_ids(event))
-        agents.difference_update(_reported_task_ids(event))
+        reported = _reported_task_ids(event)
+        if reported:
+            agents.difference_update(reported)
+            report_pending = True
         wakeup = _is_scheduled_wakeup(event)
         if _is_user_prompt(event) or wakeup:
             kind = "wakeup" if wakeup else _prompt_kind(event)
@@ -810,10 +830,12 @@ def _turn_state_at_end(
                 spoke = False
         if event.get("type") == "assistant" and not event.get("isSidechain"):
             spoke = True
+        if _is_turn_end(event):
+            report_pending = False
         if _is_turn_end(event) or (local_command_record(event) == "output" and not spoke):
             opened_by = None
             opened_at = None
-    return opened_by, opened_at, agents
+    return opened_by, opened_at, agents, report_pending
 
 
 #: The uuid of the last text this process posted silently (#1187), so the next
@@ -1166,7 +1188,9 @@ class TranscriptMirror:
         if jsonl is None:
             return
         try:
-            opened_by, opened_at, agents = await asyncio.to_thread(_turn_state_at_end, jsonl, end)
+            opened_by, opened_at, agents, report_pending = await asyncio.to_thread(
+                _read_back_state, jsonl, end
+            )
         except Exception:
             logger.warning(
                 "%s TranscriptMirror: could not read back the transcript (#1011)",
@@ -1175,6 +1199,11 @@ class TranscriptMirror:
             )
             return
         self._background_agents |= agents
+        if opened_by is None and not agents and not report_pending:
+            # #1281: the transcript is at rest — every agent reported back and the
+            # turn Claude started on the report ended, all while c-lord was down.
+            # No turn end will come for a completion held before the restart.
+            turn_events.note_read_back_at_rest(self.thread_id)
         if opened_by is not None:
             # #1179: a turn still open may already have stopped on an API error.
             # Read only then — a turn closed before the restart carries none over.
