@@ -227,6 +227,10 @@ _PERMISSION_HOLD_POLL = 2.0
 # sends anyway — each Esc is followed by a fresh look at the pane, because a
 # permission dialog can be queued behind the menu it closed.
 _PRE_SEND_MENU_DISMISSALS = 3
+# The least time between two of those Esc presses. Two Esc presses on an idle
+# prompt open Rewind (0.6 s apart did, 0.8 s did not, on 2.1.318), and a menu
+# can close between the capture and the key — so never two inside the window.
+_PRE_SEND_ESC_GAP = 1.5
 _PERMISSION_HOLD_TIMEOUT = 30 * 60.0
 # How much of the dialog (its command / summary rows) the thread is shown.
 _PERMISSION_SUMMARY_MAX = 300
@@ -851,10 +855,13 @@ _HOLD_MARKERS = _PERMISSION_PROMPT_MARKERS + _EDIT_PERMISSION_MARKERS
 # capture), and a Bash dialog at 30 columns whose wrapped options pushed the
 # question above the 15-row zone. AskUserQuestion's footer starts "Enter to
 # select", the trust / bypass dialogs' "Enter to confirm", so neither matches.
-_DIALOG_FOOTER_RE = re.compile(r"^\s*Esc to cancel\b")
+# "Esc" is the default key; the footer's key names come from the keybinding-aware
+# hint component, so a remapped cancel key reads e.g. "Ctrl+Q to cancel" (never
+# "Enter …": AskUserQuestion / Rewind / trust footers start with Enter).
+_DIALOG_FOOTER_RE = re.compile(r"^\s*(?!Enter\b)[\w+\-]{1,20} to cancel\b")
 # The same footer with "Esc to cancel" after a separator ("Tab to amend · Esc to
 # cancel"); never AskUserQuestion's "Enter to select · … · Esc to cancel".
-_DIALOG_FOOTER_TAIL_RE = re.compile(r"·\s*Esc to cancel\b")
+_DIALOG_FOOTER_TAIL_RE = re.compile(r"·\s*(?!Enter\b)[\w+\-]{1,20} to cancel\b")
 # Non-blank rows from the bottom the footer may start in: its own wrapped rows
 # below ~26 columns, plus status rows a statusline draws under the dialog.
 _DIALOG_FOOTER_SCAN_ROWS = 8
@@ -866,7 +873,11 @@ _DIALOG_OPTIONS_MAX_ROWS = 60
 _DIALOG_QUESTION_MAX_ROWS = 12
 
 
-_OPTION_ROW_RE = re.compile(r"^\s*(?:❯\s*)?\d+\.")
+# An option row ("❯ 1. Yes", "  2. No …", "↓ 2. Yes, and …" — the arrow marks a
+# list scrolled in a short pane) and its wrapped continuation, which Claude Code
+# indents under the label.
+_OPTION_ROW_RE = re.compile(r"^\s*(?:[❯↓↑]\s*)?\d+\.")
+_OPTION_CONTINUATION_RE = re.compile(r"^\s{4,}\S")
 
 
 def _dialog_footer_row(lines: list[str]) -> int | None:
@@ -874,7 +885,8 @@ def _dialog_footer_row(lines: list[str]) -> int | None:
 
     The bottom-most row that starts "Esc to cancel", or that carries
     "· Esc to cancel" (joined with the next row, in case that tail wrapped) and
-    is neither an option row nor AskUserQuestion's "Enter to select …" footer.
+    is neither an option row nor a "Enter to …" footer (AskUserQuestion's
+    "Enter to select", Rewind's "Enter to continue", trust's "Enter to confirm").
     """
     rows = [i for i, line in enumerate(lines) if line.strip()][-_DIALOG_FOOTER_SCAN_ROWS:]
     for idx in range(len(rows) - 1, -1, -1):
@@ -890,26 +902,40 @@ def _dialog_footer_row(lines: list[str]) -> int | None:
 
 
 def _structural_question_row(lines: list[str]) -> int | None:
-    """First row of a tool-permission dialog's question, by its shape (#1247)."""
+    """Where a tool-permission dialog starts, by its shape (#1247); None if none.
+
+    The dialog is the bottom-most block: a "1. Yes" row, then only option rows,
+    their indented continuations and blank rows down to the footer — or down to
+    the bottom, because the WebFetch dialog has no footer (its last option ends
+    "(esc)") and a short pane cuts the list off. Above "1. Yes" sits the
+    question "Do you want to …?" (wrapped rows rejoined); in a pane too short
+    for the whole dialog Claude Code clips it from the top, and then nothing at
+    all is above "1. Yes". Returns the question's first row, or the "1. Yes" row
+    when the question was clipped off.
+    """
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
     footer = _dialog_footer_row(lines)
-    if footer is None:
+    limit = footer if footer is not None else end
+    for yes in range(limit - 1, max(-1, limit - 1 - _DIALOG_OPTIONS_MAX_ROWS), -1):
+        if _DIALOG_YES_RE.match(lines[yes]):
+            break
+        row = lines[yes]
+        if row.strip() and not (_OPTION_ROW_RE.match(row) or _OPTION_CONTINUATION_RE.match(row)):
+            return None  # something other than the option list sits under "1. Yes"
+    else:
         return None
-    # The footer is the last block: a live input box under it means the "dialog"
-    # is scrollback above an idle prompt.
-    if any(row > footer for row in _input_box_rows(lines)):
-        return None
-    for yes in range(footer - 1, max(-1, footer - 1 - _DIALOG_OPTIONS_MAX_ROWS), -1):
-        if not _DIALOG_YES_RE.match(lines[yes]):
-            continue
-        parts: list[str] = []
-        for k in range(yes - 1, max(-1, yes - 1 - _DIALOG_QUESTION_MAX_ROWS), -1):
-            row = lines[k].strip()
-            if not row:
-                break
-            parts.insert(0, row)
-            if _DIALOG_QUESTION_RE.match(" ".join(parts)):  # rejoin the wrapped question
-                return k
-        return None
+    parts: list[str] = []
+    for k in range(yes - 1, max(-1, yes - 1 - _DIALOG_QUESTION_MAX_ROWS), -1):
+        row = lines[k].strip()
+        if not row:
+            break
+        parts.insert(0, row)
+        if _DIALOG_QUESTION_RE.match(" ".join(parts)):  # rejoin the wrapped question
+            return k
+    if not any(line.strip() for line in lines[:yes]):
+        return yes  # clipped from the top: the question is off screen
     return None
 
 
@@ -936,13 +962,21 @@ def _dialog_question_row(lines: list[str]) -> int | None:
 def _permission_dialog_open(pane: str) -> bool:
     """True when a permission dialog — not prose, not a menu — has the keyboard (#1247).
 
-    Judged by the dialog's shape (``_structural_question_row``), else by a
-    marker with no input box *below* it — Claude's own sentence "Do you want to
-    proceed?" sits above the input box (#156), and a bare ``>`` / ``❯`` row in
-    the command above the question is not an input box. An AskUserQuestion /
+    Never while a live input box is on screen. Judged by the dialog's shape
+    (``_structural_question_row``), else by a marker with no input box *below*
+    it — Claude's own sentence "Do you want to proceed?" sits above the input
+    box (#156), and a bare ``>`` / ``❯`` row in the command above the question
+    is not an input box. An AskUserQuestion /
     plan menu whose question happens to read the same is a menu: #358's.
     """
-    if _dialog_question_row(pane.splitlines()) is None:
+    lines = pane.splitlines()
+    # A real dialog replaces the input box (every ``i1247_*`` capture). A box on
+    # screen means the phrase is prose — Claude's answer above it, or a stopped
+    # request Claude Code put back into it (#879), which may well quote "Do you
+    # want to proceed?".
+    if _input_box_rows(lines):
+        return False
+    if _dialog_question_row(lines) is None:
         return False
     return not _pane_shows_menu(pane)
 
@@ -950,6 +984,32 @@ def _permission_dialog_open(pane: str) -> bool:
 def _pane_shows_menu(pane: str) -> bool:
     """An AskUserQuestion / plan menu — #358's business, not a permission dialog."""
     return (_parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)) is not None
+
+
+# #1247: Claude Code's Rewind screen ("Restore the code and/or conversation to the
+# point before…"), which two Esc presses on an idle prompt open — measured on
+# 2.1.318: 0.3 s and 0.6 s apart open it, 0.8 s and more do not. One Esc closes it.
+_REWIND_TITLE_RE = re.compile(r"^\s*Rewind\s*$")
+_REWIND_FOOTER_RE = re.compile(r"^\s*Enter to continue\b.*\bto cancel\b")
+
+
+def _rewind_open(pane: str) -> bool:
+    """True when the Rewind screen has the keyboard (#1247)."""
+    rows = [line for line in pane.splitlines() if line.strip()][-20:]
+    return (
+        bool(rows)
+        and bool(_REWIND_FOOTER_RE.match(rows[-1]))
+        and any(_REWIND_TITLE_RE.match(row) for row in rows)
+    )
+
+
+def _rewind_still_open() -> str:
+    """User-facing text for a request kept out of a Rewind screen that stayed open."""
+    return (
+        "依頼は Claude に送られていません — Claude のペインで Rewind（会話の巻き戻し）の画面が"
+        "開いたまま閉じませんでした。打ち込むと巻き戻しの選択になってしまうため送っていません。"
+        "ペインで Esc を押して閉じてから、依頼をもう一度送ってください。"
+    )
 
 
 def _permission_dialog_closed(pane: str) -> bool:
@@ -2121,7 +2181,13 @@ class TmuxClaudeRunner:
             # question says. The hold's one deadline bounds the dialogs; menus
             # get ``_PRE_SEND_MENU_DISMISSALS`` Esc presses, then the send goes
             # ahead as it did before #1247.
+            # Every Esc is pressed only on a capture that shows a menu (or the
+            # Rewind screen) taken right before it, and never within
+            # ``_PRE_SEND_ESC_GAP`` of the previous one: two quick Esc presses
+            # on an idle prompt open Rewind.
             dismissals = 0
+            last_esc: float | None = None
+            loop = asyncio.get_running_loop()
             while not self._stopped:
                 pending = await self.peek_pending_ask()
                 peeked = self._last_peek_pane
@@ -2131,15 +2197,38 @@ class TmuxClaudeRunner:
                         if held.message_type == MessageType.RESULT:
                             return
                     continue
-                if pending is None or dismissals >= _PRE_SEND_MENU_DISMISSALS:
+                rewind = pending is None and peeked is not None and _rewind_open(peeked)
+                if not rewind and pending is None:
                     break
+                if dismissals >= _PRE_SEND_MENU_DISMISSALS:
+                    if rewind:
+                        logger.error(
+                            "%s the Rewind screen stayed open; not sending the request (#1247)",
+                            log_ctx(thread_id=self._thread_id),
+                        )
+                        yield StreamEvent(
+                            raw={},
+                            message_type=MessageType.RESULT,
+                            is_complete=True,
+                            error=_rewind_still_open(),
+                        )
+                        return
+                    break  # a menu that will not close: send, as before #1247
+                if (
+                    last_esc is not None
+                    and (wait := last_esc + _PRE_SEND_ESC_GAP - loop.time()) > 0
+                ):
+                    await asyncio.sleep(wait)
+                    continue  # look again: the menu may have closed meanwhile
                 dismissals += 1
                 logger.info(
-                    "Open menu detected before delivering new input; dismissing it "
-                    "(Esc) so the message is not consumed as a menu selection (thread=%d)",
-                    self._thread_id,
+                    "%s %s before delivering new input; dismissing it (Esc) so the message "
+                    "is not consumed as a selection",
+                    log_ctx(thread_id=self._thread_id),
+                    "Rewind screen open" if rewind else "Open menu detected",
                 )
                 await self.cancel_menu()
+                last_esc = loop.time()
                 await asyncio.sleep(_MENU_NAV_DELAY)
             if (stopped := self._stopped_before_delivery()) is not None:
                 yield stopped
@@ -3311,6 +3400,11 @@ class TmuxClaudeRunner:
                     pane = _normalize_capture(raw)
         finally:
             self._held_for_permission = False
+
+    @property
+    def held_for_permission(self) -> bool:
+        """This turn's prompt is on hold behind an open permission dialog (#1247)."""
+        return self._held_for_permission
 
     def _stopped_before_delivery(self) -> StreamEvent | None:
         """The turn's RESULT when it was interrupted before its prompt was sent (#800).

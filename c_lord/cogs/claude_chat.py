@@ -2288,6 +2288,21 @@ class ClaudeChatCog(commands.Cog):
         """
         thread_id = thread.id
         runner = self._active_runners.get(thread_id)
+        if runner is not None and getattr(runner, "held_for_permission", False) is True:
+            # #1247: the running turn is a request held behind a permission
+            # dialog. Interrupting it would drop that request without a word,
+            # and the dialog would still take the command's Enter. Leave both.
+            logger.info(
+                "%s %s: a request is held behind a permission dialog; not sending (#1247)",
+                log_ctx(thread_id=thread_id),
+                command,
+            )
+            return (
+                f"⏸️ `{command}` は送っていません — 依頼が 1 件、Claude のペインで開いている"
+                "許可ダイアログへの答えを待っています（保留中）。"
+                "ペインでダイアログに答えると、その依頼がそのまま送られます。"
+                f"`{command}` はそのあとでもう一度実行してください。"
+            )
         if runner is not None:
             if ack is not None:
                 await ack()

@@ -208,13 +208,14 @@ def test_a_wrapped_tip_does_not_leak_into_the_quote(name: str) -> None:
 
 
 def _is_real_dialog_fixture(name: str) -> bool:
-    return name.startswith("i1247_") and "idle_after" not in name
+    return name.startswith("i1247_") and "idle_after" not in name and "_nodialog_" not in name
 
 
 @pytest.mark.parametrize("path", sorted(PANES.glob("*.txt")), ids=lambda p: p.name)
 def test_only_real_permission_dialogs_hold(path: Path) -> None:
     """Every real capture: dialogs hold; ask / plan / trust / bypass / login / y/N /
-    idle panes (including the ones right after /compact and /clear) do not."""
+    Rewind / idle panes (including the ones right after /compact and /clear, and
+    a stopped request put back into the input box) do not."""
     held = pane_shows_permission_dialog(path.read_text(encoding="utf-8"))
     assert held is _is_real_dialog_fixture(path.name)
 

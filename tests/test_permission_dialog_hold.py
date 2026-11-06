@@ -111,6 +111,8 @@ def _fast():  # noqa: ANN202 — a patch stack
         stack.enter_context(patch(f"c_lord.claude.tmux_runner.{name}", value))
     # The hold's own pacing (new in #1247; ``create`` so this file runs on main).
     stack.enter_context(patch("c_lord.claude.tmux_runner._PERMISSION_HOLD_POLL", 0.01, create=True))
+    # The Rewind-safe spacing between pre-send Esc presses (#1247).
+    stack.enter_context(patch("c_lord.claude.tmux_runner._PRE_SEND_ESC_GAP", 0.0, create=True))
     # A hold that never ends fails the test in seconds, not in 30 minutes.
     stack.enter_context(
         patch("c_lord.claude.tmux_runner._PERMISSION_HOLD_TIMEOUT", 2.0, create=True)
