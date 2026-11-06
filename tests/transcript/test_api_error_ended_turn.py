@@ -148,3 +148,35 @@ def test_read_back_replays_the_api_error_turn_end(tmp_path) -> None:
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
     assert _turn_state_at_end(path) == ("notification", "2026-10-29T08:40:00.000Z", set())
     assert _read_back_state(path)[4] is False
+
+
+async def test_restart_after_the_notification_does_not_report_the_persons_error(
+    tmp_path, monkeypatch
+) -> None:
+    """Review of 04788c4: the read-back drops the old error at the new turn, like the live loop.
+
+    Before the restart: the person's turn dies on the error, then a notification
+    starts Claude's own turn. After it: that turn ends with no reply — no ❌.
+    """
+    from c_lord import turn_events
+    from c_lord.skills import reply_tracker
+
+    from . import test_self_turn_api_error as a
+    from .test_restart_self_turn_api_error import _lines, _Restored
+
+    log = tmp_path / "turn-events.jsonl"
+    monkeypatch.setenv(turn_events.ENV_LOG, str(log))
+    turn_events.reset()
+    reply_tracker.reset_tracker()
+    person = a._row(
+        "user", "2026-10-29T08:21:05.000Z", message={"role": "user", "content": "確認して"}
+    )
+    before = (person, a._api_error(), *a._notification("2026-10-29T08:40:00.000Z", "b1"))
+    try:
+        async with _Restored(tmp_path, *before) as r:
+            await r.feed(a._end("2026-10-29T08:40:05.000Z"))
+        assert r.notices == [], r.notices
+        assert [e["kind"] for e in _lines(log)] == ["completion"], _lines(log)
+    finally:
+        turn_events.reset()
+        reply_tracker.reset_tracker()

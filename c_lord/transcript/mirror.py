@@ -35,7 +35,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from .. import turn_events
 from ..api_error import api_error_text, headline
@@ -774,40 +774,59 @@ def _turn_state_at_end(
 ) -> tuple[str | None, str | None, set[str]]:
     """Who opened the turn still open at *end* of *path*, when, and the agents still out.
 
-    :func:`_read_back_state` without its last item.
+    The first three items of :func:`_read_back_state`.
     """
-    opened_by, opened_at, agents, _, _ = _read_back_state(path, end)
-    return opened_by, opened_at, agents
+    state = _read_back_state(path, end)
+    return state.opened_by, state.opened_at, state.agents
 
 
-def _read_back_state(
-    path: Path, end: int | None = None
-) -> tuple[str | None, str | None, set[str], bool | None, bool]:
+class _ReadBack(NamedTuple):
+    """What :func:`_read_back_state` read back (#1011)."""
+
+    opened_by: str | None
+    opened_at: str | None
+    agents: set[str]
+    #: An agent's report still waits for a turn end (#1281); None = unknown.
+    report_pending: bool | None
+    #: The open turn stopped on an API error with nothing after it (#1294).
+    stopped_on_api_error: bool
+    #: The open turn's API-error text, as the live loop holds it (#1179).
+    api_error: str | None
+
+
+def _read_back_state(path: Path, end: int | None = None) -> _ReadBack:
     """Who opened the turn still open at *end* of *path*, when, the agents still out,
-    whether an agent's report is still waiting for a turn end (#1281), and
-    whether the open turn stopped on an API error with nothing after it (#1294).
+    whether an agent's report is still waiting for a turn end (#1281),
+    whether the open turn stopped on an API error with nothing after it (#1294),
+    and the API error that open turn holds (#1179).
 
     ``("person" | "notification" | "wakeup" | None, its timestamp, agent ids)``.
     Replays the live loop's own rules (#913/#979/#917/#1092) over what the old
     process already read, so a mirror restored after a restart picks up where it
     left off (#1011/#1012/#1093). *end* is where the tail starts (#1018); ``None``
-    reads to the end of file. Blocking; ``(None, None, set(), None, False)`` when
-    the file cannot be read — the fourth item ``None`` means "unknown", never "at rest".
+    reads to the end of file. Blocking; ``(None, None, set(), None, False, None)``
+    when the file cannot be read — ``report_pending`` ``None`` means "unknown",
+    never "at rest".
 
-    The last item is true from an agent's ``<task-notification>`` until the
+    ``report_pending`` is true from an agent's ``<task-notification>`` until the
     next turn end: the turn Claude starts on the report — the one that carries
     the answer — has not ended yet (#1281).
+
+    ``api_error`` is the latest main-chain reply's API-error text (#908/#1131),
+    dropped at the turn end — and, like the live loop, when a new turn starts
+    after a turn that stopped on it (#1294): that error was the old turn's.
     """
     try:
         lines = list(_read_back_lines(path, end))
     except OSError:
-        return None, None, set(), None, False
+        return _ReadBack(None, None, set(), None, False, None)
     opened_by: str | None = None
     opened_at: str | None = None
     spoke = False
     agents: set[str] = set()
     report_pending = False
     stopped = False  # the live loop's ``_stopped_on_api_error`` (#1294)
+    failed: str | None = None  # the live loop's ``_turn_api_error`` (#1179)
     for raw in lines:
         try:
             event = json.loads(raw)
@@ -829,6 +848,7 @@ def _read_back_state(
                 # #1294: the turn before stopped on an API error — a new one starts.
                 opened_by = None
                 stopped = False
+                failed = None
             if kind == "person" or (kind in ("notification", "wakeup") and opened_by is None):
                 opened_by = kind
                 stamp = event.get("timestamp")
@@ -838,18 +858,21 @@ def _read_back_state(
         if event.get("type") == "assistant" and not event.get("isSidechain"):
             spoke = True
             if not is_rate_limit_event(event):
-                stopped = api_error_text(event) is not None
+                failed = api_error_text(event)
+                stopped = failed is not None
         elif _tool_call_ids(event)[1] and not event.get("isSidechain"):
             stopped = False
         if _is_turn_end(event):
             report_pending = False
             stopped = False
+            if not event.get("isSidechain"):
+                failed = None
         if _is_turn_end(event) or (local_command_record(event) == "output" and not spoke):
             opened_by = None
             opened_at = None
     if opened_by is None:
         stopped = False
-    return opened_by, opened_at, agents, report_pending, stopped
+    return _ReadBack(opened_by, opened_at, agents, report_pending, stopped, failed)
 
 
 #: The uuid of the last text this process posted silently (#1187), so the next
@@ -919,37 +942,6 @@ def _silent_text_at_end(path: Path, end: int | None = None) -> str | None:
                 silent = held
             held = event.get("uuid") or None
     return None if held is not None else silent
-
-
-def _api_error_at_end(path: Path, end: int | None = None) -> str | None:
-    """The open turn's API-error text at *end* of *path*, as the live loop would hold it.
-
-    #1179: the live loop keeps the latest main-chain reply's API-error text
-    (#908/#1131) and drops it at the turn end. A restart between that row and the
-    ``turn_duration`` lost it, so a self-started turn that failed was recorded as
-    a completion with no ❌. Blocking; ``None`` when the file cannot be read.
-    """
-    try:
-        lines = list(_read_back_lines(path, end))
-    except OSError:
-        return None
-    failed: str | None = None
-    for raw in lines:
-        try:
-            event = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        if (
-            event.get("type") == "assistant"
-            and not event.get("isSidechain")
-            and not is_rate_limit_event(event)
-        ):
-            failed = api_error_text(event)
-        if _is_turn_end(event) and not event.get("isSidechain"):
-            failed = None
-    return failed
 
 
 class TranscriptMirror:
@@ -1207,13 +1199,7 @@ class TranscriptMirror:
         if jsonl is None:
             return
         try:
-            (
-                opened_by,
-                opened_at,
-                agents,
-                report_pending,
-                stopped_on_api_error,
-            ) = await asyncio.to_thread(_read_back_state, jsonl, end)
+            state = await asyncio.to_thread(_read_back_state, jsonl, end)
         except Exception:
             logger.warning(
                 "%s TranscriptMirror: could not read back the transcript (#1011)",
@@ -1221,6 +1207,8 @@ class TranscriptMirror:
                 exc_info=True,
             )
             return
+        opened_by, opened_at, agents = state.opened_by, state.opened_at, state.agents
+        report_pending = state.report_pending
         self._background_agents |= agents
         # ``report_pending is None``: the transcript could not be read, so nothing
         # is known about it — never a reason to release (review of #1281).
@@ -1231,19 +1219,14 @@ class TranscriptMirror:
             turn_events.note_read_back_at_rest(self.thread_id)
         if opened_by is not None:
             # #1179: a turn still open may already have stopped on an API error.
-            # Read only then — a turn closed before the restart carries none over.
-            try:
-                self._turn_api_error = await asyncio.to_thread(_api_error_at_end, jsonl, end)
-            except Exception:
-                logger.warning(
-                    "%s TranscriptMirror: could not read back the open turn's API error (#1179)",
-                    log_ctx(thread_id=self.thread_id),
-                    exc_info=True,
-                )
+            # Taken only then — a turn closed before the restart carries none over.
+            # Same read as the rest (#1294), so a notification that started a new
+            # turn after the error leaves the old turn's error behind.
+            self._turn_api_error = state.api_error
             self._turn_open = True
             # #1294: the old process saw this turn stop on an API error — what
             # starts after the restart is a new turn, as it would have been.
-            self._stopped_on_api_error = stopped_on_api_error
+            self._stopped_on_api_error = state.stopped_on_api_error
             self._turn_by_notification = opened_by == "notification"
             self._turn_self_started = opened_by in ("notification", "wakeup")
             if self._turn_self_started:
