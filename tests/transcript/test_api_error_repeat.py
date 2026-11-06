@@ -101,12 +101,16 @@ def _pane_prompt(uuid: str, parent: str) -> dict:
 
 
 async def _api_lines(
-    tmp_path: Path, items: list[dict | str], fail_first: str | None = None
+    tmp_path: Path,
+    items: list[dict | str],
+    fail_first: str | None = None,
+    failure_reports: list[str] | None = None,
 ) -> list[str]:
     """The API-error lines the thread got.
 
     *fail_first* makes the first API-error post fail: ``"raise"`` (the sink
     raised) or ``"none"`` (the sink returned no message). Those are not counted.
+    *failure_reports* collects the ❌ reports of self-started turns (#1131).
     """
     project = tmp_path / "proj"
     project.mkdir()
@@ -132,7 +136,8 @@ async def _api_lines(
         posted.append(text)
 
     async def api_error_sink(text: str) -> None:
-        pass
+        if failure_reports is not None:
+            failure_reports.append(text)
 
     mirror = TranscriptMirror(
         thread_id=THREAD_ID,
