@@ -227,7 +227,8 @@ def _defer_max_seconds() -> float:
         value = float(raw)
     except ValueError:
         return DEFAULT_DEFER_MAX_SECONDS
-    return value if value > 0 else DEFAULT_DEFER_MAX_SECONDS
+    # #1296: ``inf`` gave a deadline that never fires (and ``Infinity`` in the file).
+    return value if math.isfinite(value) and value > 0 else DEFAULT_DEFER_MAX_SECONDS
 
 
 def started_by_from_message(
@@ -779,6 +780,7 @@ def _ensure_held_loaded() -> None:
         return
     entries = raw.get("held") if isinstance(raw, dict) else None
     expired: list[int] = []
+    gave_deadline = False
     for entry in entries if isinstance(entries, list) else []:
         try:
             info = _info_from_dict(entry["info"])
@@ -801,6 +803,7 @@ def _ensure_held_loaded() -> None:
             # completion never goes out — give it the normal limit from now.
             held.expires = True
             held.deadline = time.time() + _defer_max_seconds()
+            gave_deadline = True
             logger.warning(
                 "%s a held completion in %s has no deadline — it goes out in %.0fs "
                 "unless the agents report back first (#1296)",
@@ -817,6 +820,10 @@ def _ensure_held_loaded() -> None:
             "%s completion held before the restart restored (#1249)",
             log_ctx(thread_id=info.thread_id),
         )
+    if gave_deadline:
+        # Written back, so the next restart counts on from it instead of
+        # starting a fresh full limit again (#1296).
+        _save_held()
     for thread_id in expired:
         _release(thread_id, "background_agents_unresolved")
 
