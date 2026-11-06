@@ -354,9 +354,27 @@ def _fetch_through(a: Path, url: str, sha: str) -> None:
     assert git(a, "rev-parse", "b/work").strip() == sha
 
 
+def _skip_unless_non_utf8_names(tmp_path: Path) -> None:
+    """Skip where the file system refuses non-UTF-8 file names (macOS APFS:
+    EILSEQ). Linux keeps running these tests."""
+    import errno
+    import os
+
+    probe = bytes(tmp_path) + b"/probe\xff"
+    try:
+        os.mkdir(probe)
+    except OSError as exc:
+        if exc.errno == errno.EILSEQ:
+            pytest.skip("this file system refuses non-UTF-8 file names (EILSEQ)")
+        raise
+    os.rmdir(probe)
+
+
 def test_non_utf8_root_byte(tmp_path: Path) -> None:
     """Root dir name holds a byte that is not UTF-8 (\\xff); URL spells it %FF."""
     import os
+
+    _skip_unless_non_utf8_names(tmp_path)
     from urllib.parse import quote
 
     root = _seed_root(tmp_path)
@@ -372,6 +390,8 @@ def test_non_utf8_root_byte(tmp_path: Path) -> None:
 def test_non_utf8_symlink_outside(tmp_path: Path) -> None:
     """Ordinary root; a link outside it named b'\\xff' leads to the neighbour; URL spells %FF."""
     import os
+
+    _skip_unless_non_utf8_names(tmp_path)
 
     root = _seed_root(tmp_path)
     a, b, sha = _only_on_neighbour(tmp_path, root)
