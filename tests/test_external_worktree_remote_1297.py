@@ -142,3 +142,127 @@ def test_linked_worktree_of_an_outside_repo_still_vouches(tmp_path: Path) -> Non
     assert not sd._no_copy(str(a), str(wt), str(a), str(root))
     r = _sweep(root)
     assert not a.exists(), r
+
+
+# Review of b7720f4: other shapes git accepts for the same remote.
+
+
+def _cycle(tmp: Path, remote_of) -> tuple[str, Path, Path, list]:
+    """A <-> B through external worktrees; *remote_of(worktree)* is the URL each one uses."""
+    _seed(tmp)
+    root = tmp / "c-lord-sessions"
+    a = _ws(tmp, root / "111", "4242")
+    b = _ws(tmp, root / "111", "4343")
+    sha = _work(a)
+    git(b, "fetch", "-q", str(a), "work:work")
+    wb, wa = remote_of(tmp, b, "wb"), remote_of(tmp, a, "wa")
+    git(a, "remote", "add", "b", wb)
+    git(a, "fetch", "-q", "b")
+    git(b, "remote", "add", "a", wa)
+    git(b, "fetch", "-q", "a")
+    git(b, "branch", "-q", "-D", "work")
+    git(b, "branch", "-q", "work", "a/work")
+    return sha, a, b, _sweep(root)
+
+
+def _gitfile_url(tmp: Path, ws: Path, name: str) -> str:
+    wt = tmp / "ext" / name
+    git(ws, "worktree", "add", "-q", "--detach", str(wt))
+    return str(wt / ".git")  # the gitdir FILE itself
+
+
+def _suffix_url(tmp: Path, ws: Path, name: str) -> str:
+    wt = tmp / "ext" / f"{name}.git"
+    git(ws, "worktree", "add", "-q", "--detach", str(wt))
+    return str(tmp / "ext" / name)  # git tries <path>.git too
+
+
+def _symlinked_git_dir_url(tmp: Path, ws: Path, name: str) -> str:
+    wt = tmp / "ext" / name
+    wt.mkdir(parents=True)
+    (wt / ".git").symlink_to(ws / ".git")
+    return str(wt)
+
+
+def test_cycle_through_the_gitdir_file(tmp_path: Path) -> None:
+    sha, a, b, r = _cycle(tmp_path, _gitfile_url)
+    assert _has(sha, a, b), f"{sha} lost: {r}"
+
+
+def test_cycle_through_git_suffix_fallback(tmp_path: Path) -> None:
+    sha, a, b, r = _cycle(tmp_path, _suffix_url)
+    assert _has(sha, a, b), f"{sha} lost: {r}"
+
+
+def test_cycle_through_symlinked_git_dir(tmp_path: Path) -> None:
+    sha, a, b, r = _cycle(tmp_path, _symlinked_git_dir_url)
+    assert _has(sha, a, b), f"{sha} lost: {r}"
+
+
+def _neighbours(tmp: Path) -> tuple[Path, Path, Path]:
+    _seed(tmp)
+    root = tmp / "c-lord-sessions"
+    return root, _ws(tmp, root / "111", "4242"), _ws(tmp, root / "111", "4343")
+
+
+def test_gitdir_file_url_is_no_copy(tmp_path: Path) -> None:
+    root, a, b = _neighbours(tmp_path)
+    url = _gitfile_url(tmp_path, a, "wa")
+    assert sd._no_copy(str(b), url, str(b), str(root))
+
+
+def test_symlinked_objects_dir_is_no_copy(tmp_path: Path) -> None:
+    root, a, b = _neighbours(tmp_path)
+    bare = tmp_path / "ext" / "x.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    shutil.rmtree(bare / "objects")
+    (bare / "objects").symlink_to(a / ".git" / "objects")
+    assert sd._no_copy(str(b), str(bare), str(b), str(root))
+
+
+def test_symlinked_refs_dir_is_no_copy(tmp_path: Path) -> None:
+    root, a, b = _neighbours(tmp_path)
+    bare = tmp_path / "ext" / "x.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    shutil.rmtree(bare / "refs")
+    (bare / "refs").symlink_to(a / ".git" / "refs")
+    assert sd._no_copy(str(b), str(bare), str(b), str(root))
+
+
+def test_quoted_alternates_line_is_no_copy(tmp_path: Path) -> None:
+    root, a, b = _neighbours(tmp_path)
+    bare = tmp_path / "ext" / "x.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    (bare / "objects" / "info" / "alternates").write_text(f'"{a / ".git" / "objects"}"\n')
+    assert sd._no_copy(str(b), str(bare), str(b), str(root))
+
+
+def test_nul_in_gitfile_or_alternates_is_no_copy(tmp_path: Path) -> None:
+    root, _a, b = _neighbours(tmp_path)
+    wt = tmp_path / "ext" / "w"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: /x\x00y\n")
+    assert sd._no_copy(str(b), str(wt), str(b), str(root))
+    bare = tmp_path / "ext" / "x.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    (bare / "objects" / "info" / "alternates").write_text("/x\x00y\n")
+    assert sd._no_copy(str(b), str(bare), str(b), str(root))
+
+
+def test_mirror_borrowing_an_outside_cache_still_vouches(tmp_path: Path) -> None:
+    """Over-keep check: ``--reference`` / ``--shared`` caches outside every root are real copies."""
+    root, a, _b = _neighbours(tmp_path)
+    cache = tmp_path / "cache" / "x.git"
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "parent.git"), str(cache))
+    ref = tmp_path / "srv" / "ref.git"
+    git(tmp_path, "clone", "-q", "--bare", "--reference", str(cache), str(cache), str(ref))
+    shared = tmp_path / "srv" / "shared.git"
+    git(tmp_path, "clone", "-q", "--bare", "--shared", str(cache), str(shared))
+    for mirror in (ref, shared):
+        assert (mirror / "objects" / "info" / "alternates").exists()
+        assert not sd._no_copy(str(a), str(mirror), str(a), str(root)), mirror
+    _work(a)
+    git(a, "remote", "add", "x", str(ref))
+    git(a, "push", "-q", "x", "work")
+    r = _sweep(root)
+    assert not a.exists(), r

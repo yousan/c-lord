@@ -341,8 +341,12 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
         `.git` がファイル（`gitdir: …`）ならその先の git ディレクトリと、そこの `commondir` が指す本体の git ディレクトリを、
         さらにそれらが `objects/info/alternates` でオブジェクトを借りていればその借り先（連なっていれば順にたどる）を見て、
         どれか1つでもワークスペースの中・置き場の下・別の c-lord の置き場やワークスペース（上の #1289 の判定）なら証にしない。
-        `.git` や `commondir`・`alternates` が読めないときも証にしない。置き場の外のリポジトリ（`~/src/project` など）の linked
-        worktree・置き場の外の普通のミラーは今までどおり証になる。
+        git がそのパスで開きうる場所はすべて見る（b7720f4 のレビュー）: git と同じく `<パス>/.git`・`<パス>`・`<パス>.git/.git`・
+        `<パス>.git` を試し（最初の1つだけでなく在るものすべて）、URL が `gitdir:` のファイルそのもの（`<worktree>/.git`）でも
+        たどる。`.git`・`objects`・`refs` がシンボリックリンクなら実体の場所で判定する。
+        `.git` や `commondir`・`alternates` が読めないとき、`"` で囲んだ alternates の行、NUL を含む中身も、確かめられないので証にしない。
+        置き場の外のリポジトリ（`~/src/project` など）の linked worktree・置き場の外の普通のミラー・置き場の外のキャッシュを
+        `--reference` / `--shared` で借りたミラーは今までどおり証になる。
       - remote の URL は **git が実際に使う形で**判定する（f870f5b のレビュー）。`url.<隣>.insteadOf=wsb:x` で `wsb:x` を隣の
         ワークスペースに書き換えていれば（見た目はネットワークの URL）、`git remote get-url --all` と `--push --all` で書き換えた後の
         URL を見る（`insteadOf` / `pushInsteadOf` の設定があるときだけ、remote 1つにつき2回。無ければ git の呼び出しは増えない —

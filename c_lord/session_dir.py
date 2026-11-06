@@ -1233,39 +1233,60 @@ def _read_small(path: Path) -> str | None:
         return None
 
 
+#: The suffixes git tries, in order, for a local remote path (``enter_repo``).
+_REPO_SUFFIXES = ("/.git", "", ".git/.git", ".git")
+
+
 def _object_homes(local: str) -> list[str] | None:
-    """The other places that hold the objects and refs of the repo at *local* (#1297).
+    """The real places that hold the objects and refs of the repo at *local* (#1297).
 
     A linked worktree's ``.git`` is a file (``gitdir: <repo>/.git/worktrees/<n>``)
-    whose ``commondir`` names the repo's real git dir; a repo may borrow objects
+    whose ``commondir`` names the repo's real git dir; a ``.git``, ``objects`` or
+    ``refs`` dir may be a symlink into another repo; a repo may borrow objects
     through ``objects/info/alternates``. Those directories are deleted with the
-    repo they belong to, wherever the worktree itself sits. Returns the resolved
-    git dir, common dir and alternate object dirs (chained ones too) — empty for
-    a plain repo or mirror. ``None`` when a file that would say cannot be read.
+    repo they belong to, wherever *local* itself sits. Every path git may open
+    for *local* is followed (the ``enter_repo`` suffixes ``/.git``, none,
+    ``.git/.git``, ``.git`` — all that exist, not only the first) and every git
+    dir, common dir, ``objects`` / ``refs`` dir and alternate object dir is
+    returned resolved. ``None`` when a file that would say cannot be read or
+    parsed (quoted alternates, a NUL byte): the caller keeps.
     """
-    here = Path(local)
-    kind = _kind(here / ".git")
-    if kind is None:
+    try:
+        return _object_homes_unchecked(local)
+    except (OSError, ValueError):
         return None
-    git_dir = here
-    if kind == "dir":
-        git_dir = here / ".git"
-    elif kind == "file":
-        text = _read_small(here / ".git")
-        if text is None:
+
+
+def _object_homes_unchecked(local: str) -> list[str] | None:
+    git_dirs: list[Path] = []
+    for suffix in _REPO_SUFFIXES:
+        cand = Path(local + suffix)
+        kind = _kind(cand)
+        if kind is None:
             return None
-        line = text.strip()
-        if line.startswith("gitdir:"):
-            git_dir = Path(os.path.realpath(here / line[len("gitdir:") :].strip()))
-    homes: list[str] = []
-    dirs = [git_dir]
-    common = _read_small(git_dir / "commondir")
-    if common is None:
-        return None
-    if common.strip():
-        dirs.append(Path(os.path.realpath(git_dir / common.strip())))
-    homes += [str(d) for d in dirs if str(d) != local]
-    objects = [d / "objects" for d in dirs]
+        if kind == "dir":
+            git_dirs.append(Path(os.path.realpath(cand)))
+        elif kind == "file":
+            text = _read_small(cand)
+            if text is None or "\0" in text:
+                return None
+            line = text.strip()
+            if line.startswith("gitdir:"):
+                target = cand.parent / line[len("gitdir:") :].strip()
+                git_dirs.append(Path(os.path.realpath(target)))
+    dirs: list[Path] = []
+    for git_dir in git_dirs:
+        dirs.append(git_dir)
+        common = _read_small(git_dir / "commondir")
+        if common is None or "\0" in common:
+            return None
+        if common.strip():
+            dirs.append(Path(os.path.realpath(git_dir / common.strip())))
+    homes = [str(d) for d in dirs]
+    objects: list[Path] = []
+    for d in dirs:
+        homes.append(os.path.realpath(d / "refs"))
+        objects.append(Path(os.path.realpath(d / "objects")))
     seen: set[str] = set()
     while objects:
         obj = objects.pop()
@@ -1274,17 +1295,18 @@ def _object_homes(local: str) -> list[str] | None:
         if len(seen) >= 32:
             return None  # a chain that long is not something to reason about: keep
         seen.add(str(obj))
+        homes.append(str(obj))
         text = _read_small(obj / "info" / "alternates")
-        if text is None:
+        if text is None or "\0" in text:
             return None
         for raw in text.splitlines():
             entry = raw.strip()
             if not entry or entry.startswith("#"):
                 continue
-            alt = Path(os.path.realpath(obj / entry))
-            homes.append(str(alt))
-            objects.append(alt)
-    return homes
+            if entry.startswith('"'):
+                return None  # C-quoted: git unquotes it; rather than re-implement, keep
+            objects.append(Path(os.path.realpath(obj / entry)))
+    return [h for h in dict.fromkeys(homes) if h != local]
 
 
 def mark_sessions_root(root: str | os.PathLike[str] | None) -> None:
