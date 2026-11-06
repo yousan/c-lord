@@ -1206,11 +1206,85 @@ def _no_copy(cwd: str, url: str, ws_root: str, sessions_root: str | None) -> boo
     local = _local_remote_path(cwd, url)
     if local is None:
         return False
-    if sessions_root is None or _inside(local, ws_root) or _inside(local, sessions_root):
+    if sessions_root is None:
         return True
-    # #1289: another instance's root (prod + staging on one host) is outside ours
-    # but just as deletable — also once that workspace is gone and only its root is left.
-    return _in_clord_workspace(local)
+    # #1297: a linked worktree (or a repo borrowing objects) outside every root keeps
+    # its objects and refs in another repo's git dir — judge where they live, too.
+    homes = _object_homes(local)
+    if homes is None:
+        return True  # could not tell where its objects live: keep
+    for path in (local, *homes):
+        if _inside(path, ws_root) or _inside(path, sessions_root):
+            return True
+        # #1289: another instance's root (prod + staging on one host) is outside ours
+        # but just as deletable — also once that workspace is gone and only its root is left.
+        if _in_clord_workspace(path):
+            return True
+    return False
+
+
+def _read_small(path: Path) -> str | None:
+    """*path*'s text; ``""`` when it does not exist; ``None`` when it cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, NotADirectoryError):
+        return ""
+    except (OSError, ValueError):
+        return None
+
+
+def _object_homes(local: str) -> list[str] | None:
+    """The other places that hold the objects and refs of the repo at *local* (#1297).
+
+    A linked worktree's ``.git`` is a file (``gitdir: <repo>/.git/worktrees/<n>``)
+    whose ``commondir`` names the repo's real git dir; a repo may borrow objects
+    through ``objects/info/alternates``. Those directories are deleted with the
+    repo they belong to, wherever the worktree itself sits. Returns the resolved
+    git dir, common dir and alternate object dirs (chained ones too) — empty for
+    a plain repo or mirror. ``None`` when a file that would say cannot be read.
+    """
+    here = Path(local)
+    kind = _kind(here / ".git")
+    if kind is None:
+        return None
+    git_dir = here
+    if kind == "dir":
+        git_dir = here / ".git"
+    elif kind == "file":
+        text = _read_small(here / ".git")
+        if text is None:
+            return None
+        line = text.strip()
+        if line.startswith("gitdir:"):
+            git_dir = Path(os.path.realpath(here / line[len("gitdir:") :].strip()))
+    homes: list[str] = []
+    dirs = [git_dir]
+    common = _read_small(git_dir / "commondir")
+    if common is None:
+        return None
+    if common.strip():
+        dirs.append(Path(os.path.realpath(git_dir / common.strip())))
+    homes += [str(d) for d in dirs if str(d) != local]
+    objects = [d / "objects" for d in dirs]
+    seen: set[str] = set()
+    while objects:
+        obj = objects.pop()
+        if str(obj) in seen:
+            continue
+        if len(seen) >= 32:
+            return None  # a chain that long is not something to reason about: keep
+        seen.add(str(obj))
+        text = _read_small(obj / "info" / "alternates")
+        if text is None:
+            return None
+        for raw in text.splitlines():
+            entry = raw.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            alt = Path(os.path.realpath(obj / entry))
+            homes.append(str(alt))
+            objects.append(alt)
+    return homes
 
 
 def mark_sessions_root(root: str | os.PathLike[str] | None) -> None:
