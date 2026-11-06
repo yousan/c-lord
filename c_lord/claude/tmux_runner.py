@@ -970,13 +970,16 @@ def _permission_dialog_open(pane: str) -> bool:
     plan menu whose question happens to read the same is a menu: #358's.
     """
     lines = pane.splitlines()
-    # A real dialog replaces the input box (every ``i1247_*`` capture). A box on
-    # screen means the phrase is prose — Claude's answer above it, or a stopped
-    # request Claude Code put back into it (#879), which may well quote "Do you
-    # want to proceed?".
-    if _input_box_rows(lines):
+    row = _dialog_question_row(lines)
+    if row is None:
         return False
-    if _dialog_question_row(lines) is None:
+    # A real dialog replaces the input box (every ``i1247_*`` capture), so a live
+    # box at or below the "question" means the phrase is prose — Claude's answer
+    # above the box, or a stopped request Claude Code put back into it (#879),
+    # which may well quote "Do you want to proceed?". A framed box ABOVE the
+    # dialog is not live: it is a captured idle pane in Claude's earlier output.
+    box = _input_box_rows(lines)
+    if box and max(box) >= row:
         return False
     return not _pane_shows_menu(pane)
 
@@ -991,15 +994,26 @@ def _pane_shows_menu(pane: str) -> bool:
 # 2.1.318: 0.3 s and 0.6 s apart open it, 0.8 s and more do not. One Esc closes it.
 _REWIND_TITLE_RE = re.compile(r"^\s*Rewind\s*$")
 _REWIND_FOOTER_RE = re.compile(r"^\s*Enter to continue\b.*\bto cancel\b")
+# Rows only the Rewind screen draws: its subtitle, and its last restore point.
+_REWIND_ROW_RE = re.compile(
+    r"^\s*(?:Restore the code and/or conversation\b|(?:❯\s*)?\(current\)\s*$)"
+)
+# Rows above the footer searched for those: many restore points push the title up.
+_REWIND_SCAN_ROWS = 200
 
 
 def _rewind_open(pane: str) -> bool:
-    """True when the Rewind screen has the keyboard (#1247)."""
-    rows = [line for line in pane.splitlines() if line.strip()][-20:]
+    """True when the Rewind screen has the keyboard (#1247).
+
+    Its footer ("Enter to continue · Esc to cancel") is the last row, and the
+    title, the subtitle or the "(current)" restore point is on screen — any one,
+    since a long list of restore points or a short pane can clip the others.
+    """
+    rows = [line for line in pane.splitlines() if line.strip()][-_REWIND_SCAN_ROWS:]
     return (
         bool(rows)
         and bool(_REWIND_FOOTER_RE.match(rows[-1]))
-        and any(_REWIND_TITLE_RE.match(row) for row in rows)
+        and any(_REWIND_TITLE_RE.match(row) or _REWIND_ROW_RE.match(row) for row in rows)
     )
 
 
@@ -2095,6 +2109,7 @@ class TmuxClaudeRunner:
                 async for event in events:
                     yield event
         finally:
+            self._held_for_permission = False  # #1247: the turn is over
             if (token := self._turn_token) is not None:
                 self._turn_token = None
                 turn_end_bus.note_turn_ended(self._thread_id, token)
@@ -2230,6 +2245,8 @@ class TmuxClaudeRunner:
                 await self.cancel_menu()
                 last_esc = loop.time()
                 await asyncio.sleep(_MENU_NAV_DELAY)
+            if not self._stopped:
+                self._held_for_permission = False  # #1247: the request goes out now
             if (stopped := self._stopped_before_delivery()) is not None:
                 yield stopped
                 return
@@ -3350,56 +3367,55 @@ class TmuxClaudeRunner:
         loop = asyncio.get_running_loop()
         if self._hold_deadline is None:
             self._hold_deadline = loop.time() + _PERMISSION_HOLD_TIMEOUT
+        # Stays True until the prompt is sent or the turn ends, so a /compact in
+        # the gap between two dialogs still sees the hold (``_run_turn`` / ``run``).
         self._held_for_permission = True
-        try:
-            while not self._stopped:
-                if _permission_dialog_open(pane):
-                    summary = _permission_dialog_summary(pane) or "(内容を読めませんでした)"
-                    if summary not in self._hold_notified:
-                        self._hold_notified.add(summary)
-                        logger.warning(
-                            "%s permission dialog open in the pane; holding the request "
-                            "until a human answers it (#1247)",
-                            log_ctx(thread_id=self._thread_id),
-                        )
-                        yield StreamEvent(
-                            raw={},
-                            message_type=MessageType.SYSTEM,
-                            permission_dialog_hold=summary,
-                        )
-                elif _pane_shows_menu(pane):
-                    # An AskUserQuestion / plan menu opened instead: the caller's
-                    # re-peek sends it the #358 way (Esc, then the request).
-                    return
-                elif _permission_dialog_closed(pane):
-                    logger.info(
-                        "%s permission dialog answered; checking the pane again before "
-                        "sending the held request (#1247)",
+        while not self._stopped:
+            if _permission_dialog_open(pane):
+                summary = _permission_dialog_summary(pane) or "(内容を読めませんでした)"
+                if summary not in self._hold_notified:
+                    self._hold_notified.add(summary)
+                    logger.warning(
+                        "%s permission dialog open in the pane; holding the request "
+                        "until a human answers it (#1247)",
                         log_ctx(thread_id=self._thread_id),
-                    )
-                    return
-                if loop.time() >= self._hold_deadline:
-                    logger.error(
-                        "%s permission dialog still open after %.0fs; ending the turn "
-                        "without sending the request (#1247)",
-                        log_ctx(thread_id=self._thread_id),
-                        _PERMISSION_HOLD_TIMEOUT,
                     )
                     yield StreamEvent(
                         raw={},
-                        message_type=MessageType.RESULT,
-                        is_complete=True,
-                        error=_permission_hold_timed_out(dialog_open=_permission_dialog_open(pane)),
+                        message_type=MessageType.SYSTEM,
+                        permission_dialog_hold=summary,
                     )
-                    return
-                await asyncio.sleep(_PERMISSION_HOLD_POLL)
-                if self._stopped:
-                    return
-                raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
-                if raw.strip():  # an empty capture is not evidence of anything (#485)
-                    pane = _normalize_capture(raw)
-        finally:
-            self._held_for_permission = False
+            elif _pane_shows_menu(pane):
+                # An AskUserQuestion / plan menu opened instead: the caller's
+                # re-peek sends it the #358 way (Esc, then the request).
+                return
+            elif _permission_dialog_closed(pane):
+                logger.info(
+                    "%s permission dialog answered; checking the pane again before "
+                    "sending the held request (#1247)",
+                    log_ctx(thread_id=self._thread_id),
+                )
+                return
+            if loop.time() >= self._hold_deadline:
+                logger.error(
+                    "%s permission dialog still open after %.0fs; ending the turn "
+                    "without sending the request (#1247)",
+                    log_ctx(thread_id=self._thread_id),
+                    _PERMISSION_HOLD_TIMEOUT,
+                )
+                yield StreamEvent(
+                    raw={},
+                    message_type=MessageType.RESULT,
+                    is_complete=True,
+                    error=_permission_hold_timed_out(dialog_open=_permission_dialog_open(pane)),
+                )
+                return
+            await asyncio.sleep(_PERMISSION_HOLD_POLL)
+            if self._stopped:
+                return
+            raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            if raw.strip():  # an empty capture is not evidence of anything (#485)
+                pane = _normalize_capture(raw)
 
     @property
     def held_for_permission(self) -> bool:

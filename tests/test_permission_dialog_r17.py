@@ -335,3 +335,76 @@ def test_a_remapped_cancel_key_still_reads_as_the_footer() -> None:
 def test_real_mcp_tool_dialogs_hold(name: str) -> None:
     """(b) An MCP tool's dialog keeps its "Esc to cancel" footer even at 25 columns."""
     assert pane_shows_permission_dialog((PANES / name).read_text(encoding="utf-8")) is True
+
+
+# --- Review of 38ea0c9 --------------------------------------------------------
+
+IDLE_PANE_TEXT = _normalize_capture(
+    (PANES / "i742_idle_after_turn_v2_1_271.txt").read_text(encoding="utf-8")
+)
+
+
+def test_an_idle_pane_quoted_above_a_real_dialog_does_not_turn_the_hold_off() -> None:
+    """MEDIUM: Claude's earlier output shows a captured idle pane (rule / ❯ / rule);
+    the real dialog below it still has the keyboard."""
+    from c_lord.claude.tmux_runner import _input_box_rows
+
+    pane = IDLE_PANE_TEXT.rstrip() + "\n\n" + _normalize_capture(PERMISSION_PANE)
+    assert _input_box_rows(pane.splitlines()), "the quoted pane must contain a framed box"
+    assert pane_shows_permission_dialog(pane) is True
+
+
+@pytest.mark.asyncio
+async def test_request_is_held_behind_a_dialog_under_a_quoted_idle_pane(tmux_manager) -> None:
+    pane = IDLE_PANE_TEXT.rstrip() + "\n\n" + _normalize_capture(PERMISSION_PANE)
+    events, typed_into = await _scripted_run(tmux_manager, [pane] * 3 + [IDLE_PANE_TEXT])
+    assert [e for e in events if getattr(e, "permission_dialog_hold", None)]
+    assert typed_into == [IDLE_PANE_TEXT]
+
+
+def _rewind_rows() -> list[str]:
+    return _normalize_capture(REWIND_PANE).rstrip().splitlines()
+
+
+def test_rewind_with_its_title_scrolled_off_is_still_rewind() -> None:
+    """LOW 1: many rewind points push the title out of a short window, or it is clipped."""
+    from c_lord.claude.tmux_runner import _rewind_open
+
+    rows = _rewind_rows()
+    title = next(i for i, r in enumerate(rows) if r.strip() == "Rewind")
+    points = [f"     Point {n}: an earlier request" for n in range(30)]
+    clipped = rows[:title] + rows[title + 2 : -2] + points + rows[-2:]  # title + subtitle gone
+    assert not any(r.strip() == "Rewind" for r in clipped)
+    assert _rewind_open("\n".join(clipped)) is True
+
+
+@pytest.mark.asyncio
+async def test_held_for_permission_stays_true_between_two_holds(tmux_manager) -> None:
+    """LOW 4: a /compact in the gap between two dialogs must still see the hold."""
+    from tests.test_permission_dialog_hold import ANSWERED_PANE, SECOND_DIALOG_PANE
+
+    runner = _runner(tmux_manager)
+    script = [PERMISSION_PANE] * 3 + [ANSWERED_PANE, SECOND_DIALOG_PANE, SECOND_DIALOG_PANE]
+    script += [SECOND_DIALOG_PANE] * 2 + [ANSWERED_PANE]
+    state = {"n": 0, "noticed": False}
+    seen: list[bool] = []
+
+    def capture(*_a: object, **_k: object) -> str:
+        if tmux_manager.send_input.called:
+            return DONE_PANE
+        if state["noticed"]:
+            seen.append(runner.held_for_permission)
+        pane = script[min(state["n"], len(script) - 1)]
+        state["n"] += 1
+        return pane
+
+    tmux_manager.capture_pane.side_effect = capture
+    from tests.test_permission_dialog_hold import _fast
+
+    with _fast(), patch("c_lord.tmux._run"):
+        async for event in runner.run("<text>"):
+            if getattr(event, "permission_dialog_hold", None):
+                state["noticed"] = True
+    assert tmux_manager.send_input.called
+    assert seen and all(seen), f"held_for_permission dropped between holds: {seen}"
+    assert runner.held_for_permission is False  # sent: nothing is held any more
