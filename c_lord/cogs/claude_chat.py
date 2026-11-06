@@ -32,7 +32,11 @@ from .. import turn_events
 from ..api_error import advice
 from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
-from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
+from ..claude.tmux_runner import (
+    TmuxClaudeRunner,
+    pane_shows_permission_dialog,
+    wait_for_idle_prompt,
+)
 from ..command_gate import is_message_authorized, owns
 from ..concurrency import SessionRegistry
 from ..coordination.service import CoordinationService
@@ -2284,6 +2288,21 @@ class ClaudeChatCog(commands.Cog):
         """
         thread_id = thread.id
         runner = self._active_runners.get(thread_id)
+        if runner is not None and getattr(runner, "held_for_permission", False) is True:
+            # #1247: the running turn is a request held behind a permission
+            # dialog. Interrupting it would drop that request without a word,
+            # and the dialog would still take the command's Enter. Leave both.
+            logger.info(
+                "%s %s: a request is held behind a permission dialog; not sending (#1247)",
+                log_ctx(thread_id=thread_id),
+                command,
+            )
+            return (
+                f"⏸️ `{command}` は送っていません — 依頼が 1 件、Claude のペインで開いている"
+                "許可ダイアログへの答えを待っています（保留中）。"
+                "ペインでダイアログに答えると、その依頼がそのまま送られます。"
+                f"`{command}` はそのあとでもう一度実行してください。"
+            )
         if runner is not None:
             if ack is not None:
                 await ack()
@@ -2336,6 +2355,23 @@ class ClaudeChatCog(commands.Cog):
                     "**このスレッドにメッセージを送れば、通常の経路で復元を試みます。**"
                 )
 
+        # #1247: a permission dialog left open between turns (a background
+        # sub-agent's Bash call) has the keyboard — the Enter below would approve
+        # it and the command would be lost. Refuse; the human answers it first.
+        if pane_shows_permission_dialog(
+            await asyncio.to_thread(tmux_manager.capture_pane, thread_id)
+        ):
+            logger.warning(
+                "%s %s: a permission dialog is open in the pane; not typing (#1247)",
+                log_ctx(thread_id=thread_id),
+                command,
+            )
+            return (
+                f"⏸️ `{command}` は送っていません — Claude のペインで許可ダイアログが開いています"
+                "（バックグラウンドのサブエージェントのコマンド確認など）。"
+                "打ち込むとその Enter がダイアログを承認してしまうためです。"
+                "先にペインでダイアログに答えてから、もう一度実行してください。"
+            )
         if before_send is not None:
             await before_send()
         # send_literal (not send_input): no ZWSP prefix, so the leading "/" is

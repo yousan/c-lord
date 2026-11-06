@@ -1,0 +1,10 @@
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes
+[39m [38;5;246m↓[39m [38;5;246m2. [39mYes, and switch to
+      [1maccept edits 
+[0m      [1m(auto-approve file 
+[0m      [1medits and common 
+[0m      [1mfile commands)[0m for
+      this session
+      [1m(shift+tab)
+
+[0m [38;5;246mEsc to cancel · Tab to…

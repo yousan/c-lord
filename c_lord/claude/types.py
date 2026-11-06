@@ -269,6 +269,9 @@ class StreamEvent:
     permission_request: PermissionRequest | None = None
     elicitation: ElicitationRequest | None = None
     unknown_tui_prompt: str | None = None
+    # #1247: the request is on hold behind an open permission dialog; the
+    # dialog's own rows (tool, requester, command), trimmed for Discord.
+    permission_dialog_hold: str | None = None
     is_compact: bool = False
     compact_trigger: str | None = None
     compact_pre_tokens: int | None = None

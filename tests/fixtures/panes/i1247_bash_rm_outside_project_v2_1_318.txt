@@ -1,0 +1,40 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.318
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · Claude Ultra
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/…/ba14e307-7d60-4da6-9688-0614dd64e99d/scratchpad/fixture1247/ws · [38;5;114m]8;id=iz7i3n;https://claude.ai/code/session_REDACTED?from=cli\/rc[39m]8;;\            
+
+[38;5;220m⚠[39m [38;5;220mYour login expires in 3 days[38;5;246m · run /login to renew
+
+[48;5;237m❯ [38;5;231mSpawn one background agent (Agent tool, run_in_background true) whose only job is to run exactly this Bash command: [39m  
+  [38;5;231mrm -rf /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1566967064349114438/ba14e307-7d60-4da6-9688-[39m 
+  [38;5;231m0614dd64e99d/scratchpad/fixture1247/outside/junk2 . Do not run it yourself. End your turn right after launching it; [39m  
+  [38;5;231mdo not wait.[39m                                                                                                          
+
+[38;5;114m[49m●[39m [1mAgent[0m(Run rm -rf on junk2)
+[38;5;246m  ⎿  [39mBackgrounded agent[38;5;246m (↓ to manage · ctrl+o to expand)
+
+[38;5;231m●[39m I started a background agent to run that one [38;5;153mrm -rf[39m on [38;5;153moutside/junk2[39m. I didn't run it myself, and I don't know the
+  result yet.
+
+[38;5;246m✻[39m [38;5;246mWaiting for [1m1[0m[38;5;246m background agent to finish
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mBash command[0m [38;5;246m· [39mfrom the general-purpose agent
+ [1mTip: auto mode handles these prompts for you — choose "switch to auto mode" below
+[0m [38;5;246mDelete the junk2 directory in the fixture's outside folder
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m [2m│[0m rm -rf /tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1566967064349114438/ba14e307-7d60-4da6-9688
+ [2m│[0m -0614dd64e99d/scratchpad/fixture1247/outside/junk2
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Do you want to proceed?                                                                                              
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m                                                                                                               
+   [38;5;246m2. [39mYes, and always allow access to [1m/tmp/claude-1000/-home-yousan-c-lord-sessions-1505747831447883806-1566967064349114
+[0m      [1m438/ba14e307-7d60-4da6-9688-0614dd64e99d/scratchpad/fixture1247/outside/junk2[0m from this project                   
+   [38;5;246m3. [39mYes, and switch to auto mode[38;5;246m · auto mode handles these prompts for you[39m                                            
+   [38;5;246m4. [39mNo                                                                                                              
+                                                                                                                        
+ [38;5;246mEsc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents[39m                                         
+                                                                                                                        
+                                                                                                                      
+
+

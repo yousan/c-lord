@@ -27,6 +27,7 @@ from ..transcript.resolver import derive_project_dir
 from ..turn_end_bus import turn_end_bus
 from ..usage_limit import count_usage_limit, extract_usage_limit
 from ..utils.logger import log_ctx
+from ..workspace_failure import redact_credentials
 from .context_usage import parse_context_total, parse_cost_from_pane
 from .types import (
     FREE_TEXT_NONE,
@@ -215,6 +216,25 @@ _MENU_NAV_DELAY = 0.25
 # Delay after startup before polling begins (seconds).
 _POST_STARTUP_DELAY = 1.0
 
+# #1247: a permission dialog left open between turns (typically a background
+# sub-agent's Bash call) holds the next request instead of receiving it — the
+# request's Enter would answer the dialog "Yes" and the text would be lost.
+# c-lord never answers that dialog; it re-reads the pane every
+# ``_PERMISSION_HOLD_POLL`` seconds and sends the request once a human has
+# answered, or ends the turn unsent after ``_PERMISSION_HOLD_TIMEOUT``.
+_PERMISSION_HOLD_POLL = 2.0
+# How many open menus (#358) the pre-send check dismisses with Esc before it
+# sends anyway — each Esc is followed by a fresh look at the pane, because a
+# permission dialog can be queued behind the menu it closed.
+_PRE_SEND_MENU_DISMISSALS = 3
+# The least time between two of those Esc presses. Two Esc presses on an idle
+# prompt open Rewind (0.6 s apart did, 0.8 s did not, on 2.1.318), and a menu
+# can close between the capture and the key — so never two inside the window.
+_PRE_SEND_ESC_GAP = 1.5
+_PERMISSION_HOLD_TIMEOUT = 30 * 60.0
+# How much of the dialog (its command / summary rows) the thread is shown.
+_PERMISSION_SUMMARY_MAX = 300
+
 # Startup grace after sending ``claude --continue`` before its outcome is
 # judged at all (issue #123 Part 2).  The pane still runs zsh for a moment
 # while claude execs, so a liveness probe taken any earlier reads every start
@@ -289,6 +309,32 @@ def _missing_window(action: str, thread_id: int) -> str:
         "ウィンドウがそもそも存在しない状態です。"
         "チャンネルが `/clord-init` で repo に紐づいているか、"
         "ホストで tmux が使えるかを確認してください。"
+    )
+
+
+def permission_hold_minutes() -> int:
+    """How long a request waits behind an open permission dialog, in minutes (#1247)."""
+    return max(1, round(_PERMISSION_HOLD_TIMEOUT / 60))
+
+
+def _permission_hold_timed_out(*, dialog_open: bool = True) -> str:
+    """User-facing text for a request that a permission dialog kept from Claude (#1247).
+
+    *dialog_open* False: the dialog was answered but Claude's input box never
+    came back — saying "the dialog stayed open" then would send the reader to
+    a pane with no dialog in it.
+    """
+    minutes = permission_hold_minutes()
+    if not dialog_open:
+        return (
+            f"依頼は Claude に送られていません — 許可ダイアログは閉じましたが、{minutes} 分たっても"
+            "Claude の入力欄に戻りませんでした。ペインの様子を確かめてから、"
+            "依頼をもう一度送ってください。"
+        )
+    return (
+        f"依頼は Claude に送られていません — Claude のペインで許可ダイアログが {minutes} 分以上"
+        "開いたままでした。c-lord はこのダイアログに答えません（依頼を打ち込むと、その Enter が"
+        "ダイアログを承認してしまうため）。ペインでダイアログに答えてから、依頼をもう一度送ってください。"
     )
 
 
@@ -784,6 +830,257 @@ def _permission_zone(text: str) -> str:
     while lines and not lines[-1].strip():
         lines.pop()
     return "\n".join(lines[-_PERMISSION_SCAN_LINES:])
+
+
+# A full-width rule (``────``) above a dialog, or the dashed rules (``╌╌╌``)
+# that frame its command.
+_DIALOG_RULE_RE = re.compile(r"^[─━═╌┄┈\-\s]+$")
+
+
+# #1247: the questions the Edit / Write dialogs ask, from real captures
+# (``i1247_edit_dialog_…`` / ``i1247_create_dialog_…``, Claude Code 2.1.318).
+# Only the pre-send hold reads them. They are deliberately NOT in
+# ``_PERMISSION_PROMPT_MARKERS``: that tuple drives decision 4's in-turn
+# auto-accept, where these dialogs are reported as an unknown prompt instead.
+_EDIT_PERMISSION_MARKERS = ("Do you want to make this edit to ", "Do you want to create ")
+_HOLD_MARKERS = _PERMISSION_PROMPT_MARKERS + _EDIT_PERMISSION_MARKERS
+
+
+# #1247 (review 16): the shape every tool-permission dialog shares, whatever its
+# verb and however narrow the pane — a "Do you want to …?" question, possibly
+# wrapped over several rows, then the options starting at "1. Yes", then a
+# footer starting "Esc to cancel" as the last row. Markers alone missed real
+# dialogs: "Do you want to overwrite notes.txt?" (no marker), an Edit question
+# wrapped before the file name (the marker's trailing space is lost in the
+# capture), and a Bash dialog at 30 columns whose wrapped options pushed the
+# question above the 15-row zone. AskUserQuestion's footer starts "Enter to
+# select", the trust / bypass dialogs' "Enter to confirm", so neither matches.
+# "Esc" is the default key; the footer's key names come from the keybinding-aware
+# hint component, so a remapped cancel key reads e.g. "Ctrl+Q to cancel" (never
+# "Enter …": AskUserQuestion / Rewind / trust footers start with Enter).
+_DIALOG_FOOTER_RE = re.compile(r"^\s*(?!Enter\b)[\w+\-]{1,20} to cancel\b")
+# The same footer with "Esc to cancel" after a separator ("Tab to amend · Esc to
+# cancel"); never AskUserQuestion's "Enter to select · … · Esc to cancel".
+_DIALOG_FOOTER_TAIL_RE = re.compile(r"·\s*(?!Enter\b)[\w+\-]{1,20} to cancel\b")
+# Non-blank rows from the bottom the footer may start in: its own wrapped rows
+# below ~26 columns, plus status rows a statusline draws under the dialog.
+_DIALOG_FOOTER_SCAN_ROWS = 8
+_DIALOG_YES_RE = re.compile(r"^\s*(?:❯\s*)?1\.\s+Yes\b")
+_DIALOG_QUESTION_RE = re.compile(r"^Do you want to\b.*\?$")
+# Rows from the footer up to "1. Yes": a 30-column Bash dialog's options take ~15.
+_DIALOG_OPTIONS_MAX_ROWS = 60
+# Rows a wrapped question may take: a ~150-character absolute path at ~26 columns.
+_DIALOG_QUESTION_MAX_ROWS = 12
+
+
+# An option row ("❯ 1. Yes", "  2. No …", "↓ 2. Yes, and …" — the arrow marks a
+# list scrolled in a short pane) and its wrapped continuation, which Claude Code
+# indents under the label.
+_OPTION_ROW_RE = re.compile(r"^\s*(?:[❯↓↑]\s*)?\d+\.")
+_OPTION_CONTINUATION_RE = re.compile(r"^\s{4,}\S")
+
+
+def _dialog_footer_row(lines: list[str]) -> int | None:
+    """Row where a permission dialog's footer starts, near the bottom (#1247).
+
+    The bottom-most row that starts "Esc to cancel", or that carries
+    "· Esc to cancel" (joined with the next row, in case that tail wrapped) and
+    is neither an option row nor a "Enter to …" footer (AskUserQuestion's
+    "Enter to select", Rewind's "Enter to continue", trust's "Enter to confirm").
+    """
+    rows = [i for i, line in enumerate(lines) if line.strip()][-_DIALOG_FOOTER_SCAN_ROWS:]
+    for idx in range(len(rows) - 1, -1, -1):
+        row = lines[rows[idx]].strip()
+        if _DIALOG_FOOTER_RE.match(row):
+            return rows[idx]
+        if _OPTION_ROW_RE.match(row) or row.startswith("Enter to"):
+            continue
+        head = " ".join(lines[k].strip() for k in rows[idx : idx + 2])
+        if _DIALOG_FOOTER_TAIL_RE.search(head):
+            return rows[idx]
+    return None
+
+
+def _structural_question_row(lines: list[str]) -> int | None:
+    """Where a tool-permission dialog starts, by its shape (#1247); None if none.
+
+    The dialog is the bottom-most block: a "1. Yes" row, then only option rows,
+    their indented continuations and blank rows down to the footer — or down to
+    the bottom, because the WebFetch dialog has no footer (its last option ends
+    "(esc)") and a short pane cuts the list off. Above "1. Yes" sits the
+    question "Do you want to …?" (wrapped rows rejoined); in a pane too short
+    for the whole dialog Claude Code clips it from the top, and then nothing at
+    all is above "1. Yes". Returns the question's first row, or the "1. Yes" row
+    when the question was clipped off.
+    """
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    footer = _dialog_footer_row(lines)
+    limit = footer if footer is not None else end
+    for yes in range(limit - 1, max(-1, limit - 1 - _DIALOG_OPTIONS_MAX_ROWS), -1):
+        if _DIALOG_YES_RE.match(lines[yes]):
+            break
+        row = lines[yes]
+        if row.strip() and not (_OPTION_ROW_RE.match(row) or _OPTION_CONTINUATION_RE.match(row)):
+            return None  # something other than the option list sits under "1. Yes"
+    else:
+        return None
+    parts: list[str] = []
+    for k in range(yes - 1, max(-1, yes - 1 - _DIALOG_QUESTION_MAX_ROWS), -1):
+        row = lines[k].strip()
+        if not row:
+            break
+        parts.insert(0, row)
+        if _DIALOG_QUESTION_RE.match(" ".join(parts)):  # rejoin the wrapped question
+            return k
+    if not any(line.strip() for line in lines[:yes]):
+        return yes  # clipped from the top: the question is off screen
+    return None
+
+
+def _marker_question_row(lines: list[str]) -> int | None:
+    """Last marker row in the bottom zone (the shapes without that footer, e.g. y/N)."""
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    for i in range(end - 1, max(0, end - _PERMISSION_SCAN_LINES) - 1, -1):
+        if any(marker in lines[i] for marker in _HOLD_MARKERS):
+            # A dialog draws no input box under its question; prose does.
+            if TmuxClaudeRunner._has_input_prompt("\n".join(lines[i + 1 :])):
+                return None
+            return i
+    return None
+
+
+def _dialog_question_row(lines: list[str]) -> int | None:
+    """Row where an open permission dialog's question starts, or None (#1247)."""
+    row = _structural_question_row(lines)
+    return row if row is not None else _marker_question_row(lines)
+
+
+def _permission_dialog_open(pane: str) -> bool:
+    """True when a permission dialog — not prose, not a menu — has the keyboard (#1247).
+
+    Never while a live input box is on screen. Judged by the dialog's shape
+    (``_structural_question_row``), else by a marker with no input box *below*
+    it — Claude's own sentence "Do you want to proceed?" sits above the input
+    box (#156), and a bare ``>`` / ``❯`` row in the command above the question
+    is not an input box. An AskUserQuestion /
+    plan menu whose question happens to read the same is a menu: #358's.
+    """
+    lines = pane.splitlines()
+    row = _dialog_question_row(lines)
+    if row is None:
+        return False
+    # A real dialog replaces the input box (every ``i1247_*`` capture), so a live
+    # box at or below the "question" means the phrase is prose — Claude's answer
+    # above the box, or a stopped request Claude Code put back into it (#879),
+    # which may well quote "Do you want to proceed?". A framed box ABOVE the
+    # dialog is not live: it is a captured idle pane in Claude's earlier output.
+    box = _input_box_rows(lines)
+    if box and max(box) >= row:
+        return False
+    return not _pane_shows_menu(pane)
+
+
+def _pane_shows_menu(pane: str) -> bool:
+    """An AskUserQuestion / plan menu — #358's business, not a permission dialog."""
+    return (_parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)) is not None
+
+
+# #1247: Claude Code's Rewind screen ("Restore the code and/or conversation to the
+# point before…"), which two Esc presses on an idle prompt open — measured on
+# 2.1.318: 0.3 s and 0.6 s apart open it, 0.8 s and more do not. One Esc closes it.
+_REWIND_TITLE_RE = re.compile(r"^\s*Rewind\s*$")
+_REWIND_FOOTER_RE = re.compile(r"^\s*Enter to continue\b.*\bto cancel\b")
+# Rows only the Rewind screen draws: its subtitle, and its last restore point.
+_REWIND_ROW_RE = re.compile(
+    r"^\s*(?:Restore the code and/or conversation\b|(?:❯\s*)?\(current\)\s*$)"
+)
+# Rows above the footer searched for those: many restore points push the title up.
+_REWIND_SCAN_ROWS = 200
+
+
+def _rewind_open(pane: str) -> bool:
+    """True when the Rewind screen has the keyboard (#1247).
+
+    Its footer ("Enter to continue · Esc to cancel") is the last row, and the
+    title, the subtitle or the "(current)" restore point is on screen — any one,
+    since a long list of restore points or a short pane can clip the others.
+    """
+    rows = [line for line in pane.splitlines() if line.strip()][-_REWIND_SCAN_ROWS:]
+    return (
+        bool(rows)
+        and bool(_REWIND_FOOTER_RE.match(rows[-1]))
+        and any(_REWIND_TITLE_RE.match(row) or _REWIND_ROW_RE.match(row) for row in rows)
+    )
+
+
+def _rewind_still_open() -> str:
+    """User-facing text for a request kept out of a Rewind screen that stayed open."""
+    return (
+        "依頼は Claude に送られていません — Claude のペインで Rewind（会話の巻き戻し）の画面が"
+        "開いたまま閉じませんでした。打ち込むと巻き戻しの選択になってしまうため送っていません。"
+        "ペインで Esc を押して閉じてから、依頼をもう一度送ってください。"
+    )
+
+
+def _permission_dialog_closed(pane: str) -> bool:
+    """True once the dialog's question is gone AND the input box is back (#1247).
+
+    Both, because a redraw between two states shows neither — that is not an
+    answer, and the next agent's dialog can be one frame away.
+    """
+    return not _permission_dialog_open(pane) and TmuxClaudeRunner._has_input_prompt(pane)
+
+
+def pane_shows_permission_dialog(raw: object) -> bool:
+    """:func:`_permission_dialog_open` on a raw capture; unreadable ⇒ False (#1247)."""
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    return _permission_dialog_open(_normalize_capture(raw))
+
+
+def _permission_dialog_summary(pane: str) -> str:
+    """The dialog's own rows above its question, trimmed for Discord (#1247).
+
+    On the real dialogs that is the tool, the requester ("from the
+    general-purpose agent"), Claude's description and the command or diff.
+    Tips and frame rules are dropped, URL credentials are redacted, and
+    backticks are neutralised so the text cannot close its code block.
+    """
+    lines = pane.splitlines()
+    end = _dialog_question_row(lines)
+    if end is None:
+        return ""
+    # The reason row above the question ("This command requires approval").
+    zone_start = max(0, end - _PERMISSION_SCAN_LINES)
+    while end > zone_start and any(m in lines[end - 1] for m in _HOLD_MARKERS):
+        end -= 1
+    block: list[str] = []
+    for line in reversed(lines[zone_start:end]):
+        stripped = line.strip()
+        if stripped.startswith("─") and _DIALOG_RULE_RE.match(stripped):
+            break  # the rule above the dialog: everything higher is conversation
+        if stripped and not _DIALOG_RULE_RE.match(stripped):
+            block.insert(0, stripped)
+    rows: list[str] = []
+    tip: str | None = None
+    for row in block:
+        # The "Tip: … below" line wraps in a narrow pane; drop all of it.
+        if row.startswith("Tip:"):
+            tip = row
+            continue
+        if tip is not None and not tip.endswith("below") and len(tip) < 200:
+            tip = f"{tip} {row}"
+            continue
+        tip = None
+        rows.append(row)
+    text = redact_credentials("\n".join(rows)).replace("`", "ˋ")
+    if len(text) > _PERMISSION_SUMMARY_MAX:
+        text = text[: _PERMISSION_SUMMARY_MAX - 1] + "…"
+    return text
 
 
 # Matches a numbered menu item line, with or without the leading ❯ cursor:
@@ -1593,6 +1890,16 @@ class TmuxClaudeRunner:
         self._resume_baseline = 0
         self._stopped = False
         self._silent_stop = False
+        # #1247: the prompt is on hold behind an open permission dialog. Until
+        # it is sent, a stop must not press C-c — in the dialog that answers it.
+        self._held_for_permission = False
+        # #1247: the normalised pane the last ``peek_pending_ask`` read (None
+        # when it read nothing — a dead pane, or a peek a test replaced).
+        self._last_peek_pane: str | None = None
+        # #1247: one deadline for every dialog this turn waits behind, and the
+        # dialogs the thread was already told about.
+        self._hold_deadline: float | None = None
+        self._hold_notified: set[str] = set()
         # #1170: the run ended because its pane is a menu waiting for an answer
         # (the #751 backstop), not because the turn finished.
         self.ended_awaiting_answer = False
@@ -1802,6 +2109,7 @@ class TmuxClaudeRunner:
                 async for event in events:
                     yield event
         finally:
+            self._held_for_permission = False  # #1247: the turn is over
             if (token := self._turn_token) is not None:
                 self._turn_token = None
                 turn_end_bus.note_turn_ended(self._thread_id, token)
@@ -1877,14 +2185,68 @@ class TmuxClaudeRunner:
             # instead of clicking a button means "I'm not answering that menu, do
             # this instead", so dismiss the menu (Esc) first and let the TUI
             # settle back to the input prompt before delivering the message.
-            if await self.peek_pending_ask() is not None:
+            # #1247: a permission dialog left open between turns (a background
+            # sub-agent's Bash call) has the keyboard. Typing the request would
+            # answer it "Yes" with the Enter and lose the text, so hold the
+            # request — no text, no key — until a human answers it in the pane.
+            # Judged on the pane each peek just read, and re-read after every
+            # hold AND after every #358 Esc: the next agent's dialog can be
+            # queued behind the one just answered, or behind the menu just
+            # dismissed. A menu (``pending``) is #358's business, whatever its
+            # question says. The hold's one deadline bounds the dialogs; menus
+            # get ``_PRE_SEND_MENU_DISMISSALS`` Esc presses, then the send goes
+            # ahead as it did before #1247.
+            # Every Esc is pressed only on a capture that shows a menu (or the
+            # Rewind screen) taken right before it, and never within
+            # ``_PRE_SEND_ESC_GAP`` of the previous one: two quick Esc presses
+            # on an idle prompt open Rewind.
+            dismissals = 0
+            last_esc: float | None = None
+            loop = asyncio.get_running_loop()
+            while not self._stopped:
+                pending = await self.peek_pending_ask()
+                peeked = self._last_peek_pane
+                if pending is None and peeked is not None and _permission_dialog_open(peeked):
+                    async for held in self._hold_for_permission_dialog(peeked):
+                        yield held
+                        if held.message_type == MessageType.RESULT:
+                            return
+                    continue
+                rewind = pending is None and peeked is not None and _rewind_open(peeked)
+                if not rewind and pending is None:
+                    break
+                if dismissals >= _PRE_SEND_MENU_DISMISSALS:
+                    if rewind:
+                        logger.error(
+                            "%s the Rewind screen stayed open; not sending the request (#1247)",
+                            log_ctx(thread_id=self._thread_id),
+                        )
+                        yield StreamEvent(
+                            raw={},
+                            message_type=MessageType.RESULT,
+                            is_complete=True,
+                            error=_rewind_still_open(),
+                        )
+                        return
+                    break  # a menu that will not close: send, as before #1247
+                if (
+                    last_esc is not None
+                    and (wait := last_esc + _PRE_SEND_ESC_GAP - loop.time()) > 0
+                ):
+                    await asyncio.sleep(wait)
+                    continue  # look again: the menu may have closed meanwhile
+                dismissals += 1
                 logger.info(
-                    "Open menu detected before delivering new input; dismissing it "
-                    "(Esc) so the message is not consumed as a menu selection (thread=%d)",
-                    self._thread_id,
+                    "%s %s before delivering new input; dismissing it (Esc) so the message "
+                    "is not consumed as a selection",
+                    log_ctx(thread_id=self._thread_id),
+                    "Rewind screen open" if rewind else "Open menu detected",
                 )
                 await self.cancel_menu()
+                last_esc = loop.time()
                 await asyncio.sleep(_MENU_NAV_DELAY)
+            if not self._stopped:
+                self._held_for_permission = False  # #1247: the request goes out now
             if (stopped := self._stopped_before_delivery()) is not None:
                 yield stopped
                 return
@@ -2987,6 +3349,79 @@ class TmuxClaudeRunner:
         """
         return self._stopped and self._silent_stop
 
+    async def _hold_for_permission_dialog(self, pane: str) -> AsyncGenerator[StreamEvent, None]:
+        """Keep the prompt out of an open permission dialog (#1247).
+
+        *pane* is the normalised pane that showed the dialog. Posts a SYSTEM
+        notice (``permission_dialog_hold``) once per distinct dialog, then polls
+        until the dialog is answered — its question gone **and** the input box
+        back — and returns; the caller re-peeks and holds again if another
+        dialog is already up. A stop returns too (the caller's
+        ``_stopped_before_delivery`` ends the turn). One deadline,
+        ``_PERMISSION_HOLD_TIMEOUT``, covers every dialog of the turn; past it
+        this yields the turn's error RESULT.
+
+        Never presses a key: this dialog is answered by a human only. The
+        in-turn auto-accept (``_accept_permission_prompt``) is a separate path.
+        """
+        loop = asyncio.get_running_loop()
+        if self._hold_deadline is None:
+            self._hold_deadline = loop.time() + _PERMISSION_HOLD_TIMEOUT
+        # Stays True until the prompt is sent or the turn ends, so a /compact in
+        # the gap between two dialogs still sees the hold (``_run_turn`` / ``run``).
+        self._held_for_permission = True
+        while not self._stopped:
+            if _permission_dialog_open(pane):
+                summary = _permission_dialog_summary(pane) or "(内容を読めませんでした)"
+                if summary not in self._hold_notified:
+                    self._hold_notified.add(summary)
+                    logger.warning(
+                        "%s permission dialog open in the pane; holding the request "
+                        "until a human answers it (#1247)",
+                        log_ctx(thread_id=self._thread_id),
+                    )
+                    yield StreamEvent(
+                        raw={},
+                        message_type=MessageType.SYSTEM,
+                        permission_dialog_hold=summary,
+                    )
+            elif _pane_shows_menu(pane):
+                # An AskUserQuestion / plan menu opened instead: the caller's
+                # re-peek sends it the #358 way (Esc, then the request).
+                return
+            elif _permission_dialog_closed(pane):
+                logger.info(
+                    "%s permission dialog answered; checking the pane again before "
+                    "sending the held request (#1247)",
+                    log_ctx(thread_id=self._thread_id),
+                )
+                return
+            if loop.time() >= self._hold_deadline:
+                logger.error(
+                    "%s permission dialog still open after %.0fs; ending the turn "
+                    "without sending the request (#1247)",
+                    log_ctx(thread_id=self._thread_id),
+                    _PERMISSION_HOLD_TIMEOUT,
+                )
+                yield StreamEvent(
+                    raw={},
+                    message_type=MessageType.RESULT,
+                    is_complete=True,
+                    error=_permission_hold_timed_out(dialog_open=_permission_dialog_open(pane)),
+                )
+                return
+            await asyncio.sleep(_PERMISSION_HOLD_POLL)
+            if self._stopped:
+                return
+            raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
+            if raw.strip():  # an empty capture is not evidence of anything (#485)
+                pane = _normalize_capture(raw)
+
+    @property
+    def held_for_permission(self) -> bool:
+        """This turn's prompt is on hold behind an open permission dialog (#1247)."""
+        return self._held_for_permission
+
     def _stopped_before_delivery(self) -> StreamEvent | None:
         """The turn's RESULT when it was interrupted before its prompt was sent (#800).
 
@@ -3025,6 +3460,10 @@ class TmuxClaudeRunner:
         """
         self._stopped = True
         self._silent_stop = silent
+        if self._held_for_permission:
+            # #1247: nothing was sent, and the pane is a permission dialog —
+            # C-c there would answer it. The hold loop sees the flag and ends.
+            return True
         return bool(await asyncio.to_thread(self._tmux.send_interrupt, self._thread_id))
 
     def withdraw(self, *, silent: bool = False) -> None:
@@ -3866,10 +4305,12 @@ class TmuxClaudeRunner:
         Recovers both AskUserQuestion and plan-approval (#251) menus, which share
         the pane_ask bridge.
         """
+        self._last_peek_pane = None
         if await self._pane_is_dead():
             return None
         raw = await asyncio.to_thread(self._tmux.capture_pane, self._thread_id)
         pane = _normalize_capture(raw)
+        self._last_peek_pane = pane  # #1247: the pre-send permission check reads it too
         return _parse_ask_from_pane(pane) or _parse_plan_from_pane(pane)
 
     async def _pane_is_dead(self) -> bool:
