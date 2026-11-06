@@ -795,6 +795,19 @@ def _ensure_held_loaded() -> None:
             continue
         if info.thread_id in _HELD or info.thread_id in _ACTIVE:
             continue  # this process already moved on in that thread
+        if held.deadline is None:
+            # #1296: only a hand-written file has one (menu-wait holds are not
+            # carried over). Without a deadline no timer is armed and the
+            # completion never goes out — give it the normal limit from now.
+            held.expires = True
+            held.deadline = time.time() + _defer_max_seconds()
+            logger.warning(
+                "%s a held completion in %s has no deadline — it goes out in %.0fs "
+                "unless the agents report back first (#1296)",
+                log_ctx(thread_id=info.thread_id),
+                path,
+                _defer_max_seconds(),
+            )
         _HELD[info.thread_id] = held
         if held.deadline is not None and held.deadline <= time.time():
             expired.append(info.thread_id)
