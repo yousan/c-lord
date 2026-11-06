@@ -999,6 +999,10 @@ class TranscriptMirror:
         # safeguards refuse request after request wrote the same error 4 times in
         # 23 s, and each one became the same line in the thread.
         self._turn_api_error_lines: set[str] = set()
+        # #1294: the main chain's latest row of the turn is an API error with
+        # nothing after it — the turn stopped there, often without writing a
+        # ``turn_duration``. A tool result after it means the turn kept going.
+        self._stopped_on_api_error = False
         # tool_use ids already delivered — a transcript line re-read after a
         # rewrite (#433) must not attach the same files a second time.
         self._delivered_user_files: set[str] = set()
@@ -1082,6 +1086,7 @@ class TranscriptMirror:
         self._turn_by_notification = False
         self._turn_self_started = False
         self._turn_api_error_lines.clear()
+        self._stopped_on_api_error = False
 
     async def _on_unresolved(self, report: UnresolvedTranscript) -> None:
         """Say out loud that this thread's transcript cannot be found (#773/#585).
@@ -1552,6 +1557,11 @@ class TranscriptMirror:
                     ):
                         self._turn_api_error = api_error_text(event)
                         turn_end_bus.note_reply(self.thread_id, api_error=self._turn_api_error)
+                        self._stopped_on_api_error = self._turn_api_error is not None
+                    elif closed and not event.get("isSidechain"):
+                        # #1294: a tool result after the error — the turn went on
+                        # (the #1251 refusals), so a notification is still inside it.
+                        self._stopped_on_api_error = False
                     self._track_background_agents(event)
                     if self._subagent_log is not None:
                         # #1021: the sub-agent log is an extra; whatever goes wrong
@@ -1592,6 +1602,13 @@ class TranscriptMirror:
                         # are nobody's request.
                         if started_by == "person" and is_harness_user_record(event):
                             started_by = None
+                        if started_by is not None and self._stopped_on_api_error:
+                            # #1294: the turn before stopped on an API error and the
+                            # CLI wrote no turn_duration. Whatever starts now starts
+                            # a new turn — a notification / wakeup is Claude's own
+                            # (its ❌ report, #1131) with its own API-error lines.
+                            self._turn_open = False
+                            self._stopped_on_api_error = False
                         if started_by is not None:
                             self._pane_bang = None
                             # #1099: ``_answering_bang`` waits until the #912
@@ -1682,6 +1699,7 @@ class TranscriptMirror:
                             )
                             self._turn_api_error = None
                             self._turn_api_error_lines.clear()
+                            self._stopped_on_api_error = False
                             turn_end_bus.mark(self.thread_id, at=_event_time(event))
                         continue
 
