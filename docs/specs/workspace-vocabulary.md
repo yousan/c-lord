@@ -338,7 +338,7 @@ SKILL.md だけ）。同じ判定を使う 30 日スイープは、そういう�
         ワークスペースに書き換えていれば（見た目はネットワークの URL）、`git remote get-url --all` と `--push --all` で書き換えた後の
         URL を見る（`insteadOf` / `pushInsteadOf` の設定があるときだけ、remote 1つにつき2回。無ければ git の呼び出しは増えない —
         remote の URL はすでに読んでいる `git config` から判定する）。git が答えられなければ、その remote は証にしない。
-        `file://` の URL は git と同じく `%xx` を戻してから比べる（`file:///…/s%65ssions/…` は置き場の下 — W57 第16弾）。
+        `file://` の URL は git と同じく `%xx` を戻してから比べる（`file:///…/s%65ssions/…` は置き場の下 — W57 第16弾）。戻すのは git と同じく生のバイトへ（`%FF` はバイト 0xFF。UTF-8 として読めない `%xx` を U+FFFD に置き換えて比べていたため、`%FF` で隣のワークスペースを指す remote を置き場の外と読み、証にして消していた — #1295）。
       - **`url` と `pushurl` のどれか1つでも**置き場・ワークスペースの中・（置き場が分からないとき）ローカルパスなら、その remote は証に
         しない（`url` が本物のミラーで `pushurl` が隣のワークスペースでも、`git push` が `refs/remotes/<名前>/*` を進めるため）。
       - **設定に無い remote の追跡 ref は証にしない**（f870f5b のレビュー）。`git fetch <隣のパス> 'refs/heads/*:refs/remotes/b/*'` は
