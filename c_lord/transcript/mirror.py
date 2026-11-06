@@ -776,22 +776,23 @@ def _turn_state_at_end(
 
     :func:`_read_back_state` without its last item.
     """
-    opened_by, opened_at, agents, _ = _read_back_state(path, end)
+    opened_by, opened_at, agents, _, _ = _read_back_state(path, end)
     return opened_by, opened_at, agents
 
 
 def _read_back_state(
     path: Path, end: int | None = None
-) -> tuple[str | None, str | None, set[str], bool | None]:
+) -> tuple[str | None, str | None, set[str], bool | None, bool]:
     """Who opened the turn still open at *end* of *path*, when, the agents still out,
-    and whether an agent's report is still waiting for a turn end (#1281).
+    whether an agent's report is still waiting for a turn end (#1281), and
+    whether the open turn stopped on an API error with nothing after it (#1294).
 
     ``("person" | "notification" | "wakeup" | None, its timestamp, agent ids)``.
     Replays the live loop's own rules (#913/#979/#917/#1092) over what the old
     process already read, so a mirror restored after a restart picks up where it
     left off (#1011/#1012/#1093). *end* is where the tail starts (#1018); ``None``
-    reads to the end of file. Blocking; ``(None, None, set(), None)`` when the
-    file cannot be read — the last item ``None`` means "unknown", never "at rest".
+    reads to the end of file. Blocking; ``(None, None, set(), None, False)`` when
+    the file cannot be read — the fourth item ``None`` means "unknown", never "at rest".
 
     The last item is true from an agent's ``<task-notification>`` until the
     next turn end: the turn Claude starts on the report — the one that carries
@@ -800,12 +801,13 @@ def _read_back_state(
     try:
         lines = list(_read_back_lines(path, end))
     except OSError:
-        return None, None, set(), None
+        return None, None, set(), None, False
     opened_by: str | None = None
     opened_at: str | None = None
     spoke = False
     agents: set[str] = set()
     report_pending = False
+    stopped = False  # the live loop's ``_stopped_on_api_error`` (#1294)
     for raw in lines:
         try:
             event = json.loads(raw)
@@ -823,6 +825,10 @@ def _read_back_state(
             kind = "wakeup" if wakeup else _prompt_kind(event)
             if kind == "person" and is_harness_user_record(event):
                 kind = None
+            if kind is not None and stopped:
+                # #1294: the turn before stopped on an API error — a new one starts.
+                opened_by = None
+                stopped = False
             if kind == "person" or (kind in ("notification", "wakeup") and opened_by is None):
                 opened_by = kind
                 stamp = event.get("timestamp")
@@ -831,12 +837,19 @@ def _read_back_state(
                 spoke = False
         if event.get("type") == "assistant" and not event.get("isSidechain"):
             spoke = True
+            if not is_rate_limit_event(event):
+                stopped = api_error_text(event) is not None
+        elif _tool_call_ids(event)[1] and not event.get("isSidechain"):
+            stopped = False
         if _is_turn_end(event):
             report_pending = False
+            stopped = False
         if _is_turn_end(event) or (local_command_record(event) == "output" and not spoke):
             opened_by = None
             opened_at = None
-    return opened_by, opened_at, agents, report_pending
+    if opened_by is None:
+        stopped = False
+    return opened_by, opened_at, agents, report_pending, stopped
 
 
 #: The uuid of the last text this process posted silently (#1187), so the next
@@ -1194,9 +1207,13 @@ class TranscriptMirror:
         if jsonl is None:
             return
         try:
-            opened_by, opened_at, agents, report_pending = await asyncio.to_thread(
-                _read_back_state, jsonl, end
-            )
+            (
+                opened_by,
+                opened_at,
+                agents,
+                report_pending,
+                stopped_on_api_error,
+            ) = await asyncio.to_thread(_read_back_state, jsonl, end)
         except Exception:
             logger.warning(
                 "%s TranscriptMirror: could not read back the transcript (#1011)",
@@ -1224,6 +1241,9 @@ class TranscriptMirror:
                     exc_info=True,
                 )
             self._turn_open = True
+            # #1294: the old process saw this turn stop on an API error — what
+            # starts after the restart is a new turn, as it would have been.
+            self._stopped_on_api_error = stopped_on_api_error
             self._turn_by_notification = opened_by == "notification"
             self._turn_self_started = opened_by in ("notification", "wakeup")
             if self._turn_self_started:
@@ -1609,6 +1629,9 @@ class TranscriptMirror:
                             # (its ❌ report, #1131) with its own API-error lines.
                             self._turn_open = False
                             self._stopped_on_api_error = False
+                            # Review of #1294: the old turn's error is not the new
+                            # turn's (``note_prompt`` above cleared the bus's copy).
+                            self._turn_api_error = None
                         if started_by is not None:
                             self._pane_bang = None
                             # #1099: ``_answering_bang`` waits until the #912

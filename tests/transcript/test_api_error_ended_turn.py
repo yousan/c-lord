@@ -77,3 +77,74 @@ async def test_self_started_turn_after_an_api_error_ended_turn_reports_its_failu
     reports: list[str] = []
     await _api_lines(tmp_path, _rows(start), failure_reports=reports)
     assert reports == [_SERVER], reports
+
+
+async def test_a_self_started_turn_that_writes_no_reply_does_not_report_the_old_error(
+    tmp_path,
+) -> None:
+    """Review of #1294: the person's error belongs to the person's turn (their runner's ❌).
+
+    The notification starts a new turn; if that turn ends before Claude writes
+    anything, it did not stop on an API error — no ❌ for the old one.
+    """
+    rows: list[dict | str] = [_TURN]
+    rows += _api_error_end(_TIMES[0], 0)
+    rows.append(_user_text("n1", "err0", _NOTIF))
+    rows.append(_turn_end("end", "n1"))
+    reports: list[str] = []
+    await _api_lines(tmp_path, rows, failure_reports=reports)
+    assert reports == [], reports
+
+
+async def test_restart_after_an_api_error_ended_turn_still_reports_the_next_self_turn(
+    tmp_path, monkeypatch
+) -> None:
+    """Review of #1294: the old process saw the person's turn die on the error.
+
+    The new process reads that back (#1011), so the notification after the
+    restart still starts Claude's own turn, and its failure is reported once.
+    """
+    from c_lord import turn_events
+    from c_lord.skills import reply_tracker
+
+    from . import test_self_turn_api_error as a
+    from .test_restart_self_turn_api_error import _lines, _Restored
+
+    log = tmp_path / "turn-events.jsonl"
+    monkeypatch.setenv(turn_events.ENV_LOG, str(log))
+    turn_events.reset()
+    reply_tracker.reset_tracker()
+    person = a._row(
+        "user", "2026-10-29T08:21:05.000Z", message={"role": "user", "content": "確認して"}
+    )
+    try:
+        async with _Restored(tmp_path, person, a._api_error()) as r:
+            await r.feed(
+                *a._notification("2026-10-29T08:40:00.000Z", "b1"),
+                {**a._api_error(), "uuid": "err-after-restart"},  # a row of its own
+                a._end("2026-10-29T08:40:05.000Z"),
+            )
+        assert len(r.notices) == 1, r.notices
+        assert [(e["kind"], e.get("reason")) for e in _lines(log)] == [("failure", "api_error")]
+    finally:
+        turn_events.reset()
+        reply_tracker.reset_tracker()
+
+
+def test_read_back_replays_the_api_error_turn_end(tmp_path) -> None:
+    """The read-back follows the live rule (#1011): a notification after the stop is Claude's."""
+    import json
+
+    from c_lord.transcript.mirror import _read_back_state, _turn_state_at_end
+
+    from . import test_self_turn_api_error as a
+
+    person = a._row("user", "2026-10-29T08:21:05.000Z", message={"role": "user", "content": "x"})
+    rows = [person, a._api_error()]
+    path = tmp_path / "s.jsonl"
+    path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    assert _read_back_state(path)[4] is True
+    rows += a._notification("2026-10-29T08:40:00.000Z", "b1")
+    path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    assert _turn_state_at_end(path) == ("notification", "2026-10-29T08:40:00.000Z", set())
+    assert _read_back_state(path)[4] is False
