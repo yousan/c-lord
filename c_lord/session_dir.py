@@ -35,7 +35,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import unquote
+from urllib.parse import unquote_to_bytes
 
 from .attachments import ATTACHMENT_SUBDIR
 from .coauthor import DATA_FILE_NAME as COAUTHOR_DATA_FILE
@@ -1180,7 +1180,8 @@ def _local_remote_path(cwd: str, url: str) -> str | None:
         rest = url[len("file://") :]
         url = rest[rest.index("/") :] if "/" in rest else rest  # file://host/path
         # git decodes %xx in a file:// URL: ``s%65ssions`` is ``sessions`` (W57 round 16).
-        url = unquote(url)
+        # To raw bytes, as git does: ``%FF`` is the byte 0xFF, not U+FFFD (#1295).
+        url = os.fsdecode(unquote_to_bytes(os.fsencode(url)))
     elif _NETWORK_URL_RE.match(url):
         return None
     return os.path.realpath(os.path.join(os.path.realpath(cwd), url))
