@@ -325,3 +325,61 @@ def test_pct_file_url_tag_cycle_one_sweep(tmp_path: Path) -> None:
     git(sa, "remote", "add", "b", _pct(sb))
     r = _sweep_root(root)
     assert a.exists() or b.exists(), f"one sweep deleted both; {sha} gone: {r}"
+
+
+# ---- #1295: ``%xx`` that is not UTF-8 in a file:// URL -------------------------------
+#
+# git puts the raw byte back (``%FF`` is the byte 0xFF), but c-lord decoded with
+# ``errors='replace'`` and compared a path holding U+FFFD instead. That path does
+# not exist, so it read as "outside the sessions root", the neighbour vouched for
+# a commit only it held, and the workspace was deleted.
+
+
+def _only_on_neighbour(tmp: Path, root: Path) -> tuple[Path, Path, str]:
+    a, b = _flat_ws(tmp, root, "4242"), _flat_ws(tmp, root, "4343")
+    git(a, "checkout", "-q", "-b", "work")
+    sha = _commit(a, "w.txt", "only copy\n")
+    git(a, "checkout", "-q", "main")
+    git(b, "fetch", "-q", str(a), "work:work")
+    return a, b, sha
+
+
+def _fetch_through(a: Path, url: str, sha: str) -> None:
+    import subprocess
+
+    git(a, "remote", "add", "b", url)
+    got = subprocess.run(["git", "fetch", "-q", "b"], cwd=a, capture_output=True)
+    if got.returncode != 0:
+        pytest.skip(f"git cannot fetch: {got.stderr[:200]!r}")
+    assert git(a, "rev-parse", "b/work").strip() == sha
+
+
+def test_non_utf8_root_byte(tmp_path: Path) -> None:
+    """Root dir name holds a byte that is not UTF-8 (\\xff); URL spells it %FF."""
+    import os
+    from urllib.parse import quote
+
+    root = _seed_root(tmp_path)
+    new = Path(os.fsdecode(bytes(tmp_path) + b"/s\xffs"))
+    root.rename(new)
+    a, b, sha = _only_on_neighbour(tmp_path, new)
+    url = "file://" + quote(os.fsencode(str(b)))
+    _fetch_through(a, url, sha)
+    st = sd.worktree_status(str(a), sessions_root=str(new))
+    assert not st.clean, f"{url!r}: {sha} only on neighbour, called clean"
+
+
+def test_non_utf8_symlink_outside(tmp_path: Path) -> None:
+    """Ordinary root; a link outside it named b'\\xff' leads to the neighbour; URL spells %FF."""
+    import os
+
+    root = _seed_root(tmp_path)
+    a, b, sha = _only_on_neighbour(tmp_path, root)
+    (tmp_path / "x").mkdir()
+    os.symlink(bytes(b), bytes(tmp_path) + b"/x/\xff")
+    url = "file://" + str(tmp_path) + "/x/%FF"
+    _fetch_through(a, url, sha)
+    st = sd.worktree_status(str(a), sessions_root=str(root))
+    assert not st.clean, f"{url!r}: {sha} only on neighbour, called clean"
+    r = _sweep_root(root)
+    assert a.exists(), r
