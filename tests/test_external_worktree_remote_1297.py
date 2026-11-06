@@ -266,3 +266,35 @@ def test_mirror_borrowing_an_outside_cache_still_vouches(tmp_path: Path) -> None
     git(a, "push", "-q", "x", "work")
     r = _sweep(root)
     assert not a.exists(), r
+
+
+# Re-review of f8f951c: git adds the suffixes to the path as written, before any symlink
+# is followed — ``<ln>.git`` is a sibling of the link, not of what it points at.
+
+
+def _symlink_to_plain_dir_url(tmp: Path, ws: Path, name: str) -> str:
+    ext = tmp / "ext"
+    plain = tmp / "plain" / name
+    plain.mkdir(parents=True)
+    ext.mkdir(exist_ok=True)
+    (ext / name).symlink_to(plain)  # a non-repo dir
+    (ext / f"{name}.git").symlink_to(ws / ".git")
+    return str(ext / name)
+
+
+def _dangling_symlink_url(tmp: Path, ws: Path, name: str) -> str:
+    ext = tmp / "ext"
+    ext.mkdir(exist_ok=True)
+    (ext / name).symlink_to(tmp / "nowhere" / name)
+    (ext / f"{name}.git").symlink_to(ws / ".git")
+    return str(ext / name)
+
+
+def test_cycle_through_suffix_beside_a_symlink_to_a_plain_dir(tmp_path: Path) -> None:
+    sha, a, b, r = _cycle(tmp_path, _symlink_to_plain_dir_url)
+    assert _has(sha, a, b), f"{sha} lost: {r}"
+
+
+def test_cycle_through_suffix_beside_a_dangling_symlink(tmp_path: Path) -> None:
+    sha, a, b, r = _cycle(tmp_path, _dangling_symlink_url)
+    assert _has(sha, a, b), f"{sha} lost: {r}"

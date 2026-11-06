@@ -1176,6 +1176,17 @@ def _no_copy_remotes(
 
 def _local_remote_path(cwd: str, url: str) -> str | None:
     """The real path a local remote URL names; ``None`` for a network URL."""
+    written = _local_remote_as_written(cwd, url)
+    return None if written is None else os.path.realpath(written)
+
+
+def _local_remote_as_written(cwd: str, url: str) -> str | None:
+    """The absolute path a local remote URL names, its symlinks not followed (#1297).
+
+    Only *cwd* (what a relative URL is relative to) is resolved: git adds its
+    ``.git`` suffixes to the path as written, so ``<link>.git`` is a sibling of
+    the link, not of what it points at.
+    """
     if url.startswith("file://"):
         rest = url[len("file://") :]
         url = rest[rest.index("/") :] if "/" in rest else rest  # file://host/path
@@ -1183,7 +1194,7 @@ def _local_remote_path(cwd: str, url: str) -> str | None:
         url = unquote(url)
     elif _NETWORK_URL_RE.match(url):
         return None
-    return os.path.realpath(os.path.join(os.path.realpath(cwd), url))
+    return os.path.join(os.path.realpath(cwd), url)
 
 
 def _inside(path: str | None, root: str) -> bool:
@@ -1210,7 +1221,7 @@ def _no_copy(cwd: str, url: str, ws_root: str, sessions_root: str | None) -> boo
         return True
     # #1297: a linked worktree (or a repo borrowing objects) outside every root keeps
     # its objects and refs in another repo's git dir — judge where they live, too.
-    homes = _object_homes(local)
+    homes = _object_homes(_local_remote_as_written(cwd, url) or local)
     if homes is None:
         return True  # could not tell where its objects live: keep
     for path in (local, *homes):
@@ -1260,20 +1271,24 @@ def _object_homes(local: str) -> list[str] | None:
 def _object_homes_unchecked(local: str) -> list[str] | None:
     git_dirs: list[Path] = []
     for suffix in _REPO_SUFFIXES:
-        cand = Path(local + suffix)
+        # #1297: suffixes go on the path as written; each candidate is then resolved.
+        written = Path(local.rstrip("/") + suffix)
+        cand = Path(os.path.realpath(written))
         kind = _kind(cand)
         if kind is None:
             return None
         if kind == "dir":
-            git_dirs.append(Path(os.path.realpath(cand)))
+            git_dirs.append(cand)
         elif kind == "file":
             text = _read_small(cand)
             if text is None or "\0" in text:
                 return None
             line = text.strip()
             if line.startswith("gitdir:"):
-                target = cand.parent / line[len("gitdir:") :].strip()
-                git_dirs.append(Path(os.path.realpath(target)))
+                gitdir = line[len("gitdir:") :].strip()
+                # A relative gitdir: judge it from the link's dir and the file's real dir.
+                for base in dict.fromkeys((written.parent, cand.parent)):
+                    git_dirs.append(Path(os.path.realpath(base / gitdir)))
     dirs: list[Path] = []
     for git_dir in git_dirs:
         dirs.append(git_dir)
