@@ -37,7 +37,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .session_cleanup import _MIN_PATH_DEPTH, DirOutcome, describe_changes
-from .session_dir import WorktreeStatus, worktree_status
+from .session_dir import WorktreeStatus, mark_sessions_root, worktree_status
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +237,7 @@ def _remove_orphan_dir(
     """
     import shutil
 
+    mark_sessions_root(sessions_root)  # #1289: before judging, so the next root sees it
     try:
         target = Path(path)
         if len([p for p in target.parts if p not in ("/", "")]) < _MIN_PATH_DEPTH:
@@ -405,6 +406,8 @@ class OrphanSweepLoop:
             return
         if self._task is not None and not getattr(self._task, "done", lambda: True)():
             return
+        # #1289: the first pass is minutes away; another instance's sweep may run first.
+        mark_sessions_root(self._root)
         self._task = asyncio.create_task(self._run(), name="orphan_sweep")
         logger.info(
             "Started orphan-dir sweep (root=%s, threshold=%dd, interval=%.0fs)",
@@ -444,6 +447,7 @@ class OrphanSweepLoop:
         行の一覧が取れないまま走ると、生きているワークスペースが軒並み
         「行が無い」に見える。ここが空振りしたら掃除ごと諦めるのが正しい。
         """
+        mark_sessions_root(self._root)  # #1289
         known = await self._repo.all_working_dirs()  # type: ignore[attr-defined]
         result = await sweep_orphan_dirs(
             self._root,

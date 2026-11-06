@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from c_lord import turn_events
 from c_lord.turn_events import StartedBy
 from tests.test_turn_events import THREAD_ID, _clean, _lines, _thread, log  # noqa: F401
@@ -298,3 +300,49 @@ async def test_a_bad_number_never_raises_from_restore_and_later_entries_still_lo
         path.write_text(f'{{"held": [{bad}, {good}]}}')
         turn_events.restore_held()
         assert list(turn_events._HELD) == [4343], body
+
+
+# --- #1296: a carried-over hold with no deadline ----------------------------------
+# A hold read back with ``"deadline": null`` got no timer (``_arm`` returns on
+# None), so unless that thread ended a turn again, the request's completion
+# never went out. c-lord always writes a deadline (menu-wait holds, the only
+# ones without, are not carried over) — a hand-written file can omit it. It now
+# gets the normal hold limit from the time it was read back.
+
+
+async def test_a_restored_hold_with_no_deadline_still_goes_out(log, monkeypatch):  # noqa: F811
+    import asyncio
+
+    monkeypatch.setenv(turn_events.ENV_DEFER_MAX, "0.3")
+    path = turn_events.held_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'{{"held": [{_entry_json(deadline="null")}]}}')
+    turn_events.restore_held()
+    assert THREAD_ID in turn_events._HELD  # not dropped: the completion is kept
+    await asyncio.sleep(0.8)
+    await turn_events.drain()
+    events = _lines(log)
+    assert [(e["kind"], e.get("reason")) for e in events] == [
+        ("completion", "background_agents_unresolved")
+    ], "held forever: no deadline, no timer"
+    assert events[0]["started_by"]["type"] == "webhook"
+
+
+@pytest.mark.parametrize("raw", ["inf", "Infinity", "nan", "1e400"])
+def test_a_non_finite_hold_limit_falls_back_to_the_default(monkeypatch, raw):
+    """#1296 follow-up: ``inf`` gave a deadline that never fires, saved as ``Infinity``."""
+    monkeypatch.setenv(turn_events.ENV_DEFER_MAX, raw)
+    assert turn_events._defer_max_seconds() == turn_events.DEFAULT_DEFER_MAX_SECONDS
+
+
+async def test_a_fresh_deadline_is_saved_so_another_restart_keeps_it(log):  # noqa: F811
+    """#1296 follow-up: the file stops saying null, so each restart does not restart the limit."""
+    import json
+
+    path = turn_events.held_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'{{"held": [{_entry_json(deadline="null")}]}}')
+    turn_events.restore_held()
+    given = turn_events._HELD[THREAD_ID].deadline
+    saved = json.loads(path.read_text())["held"]
+    assert [e["deadline"] for e in saved] == [given]
