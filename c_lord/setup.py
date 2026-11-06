@@ -219,6 +219,12 @@ async def setup_bridge(
             logger.info("Session dirs: %s (default; SESSION_DIR_BASE not set)", session_dir_base)
     else:
         logger.info("Session dirs: %s", session_dir_base)
+    # #1289: an idle bot builds no SessionDirManager; mark the root now so the
+    # other instance on this host (prod / staging) never trusts a workspace here.
+    from .clord_home import LEGACY_SESSION_DIR_BASE as _LEGACY_BASE
+    from .session_dir import mark_sessions_root
+
+    mark_sessions_root(session_dir_base or _LEGACY_BASE)
     if session_source_repo is not None or os.getenv("SESSION_SOURCE_REPO"):
         import warnings
 
