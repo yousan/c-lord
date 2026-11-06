@@ -1,0 +1,24 @@
+
+
+[38;5;246m✻[39m [38;5;246mWaiting for [1m2[0m[38;5;246m background agents to 
+[39m  [38;5;246mfinish
+
+[38;5;153m────────────────────────────────────────
+[39m [1m[38;5;153mFetch[0m [38;5;246m· [39mfrom the general-purpose agent
+ [38;5;246mClaude wants to fetch content from 
+[39m [38;5;246mexample.com
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m url: https://example.com/
+ prompt: What is the page's title?
+[38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m Permission rule [1mWebFetch[0m requires
+ confirmation for this tool.
+ [38;5;246m/permissions to update rules
+
+[39m Do you want to allow Claude to fetch
+ this content?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes
+[39m   [38;5;246m2. [39mYes, and don't ask again for
+      [1mexample.com
+[0m   [38;5;246m3. [39mNo, and tell Claude what to do
+      differently [1m(esc)
