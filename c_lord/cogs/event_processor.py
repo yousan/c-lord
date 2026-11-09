@@ -418,7 +418,11 @@ class EventProcessor:
             # #1309: the embed reaches whoever opens the thread; the cure is on
             # the host, so the owner is told by DM — once per outage.
             if self._config.outcome.login_required:
-                await login_alert.report(self._config.thread)
+                tmux = getattr(self._config.runner, "_tmux", None)
+                session = getattr(tmux, "session_name", None)
+                await login_alert.report(
+                    self._config.thread, session=session if isinstance(session, str) else None
+                )
         else:
             if self._config.status:
                 await self._config.status.set_done()
