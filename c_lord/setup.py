@@ -337,6 +337,11 @@ async def setup_bridge(
     bot.transcript_mirror_cog = transcript_cog  # type: ignore[attr-defined]
     logger.info("Registered TranscriptMirrorCog")
 
+    # --- Login alert (#1309) — the owner hears about a logout by DM ---
+    from .login_alert import login_alert
+
+    login_alert.bind(bot)
+
     # --- VersionCog (read-only /version + !version twin, zero-config) ---
     await bot.add_cog(VersionCog(bot))
     logger.info("Registered VersionCog")
