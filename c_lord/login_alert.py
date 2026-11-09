@@ -32,7 +32,6 @@ machine's host name). See ``docs/specs/login-alert.md``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -52,6 +51,8 @@ from .utils.logger import log_ctx
 logger = logging.getLogger(__name__)
 
 HOST_LABEL_ENV = "CLORD_HOST_LABEL"
+#: "Leave the DM's buttons as they are" for :meth:`LoginAlert.set_extra`.
+_KEEP: Any = object()
 _STATE_FILE = "login-alert.json"
 #: How many stopped threads the DM lists before it says "+N more" — a DM is
 #: capped at 2000 characters and a thread link is ~85.
@@ -170,22 +171,33 @@ class LoginAlert:
 
     # -- the two events -------------------------------------------------------
 
-    async def report(self, thread: Any) -> None:
-        """A turn in *thread* was refused because Claude Code is logged out. Never raises."""
+    async def report(self, thread: Any, *, session: str | None = None) -> None:
+        """A turn in *thread* was refused because Claude Code is logged out. Never raises.
+
+        *session*: the tmux session the thread's claude runs in — #1310 opens its
+        login window there, so it inherits the same environment (config dir).
+        """
         try:
             async with self._lock:
-                await self._report(thread)
+                await self._report(thread, session)
         except Exception:
             logger.exception("login alert failed (#1309) — thread %s", getattr(thread, "id", "?"))
 
-    async def recovered(self) -> None:
-        """A turn ran — Claude Code is logged in. Ends the outage, if any. Never raises."""
+    async def recovered(self, note: str | None = None) -> None:
+        """Claude Code is logged in again. Ends the outage, if any. Never raises.
+
+        The DM is edited one last time: its trailing section becomes *note*
+        (default: "logged back in at HH:MM") and the #1310 button goes away.
+        """
         try:
             async with self._lock:
                 state = self._load()
                 if not state.get("open"):
                     return
                 threads = len(state.get("threads", []))
+                at = time.strftime("%H:%M", time.localtime(self._clock()))
+                state["extra"] = note or f"✅ ログインが戻りました（{at}）。"
+                await self._edit_dm(state, view=None)
                 self._state = {"open": False, "threads": []}
                 self._dm = None
                 self._save()
@@ -197,8 +209,11 @@ class LoginAlert:
         except Exception:
             logger.exception("login alert: could not close the outage (#1309)")
 
-    async def set_extra(self, extra: str | None) -> None:
-        """Replace the DM's trailing section (the re-login link — #1310). Never raises."""
+    async def set_extra(self, extra: str | None, *, view: Any = _KEEP) -> None:
+        """Replace the DM's trailing section (the re-login link — #1310). Never raises.
+
+        *view*: the DM's buttons; left as they are unless given (``None`` removes).
+        """
         try:
             async with self._lock:
                 state = self._load()
@@ -206,13 +221,13 @@ class LoginAlert:
                     return
                 state["extra"] = extra
                 self._save()
-                await self._edit_dm(state)
+                await self._edit_dm(state, view=view)
         except Exception:
             logger.exception("login alert: could not update the DM (#1309)")
 
     # -- internals ------------------------------------------------------------
 
-    async def _report(self, thread: Any) -> None:
+    async def _report(self, thread: Any, session: str | None) -> None:
         state = self._load()
         thread_id = getattr(thread, "id", None)
         url = str(getattr(thread, "jump_url", "") or thread_id)
@@ -220,7 +235,7 @@ class LoginAlert:
         known = {t.get("id") for t in state["threads"]}
         added = thread_id not in known
         if added:
-            state["threads"].append({"id": thread_id, "url": url})
+            state["threads"].append({"id": thread_id, "url": url, "session": session})
 
         if state.get("open"):
             self._save()
@@ -323,14 +338,21 @@ class LoginAlert:
         ref = self._load().get("dm")
         return ref.get("channel") if ref else None
 
-    async def _edit_dm(self, state: dict[str, Any]) -> None:
+    async def _edit_dm(self, state: dict[str, Any], *, view: Any = _KEEP) -> None:
         msg = await self._dm_message(state)
         if msg is None:
             return
-        with contextlib.suppress(*DISCORD_CALL_FAILURES):
+        kwargs: dict[str, Any] = {}
+        if view is not _KEEP:
+            kwargs["view"] = view
+        try:
             await msg.edit(
-                content=self._body(state), allowed_mentions=discord.AllowedMentions.none()
+                content=self._body(state),
+                allowed_mentions=discord.AllowedMentions.none(),
+                **kwargs,
             )
+        except DISCORD_CALL_FAILURES as exc:
+            logger.warning("login alert: could not edit the DM (%s: %s)", type(exc).__name__, exc)
 
     async def _fire(self, callbacks: list[Callable[[], Any]]) -> None:
         for cb in callbacks:

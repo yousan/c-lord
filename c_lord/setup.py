@@ -342,6 +342,15 @@ async def setup_bridge(
 
     login_alert.bind(bot)
 
+    # --- Login relay (#1310) — log back in from that DM ---
+    from .login_relay import LoginRelayCog, relay_enabled
+
+    if relay_enabled():
+        await bot.add_cog(LoginRelayCog(bot))
+        logger.info("Registered LoginRelayCog")
+    else:
+        logger.info("Login relay disabled (CLORD_LOGIN_RELAY=0) — the DM alert stays (#1310)")
+
     # --- VersionCog (read-only /version + !version twin, zero-config) ---
     await bot.add_cog(VersionCog(bot))
     logger.info("Registered VersionCog")

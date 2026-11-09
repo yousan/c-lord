@@ -37,7 +37,7 @@
 | [turn-progress.md](./turn-progress.md) | ターン中の進捗表示 | スレッドが90秒黙ったときだけ1行出て、15秒ごとに書き換わり、実出力が戻ると消える（常時は出さない） |
 | [turn-end-notification.md](./turn-end-notification.md) | ターン終了の呼び出し 🟡/⚠️ | 応答があったときだけ「終わりました」。何も返っていないターンは「応答がありませんでした」と正しく言う |
 | [usage-limit.md](./usage-limit.md) | 利用上限（クォータ）に当たったとき | 上限は上限として、回復時刻つきで出す。「もう一度送ってください」とは言わない（送っても通らないため） |
-| [login-alert.md](./login-alert.md) | ログイン切れの DM | Claude Code のログインが切れたら owner に DM が1通。ホスト名・止まったスレッド・次の手。同じ切れの間は1通に書き足す (#1309) |
+| [login-alert.md](./login-alert.md) | ログイン切れの DM | Claude Code のログインが切れたら owner に DM が1通。ホスト名・止まったスレッド・次の手。同じ切れの間は1通に書き足す (#1309)。DM のリンクとコードの返信でログインし直せる (#1310) |
 | [mirrored-events.md](./mirrored-events.md) | スレッドに流れるイベントの選別 | 👤 はその人が実際に打ったものだけ。ハーネス内部の通知は progress.txt に畳み、内部パスは出さない |
 | [repeat-fold.md](./repeat-fold.md) | 同じ発言の繰り返し | 同じ文が延々続いたら4回目からは1通にまとめ、何回ぶんかをその1通で数える。別の文・ターン最後の返事はまとめない |
 | [subagent-log.md](./subagent-log.md) | サブエージェントの作業 | 1回の走りごとに開始・終了の1行と `subagent-*.md`（報告の全文・依頼・ツール呼び出し）。走っている間は添付が差し替わる。`CLORD_SUBAGENT_VOICES=1` で、やり取りと最終報告を話した側の名前で出す |

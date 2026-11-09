@@ -189,6 +189,13 @@ class ClaudeChatCog(commands.Cog):
   first lines, link; once a day per person, in memory), and every refusal is
   logged. The DM never names who *is* allowed. `CLORD_NOTIFY_DENIED=0` turns
   the DM off (#346, `docs/specs/authorization-default.md`)
+- Logging back in from the DM (#1310) types text into a pane, so it is the
+  narrowest gate in the project: only a DM from the owner (`DISCORD_OWNER_ID`,
+  else the application owner), only while the `clord-login` window is waiting
+  (15 minutes), only one space-free token, sent with `send-keys -l` into that
+  window and nowhere else. The sign-in link and the code stay in the DM: no
+  thread, channel or log line carries either (the log records the code's
+  length). `CLORD_LOGIN_RELAY=0` turns it off (`docs/specs/login-alert.md`)
 - The same check applies to `SkillCommandCog`, `ChannelRepoCog` and
   `SessionManageCog` — they hold the same `Authorizer` instance rather than a
   copy of the rule. Every slash / text command goes through it except the
