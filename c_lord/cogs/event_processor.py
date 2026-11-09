@@ -41,6 +41,7 @@ from ..discord_ui.permission_view import PermissionView
 from ..discord_ui.plan_view import PlanApprovalView
 from ..discord_ui.progress_folder import ProgressFolder
 from ..discord_ui.tool_timer import LiveToolTimer
+from ..login_alert import login_alert
 from ..usage_limit import usage_limit_notices
 from ..utils.logger import log_ctx
 from .run_config import RunConfig
@@ -414,9 +415,15 @@ class EventProcessor:
                 self._config.outcome.pinged_user_id = self._failure_notify_uid
             if self._config.status:
                 await self._config.status.set_error()
+            # #1309: the embed reaches whoever opens the thread; the cure is on
+            # the host, so the owner is told by DM — once per outage.
+            if self._config.outcome.login_required:
+                await login_alert.report(self._config.thread)
         else:
             if self._config.status:
                 await self._config.status.set_done()
+            # #1309: a turn that ran was logged in — the outage, if any, is over.
+            await login_alert.recovered()
 
         # Fold collected progress messages into a progress.txt attachment on
         # the final response, then delete the originals.

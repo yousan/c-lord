@@ -150,6 +150,7 @@ Claude Code はログインが切れていると、どの依頼にも `Login exp
 - あわせて `🔑 Claude Code のログインが切れています` の embed が出る。ログインはホスト全体で共通なので、他のスレッドも止まっている可能性があることを添える
 - 判定はペインの「`… · Please run /login` だけの行」がこのターンで**増えた**ときだけ。ステータス行の `Not logged in · Run /login` や、前のターンの行の再描画、文中で引用された文言では判定しない
 - Claude が返した英語の1行（`Login expired · Please run /login`）は transcript ミラーがそのまま転送する（こちらは変えていない）
+- あわせて owner に DM が1通届く（同じ切れの間は1通だけ — [login-alert.md](login-alert.md)、#1309）
 
 ### 設定されたモデルを Claude Code が使えなかったターン (#484)
 

@@ -212,3 +212,30 @@ def _reset_fallback_owner_ids():
         authorization.set_fallback_owner_ids(None)
         authorization.set_default_authorizer(None)
 
+
+@pytest.fixture(autouse=True)
+def _fresh_login_alert(tmp_path):
+    """Give every test its own login outage (#1309).
+
+    ``login_alert`` is process-global (one bot per process) and remembers an
+    open outage; without this one test's refused turn would swallow the next
+    test's DM.
+    """
+    from c_lord.login_alert import login_alert
+
+    saved = (login_alert._state_path, login_alert._bot, login_alert._on_open, login_alert._on_close)
+    login_alert._state_path = tmp_path / "login-alert.json"
+    login_alert._state = None
+    login_alert._dm = None
+    login_alert._bot = None
+    login_alert._on_open = []
+    login_alert._on_close = []
+    yield
+    (
+        login_alert._state_path,
+        login_alert._bot,
+        login_alert._on_open,
+        login_alert._on_close,
+    ) = saved
+    login_alert._state = None
+    login_alert._dm = None
