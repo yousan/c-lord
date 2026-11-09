@@ -408,6 +408,8 @@ uv lock --upgrade-package c-lord && uv sync
 | `CLORD_ALLOWED_ROLE` | Discord role name whose members may drive the bot (OR with `DISCORD_OWNER_ID`) | (optional) |
 | `CLORD_ALLOW_ANYONE` | `1` lets **every** member of the server drive the bot — which means running shell commands on the host. Warned about at startup | `false` |
 | `CLORD_NOTIFY_DENIED` | `0` stops the DM the application owner gets when someone not allowed posts in a bot thread (the sender never sees anything; the refusal is still logged — #346) | `true` |
+| `CLORD_HOST_LABEL` | What the login-outage DM calls this machine (#1309 — tell a second host apart) | host name |
+| `CLORD_LOGIN_RELAY` | `0` keeps the login-outage DM but drops logging back in from it (sign-in link + code reply, #1310) | `true` |
 | `CLORD_OWNER_FALLBACK` | How far the owner fallback goes for turns nobody human asked for (webhook / CI / scheduler): `all` (turn-end 🟡 + pauses + failures), `blocked` (pauses + failures — quiet when it works, loud when it breaks), `off` (never, failures included) | `blocked` |
 | `CLORD_EVENT_LOG` | Append one JSON line per turn end (`completion` / `blocked` / `failure`) to this file, after the last reply is posted — for a dispatching agent or CI to `tail -F` instead of polling the thread. Server-side only; see [docs/specs/turn-end-events.md](docs/specs/turn-end-events.md) (#917) | (off) |
 | `CLORD_EVENT_WEBHOOK_URL` / `CLORD_EVENT_WEBHOOK_SECRET` | POST the same event as JSON to this URL, with `X-Clord-Signature: sha256=<HMAC-SHA256 of the body>`. Nothing is sent without the secret. Failures are retried a few times and never block the turn (#917) | (off) |
