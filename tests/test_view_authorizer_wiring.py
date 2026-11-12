@@ -218,7 +218,7 @@ RUN_CONFIG_SITES = [
 def test_every_run_posts_views_that_can_see_the_allowlist(rel: str) -> None:
     """A run's ``RunConfig.authorizer`` is what gates the buttons it posts.
 
-    ``event_processor`` builds PermissionView / StopView / AskView from it, so a
+    The ask bridge ``event_processor`` starts builds its AskView from it, so a
     cog that starts a run without one produces the un-wired Views of #739. Four
     of the five construction sites had never passed it.
     """

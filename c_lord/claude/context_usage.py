@@ -70,9 +70,9 @@ class ContextUsage:
     def used(self) -> int:
         """Tokens occupying the context window for the *next* turn.
 
-        Matches Claude Code's own accounting (``embeds.session_complete_embed``):
-        prompt tokens only — input plus cache reads/creation.  Output tokens are
-        not yet "in" the window; they become cached input on the next turn.
+        Matches Claude Code's own accounting: prompt tokens only — input plus
+        cache reads/creation.  Output tokens are not yet "in" the window; they
+        become cached input on the next turn.
         """
         return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
 

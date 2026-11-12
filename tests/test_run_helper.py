@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -12,14 +11,9 @@ import pytest
 from c_lord.claude.types import (
     MessageType,
     StreamEvent,
-    ToolCategory,
-    ToolUseEvent,
 )
 from c_lord.cogs._run_helper import (
-    TOOL_RESULT_MAX_CHARS,
-    LiveToolTimer,
     _make_error_embed,
-    _truncate_result,
     run_claude_in_thread,
 )
 from c_lord.concurrency import SessionRegistry
@@ -336,24 +330,6 @@ class TestPostContextUsage:
         cfg.thread.send.assert_not_called()
 
 
-class TestTruncateResult:
-    def test_short_content_unchanged(self) -> None:
-        assert _truncate_result("hello") == "hello"
-
-    def test_exact_limit_unchanged(self) -> None:
-        text = "x" * TOOL_RESULT_MAX_CHARS
-        assert _truncate_result(text) == text
-
-    def test_long_content_truncated(self) -> None:
-        text = "x" * (TOOL_RESULT_MAX_CHARS + 100)
-        result = _truncate_result(text)
-        assert result.endswith("... (truncated)")
-        assert len(result) < len(text)
-
-    def test_empty_content(self) -> None:
-        assert _truncate_result("") == ""
-
-
 class TestRunClaudeInThread:
     """Integration tests for run_claude_in_thread with mocked runner."""
 
@@ -383,107 +359,6 @@ class TestRunClaudeInThread:
                 yield e
 
         return gen
-
-    @pytest.mark.asyncio
-    async def test_tool_result_updates_embed(
-        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
-    ) -> None:
-        """Tool result content should update the tool use embed."""
-        tool_msg = MagicMock(spec=discord.Message)
-        tool_msg.edit = AsyncMock()
-        tool_msg.embeds = [MagicMock(title="📖 Reading: /tmp/test.py...")]
-        thread.send = AsyncMock(return_value=tool_msg)
-
-        events = [
-            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
-            StreamEvent(
-                message_type=MessageType.ASSISTANT,
-                tool_use=ToolUseEvent(
-                    tool_id="t1",
-                    tool_name="Read",
-                    tool_input={"file_path": "/tmp/test.py"},
-                    category=ToolCategory.READ,
-                ),
-            ),
-            StreamEvent(
-                message_type=MessageType.USER,
-                tool_result_id="t1",
-                tool_result_content="print('hello world')",
-            ),
-            StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                session_id="sess-1",
-                cost_usd=0.01,
-                duration_ms=1000,
-            ),
-        ]
-        runner.run = self._make_async_gen(events)
-
-        await run_claude_in_thread(thread, runner, repo, "test", None)
-
-        # Tool message should have been edited with result
-        tool_msg.edit.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_thinking_posted_as_embed(
-        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
-    ) -> None:
-        """Extended thinking should be posted as a spoiler embed."""
-        events = [
-            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
-            StreamEvent(message_type=MessageType.ASSISTANT, thinking="Let me analyze this..."),
-            StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                text="Done!",
-                session_id="sess-1",
-                cost_usd=0.01,
-                duration_ms=500,
-            ),
-        ]
-        runner.run = self._make_async_gen(events)
-
-        await run_claude_in_thread(thread, runner, repo, "test", None)
-
-        # Check that thinking embed was sent
-        embed_calls = [c for c in thread.send.call_args_list if "embed" in c.kwargs]
-        thinking_embeds = [
-            c
-            for c in embed_calls
-            if hasattr(c.kwargs.get("embed"), "title")
-            and "Thinking" in (c.kwargs["embed"].title or "")
-        ]
-        assert len(thinking_embeds) == 1
-        # Description must use a plain code block (no spoiler) for guaranteed readability
-        embed = thinking_embeds[0].kwargs["embed"]
-        assert embed.description is not None
-        assert embed.description.startswith("```")
-        assert embed.description.endswith("```")
-        assert "||" not in embed.description
-
-    @pytest.mark.asyncio
-    async def test_redacted_thinking_posted_as_embed(
-        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
-    ) -> None:
-        """A redacted_thinking block should post a placeholder embed."""
-        events = [
-            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
-            StreamEvent(message_type=MessageType.ASSISTANT, has_redacted_thinking=True),
-            StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                text="Done.",
-                session_id="sess-1",
-            ),
-        ]
-        runner.run = self._make_async_gen(events)
-
-        await run_claude_in_thread(thread, runner, repo, "test", None)
-
-        embed_calls = [c for c in thread.send.call_args_list if "embed" in c.kwargs]
-        titles = [c.kwargs["embed"].title or "" for c in embed_calls]
-        assert any("redacted" in t.lower() for t in titles)
 
     @pytest.mark.asyncio
     async def test_error_handling(
@@ -1104,125 +979,6 @@ class TestConcurrencyIntegration:
         assert captured_prompt[0] == "fix the bug"
         # No system context → runner.clone should not have been called.
         runner.clone.assert_not_called()
-
-
-class TestLiveToolTimer:
-    """Tests for LiveToolTimer elapsed-time embed updates."""
-
-    def _bash_tool(self) -> ToolUseEvent:
-        return ToolUseEvent(
-            tool_id="t1",
-            tool_name="Bash",
-            tool_input={"command": "az login --use-device-code"},
-            category=ToolCategory.COMMAND,
-        )
-
-    def _make_msg(self) -> MagicMock:
-        msg = MagicMock(spec=discord.Message)
-        msg.edit = AsyncMock()
-        return msg
-
-    @pytest.mark.asyncio
-    async def test_timer_updates_embed_after_interval(self) -> None:
-        """After TOOL_TIMER_INTERVAL seconds, the embed should be updated with elapsed time."""
-        import c_lord.discord_ui.tool_timer as tt
-
-        msg = self._make_msg()
-        timer = LiveToolTimer(msg, self._bash_tool())
-
-        original_interval = tt.TOOL_TIMER_INTERVAL
-        tt.TOOL_TIMER_INTERVAL = 0.01  # speed up for test
-        try:
-            task = timer.start()
-            await asyncio.sleep(0.05)  # allow at least one tick
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        finally:
-            tt.TOOL_TIMER_INTERVAL = original_interval
-
-        msg.edit.assert_called()
-        # Elapsed time must be in description (title stays stable across ticks)
-        call_embed = msg.edit.call_args.kwargs.get("embed")
-        assert call_embed is not None
-        assert call_embed.description is not None
-        assert "s" in call_embed.description  # e.g. "⏳ 0s elapsed..."
-        assert "s)" not in call_embed.title  # title must NOT contain elapsed time
-
-    @pytest.mark.asyncio
-    async def test_timer_cancelled_stops_updates(self) -> None:
-        """After cancellation, no further edits should occur."""
-        import c_lord.discord_ui.tool_timer as tt
-
-        msg = self._make_msg()
-        timer = LiveToolTimer(msg, self._bash_tool())
-
-        original_interval = tt.TOOL_TIMER_INTERVAL
-        tt.TOOL_TIMER_INTERVAL = 0.01
-        try:
-            task = timer.start()
-            await asyncio.sleep(0.005)  # cancel before first tick
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        finally:
-            tt.TOOL_TIMER_INTERVAL = original_interval
-
-        msg.edit.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_run_claude_cancels_timer_on_tool_result(self) -> None:
-        """Timer task should be cancelled when the tool result arrives."""
-        import c_lord.cogs._run_helper as rh
-
-        thread = MagicMock(spec=discord.Thread)
-        thread.id = 11111
-        tool_msg = MagicMock(spec=discord.Message)
-        tool_msg.edit = AsyncMock()
-        tool_msg.embeds = [MagicMock(title="🔧 Running: az login...")]
-        thread.send = AsyncMock(return_value=tool_msg)
-
-        repo = MagicMock()
-        repo.save = AsyncMock()
-        runner = MagicMock()
-
-        events = [
-            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
-            StreamEvent(
-                message_type=MessageType.ASSISTANT,
-                tool_use=ToolUseEvent(
-                    tool_id="t1",
-                    tool_name="Bash",
-                    tool_input={"command": "az login --use-device-code"},
-                    category=ToolCategory.COMMAND,
-                ),
-            ),
-            StreamEvent(
-                message_type=MessageType.USER,
-                tool_result_id="t1",
-                tool_result_content="Device login complete",
-            ),
-            StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
-                session_id="sess-1",
-                cost_usd=0.01,
-                duration_ms=5000,
-            ),
-        ]
-
-        async def gen(*args, **kwargs):
-            for e in events:
-                yield e
-
-        runner.run = gen
-
-        original_interval = rh.TOOL_TIMER_INTERVAL
-        rh.TOOL_TIMER_INTERVAL = 100  # ensure timer never fires during this test
-        try:
-            await run_claude_in_thread(thread, runner, repo, "login", None)
-        finally:
-            rh.TOOL_TIMER_INTERVAL = original_interval
 
         # All timers should be cleared after run completes
         # (verified indirectly: no ghost tasks, session finishes cleanly)

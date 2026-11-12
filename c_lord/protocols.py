@@ -1,7 +1,7 @@
-"""Shared protocols for cross-Cog coordination.
+"""Structural interfaces that cogs can satisfy without inheriting from anything.
 
-Protocols use structural subtyping (PEP 544): any Cog that defines the
-required attributes satisfies the protocol — no explicit inheritance needed.
+A cog that wants to be waited for before a restart only has to expose the
+members named here; nothing in c-lord needs to know its class.
 """
 
 from __future__ import annotations
@@ -11,14 +11,13 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class DrainAware(Protocol):
-    """A Cog that tracks in-flight work and can report whether it is idle.
+    """Something that can say how much work it still has in flight.
 
-    AutoUpgradeCog auto-discovers all DrainAware Cogs registered on the bot
-    and waits for every one to reach ``active_count == 0`` before restarting.
-
-    Implementors only need to expose an ``active_count`` int property that
-    returns the number of currently running tasks/sessions.
+    ``AutoUpgradeCog`` holds the restart back until every cog that matches
+    this protocol reports zero.
     """
 
     @property
-    def active_count(self) -> int: ...
+    def active_count(self) -> int:
+        """How many units of work are running right now."""
+        ...

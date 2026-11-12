@@ -33,9 +33,6 @@ from c_lord.discord_ui.authorization import (
     set_default_authorizer,
     set_fallback_owner_ids,
 )
-from c_lord.discord_ui.elicitation_view import ElicitationFormView, ElicitationUrlView
-from c_lord.discord_ui.permission_view import PermissionView
-from c_lord.discord_ui.plan_view import PlanApprovalView
 from c_lord.discord_ui.views import ReopenSessionView, StatusShowAllView, StopView
 
 # ---------------------------------------------------------------------------
@@ -180,16 +177,6 @@ class TestInteractionCheck:
 
 def _build_view(cls_name: str, authorizer: Authorizer | None):
     runner = MagicMock()
-    if cls_name == "PermissionView":
-        return PermissionView(runner, MagicMock(), authorizer=authorizer)
-    if cls_name == "PlanApprovalView":
-        return PlanApprovalView(runner, "req-1", authorizer=authorizer)
-    if cls_name == "ElicitationUrlView":
-        req = MagicMock()
-        req.url = None  # skip the link-button branch
-        return ElicitationUrlView(runner, req, authorizer=authorizer)
-    if cls_name == "ElicitationFormView":
-        return ElicitationFormView(runner, MagicMock(), authorizer=authorizer)
     if cls_name == "StopView":
         return StopView(runner, authorizer=authorizer)
     if cls_name == "ReopenSessionView":
@@ -213,10 +200,6 @@ def _build_view(cls_name: str, authorizer: Authorizer | None):
 
 
 ALL_VIEWS = [
-    "PermissionView",
-    "PlanApprovalView",
-    "ElicitationUrlView",
-    "ElicitationFormView",
     "StopView",
     "ReopenSessionView",
     "StatusShowAllView",

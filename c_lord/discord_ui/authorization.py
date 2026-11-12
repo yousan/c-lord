@@ -39,8 +39,8 @@ make, never one it lets you make by accident.
 Usage (Views): list the mixin *before* ``discord.ui.View`` in the bases and
 store the authorizer on ``self._authorizer`` in ``__init__``::
 
-    class PlanApprovalView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
-        def __init__(self, runner, request_id, authorizer=None):
+    class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
+        def __init__(self, runner, authorizer=None):
             super().__init__(...)
             self._authorizer = authorizer
 """

@@ -130,10 +130,8 @@ Claude 子进程将 `DISCORD_THREAD_ID` 作为环境变量接收，因此运行�
 
 ### 交互式聊天
 - **Thread = Session** — Discord 线程与 Claude Code 会话 1:1 映射
-- **实时状态** — 表情反应：🧠 思考中，🛠️ 读取文件，💻 编辑中，🌐 网页搜索
-- **流式文本** — Claude 工作时中间助手文本实时显示
-- **工具结果显示** — 实时工具调用结果，含每 10 秒更新的耗时计数器
-- **扩展思考** — 推理以剧透标签 embed 显示（点击展开）
+- **实时状态** — 你的消息上的表情反应：🟢 运行中，🟡 轮到你（出错为 ❌，安静 10 秒 / 30 秒为 ⏳ / ⚠️）
+- **工具活动** — 不逐个工具发帖，而是从 Claude Code 自身的 transcript 读取：回合安静下来时显示一行进度（`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`），本回合的工具调用和进度语句作为 `progress.txt` 附在回答上（#723）
 - **会话持久化** — 通过 `--resume` 跨消息继续对话
 - **技能执行** — `/skill` 斜杠命令，含自动补全、可选参数、线程内恢复
 - **热重载** — `~/.claude/skills/` 中新增的技能自动加载（60 秒刷新，无需重启）
@@ -142,14 +140,11 @@ Claude 子进程将 `DISCORD_THREAD_ID` 作为环境变量接收，因此运行�
 - **附件支持** — 文本文件自动追加到提示（最多 5 个 × 50 KB）；图片通过 `--image` 标志下载传递（最多 4 × 5 MB）
 - **超时通知** — 超时时显示含耗时和恢复指引的 embed
 - **交互式问题** — `AskUserQuestion` 渲染为 Discord 按钮或下拉菜单；选择后会话继续；按钮在 bot 重启后仍可用
-- **Plan Mode** — Claude 调用 `ExitPlanMode` 时，Discord embed 显示完整计划并附带批准/取消按钮；仅在批准后 Claude 才继续执行；5 分钟超时自动取消
-- **工具权限请求** — Claude 需要执行工具权限时，Discord 显示带工具名称和输入的允许/拒绝按钮；2 分钟后自动拒绝
-- **MCP Elicitation** — MCP 服务器可通过 Discord 请求用户输入（表单模式：JSON schema 最多 5 个 Modal 字段；URL 模式：URL 按钮 + 完成确认）；5 分钟超时
-- **TodoWrite 实时进度** — Claude 调用 `TodoWrite` 时，发布单个 Discord embed 并在每次更新时就地编辑；显示 ✅ 已完成、🔄 进行中（带 `activeForm` 标签）、⬜ 待处理
+- **Plan Mode** — Claude 调用 `ExitPlanMode` 时，Claude Code 显示的批准菜单以与 `AskUserQuestion` 相同的方式桥接到 Discord：选项显示为按钮，Claude 按你的选择继续（#251）
+- **工具权限提示** — 不显示在 Discord 上：c-lord 在窗格内接受 Claude Code 的权限提示，回合不会停下。Claude 可以做什么由会话的 permission mode / 设置决定，而不是逐个工具的按钮
 - **线程面板** — 实时置顶 embed，显示各线程活跃/等待状态；需要输入时 @提及所有者
-- **Token 使用量** — 会话完成 embed 显示缓存命中率和 token 计数
-- **上下文使用量** — 会话完成 embed 中显示上下文窗口百分比（输入 + 缓存 token，不含输出）及自动压缩前剩余容量；超过 83.5% 时显示 ⚠️ 警告
-- **压缩检测** — 发生上下文压缩时在线程中通知（触发类型 + 压缩前 token 数）
+- **上下文使用量** — 每个回合结束时附一行页脚（`📊 7% context (69k/1.0M) · …`）：上下文窗口百分比（输入 + 缓存 token，不含输出）、模型、版本和费用；超过 83.5% 时变为 ⚠️ 警告（下一回合可能自动压缩）
+- **压缩通知** — 发生上下文压缩时，线程中出现一行 `🗜️ コンテキストを圧縮しました`（#628）
 - **会话中断** — 向活跃线程发送新消息会向正在运行的会话发送 SIGINT 并以新指令重新开始；无需手动 `/stop`
 - **长期停滞通知** — 30 秒无活动（扩展思考或上下文压缩）后发送线程消息；Claude 恢复时自动重置
 
@@ -505,11 +500,7 @@ c_lord/
     ask_view.py            # AskUserQuestion 的按钮/下拉菜单
     ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB 生命周期
     streaming_manager.py   # StreamingMessageManager — 防抖就地消息编辑
-    tool_timer.py          # LiveToolTimer — 长运行工具的耗时计数器
     thread_dashboard.py    # 显示会话状态的实时置顶 embed
-    plan_view.py           # Plan Mode 批准/取消按钮（ExitPlanMode）
-    permission_view.py     # 工具权限请求允许/拒绝按钮
-    elicitation_view.py    # MCP Elicitation 的 Discord UI（Modal 表单或 URL 按钮）
   session_sync.py          # CLI 会话发现和导入
   session_dir.py           # 每个线程一个 git 克隆（从不删除有未提交更改的目录）
   ext/
