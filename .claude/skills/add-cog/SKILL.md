@@ -132,7 +132,7 @@ Cog の中に同じものを書かない。`run_claude_in_thread()` は古い呼
 
 利用者に見えるコマンドや動きを足したなら、同じ PR で `docs/COMMANDS.md`（と `docs/ja/COMMANDS.md`）、
 必要なら `docs/specs/` に「あるべき動き」を書く。環境変数を足したら `.env.example` にも。
-CLAUDE.md の Project Structure にも 1 行足す。
+`docs/ARCHITECTURE.md` の全ファイル一覧（Every file）にも 1 行足す。
 
 ## 6. 通す
 

@@ -3,8 +3,8 @@
 How the pieces of c-lord fit together today: which process does what, what travels between
 Discord, tmux and Claude Code, and where to look in the code.
 
-> **一次情報は `CLAUDE.md`。** モジュールの一覧は `CLAUDE.md` の "Project Structure"、
-> それぞれの設計判断の経緯は "Key Design Decisions" と [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)、
+> **規則と設計判断の一次情報は `CLAUDE.md`。** 全ファイルの一覧はこの文書の末尾
+> （[Every file](#every-file)）、それぞれの設計判断の経緯は "Key Design Decisions" と [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)、
 > 利用者から見た個々の動きは [`specs/`](specs/README.md) にある。この文書は全体のつながりを説明する。
 > #53 以前の構成（`claude -p` を毎回起動して stream-json を読む `ClaudeRunner`）の説明は、
 > #724 と #1315 で取り除いた。
@@ -63,7 +63,8 @@ notifications or start a session. It is not part of how an answer is delivered.
 
 ## Modules by layer
 
-`CLAUDE.md` lists every file. The tables below name the ones that carry the architecture.
+The tables below name the modules that carry the architecture; [Every file](#every-file) at the
+end lists them all.
 
 ### Starting up
 
@@ -320,3 +321,140 @@ Discord shows from value types (`claude/types.py`) and reaches a pane only throu
 tmux manager it is handed — the ask bridge typing a clicked answer is the main case. Keeping it
 that way is what lets the runner be tested without Discord mocks and most UI components without
 tmux.
+
+## Every file
+
+Every file under `c_lord/`, with one line taken from its module docstring. `CLAUDE.md` carries only
+the short version of this tree — when you add a file, add it here.
+
+```
+c_lord/                        # Installable Python package
+  __init__.py                  # 公開 API（利用側が import する名前と __version__）
+  main.py                      # 単体で動かすときの入口（python -m c_lord.main）
+  cli.py                       # `c-lord` コマンド: setup（.env を作る）/ start / version
+  bot.py                       # Discord の Bot クラス（ClaudeDiscordBot）
+  setup.py                     # setup_bridge(): 全 Cog と常駐ループを 1 回の呼び出しで登録
+  protocols.py                 # Cog が継承なしで満たせるインターフェース（DrainAware）
+  version.py                   # 版の解決（git タグ由来、vX.Y.Z-b<commit>-<date>）
+  tmux.py                      # Tmux session management wrapper
+  session_dir.py               # Git clone based session directory management
+  coauthor.py                  # prepare-commit-msg hook: Co-authored-by trailers (#518)
+  command_gate.py              # 担当 (#596) / 認可 (#508) — text-command gate
+  legacy_env.py                # Startup notice for removed env switches (#712)
+
+  # ── ワークスペース（作業ディレクトリ）と git ──
+  workspace_dir.py  clord_home.py  git_mirrors.py  git_exclude.py
+  attachments.py  devenv.py  session_plugins.py
+  # ── ワークスペースの寿命（スリープ・停止・掃除）──
+  idle_sweep.py  idle_sleep.py  idle_stop.py  resident_cap.py  retention.py
+  orphan_dirs.py  stopped_sweep.py  session_cleanup.py  session_close.py
+  session_stop.py  tool_shells.py  workspace_notice.py  workspace_failure.py
+  # ── 継続と、再起動からの立て直し ──
+  session_resume.py  session_reattach.py  startup_recovery.py
+  ask_menu_recovery.py  ask_confirm_recovery.py  stale_stop_buttons.py
+  gateway_backfill.py  host_restart_notice.py  shutdown_watchdog.py
+  # ── ターンの状態 ──
+  concurrency.py  pane_running.py  turn_activity.py  turn_end_bus.py
+  turn_events.py  api_error.py  usage_limit.py  menu_ledger.py
+  # ── 誰の入力か・誰に知らせるか ──
+  denied_notice.py  notify_policy.py  thread_owner.py  thread_origin.py
+  voice_webhooks.py  login_alert.py  login_relay.py
+  # ── スレッド名 ──
+  thread_name.py  topic.py  issue_ref.py  thread_rename.py
+  thread_settings.py  thread_state_sync.py
+  # ── その他 ──
+  api_endpoint.py  discord_ref.py  discord_failures.py  log_sampler.py
+  model_scopes.py  status_view.py
+
+  cogs/
+    claude_chat.py             # 中心の Cog（スレッド作成、メッセージ処理）
+    skill_command.py           # /skill（オートコンプリートつき）
+    channel_repo.py            # /clord-init・/clord-thread-init（チャンネル / スレッドとリポジトリの bind）、
+                               # resolve_tmux_manager()
+    session_manage.py          # /clord-status、/workspace-*、/tmux-* などの管理コマンド
+    transcript_mirror.py       # jsonl transcript → スレッドへの転送。唯一の配信経路 (#71/#712)
+    webhook_trigger.py         # webhook → Claude Code のタスク実行（CI/CD）
+    auto_upgrade.py            # webhook / /upgrade → パッケージ更新 + 再起動
+    scheduler.py               # 定期タスクの実行（SQLite、マスターループ）
+    session_cleanup.py         # 掃除したセッション記録をスレッドに知らせる (#554)
+    version_cmd.py             # /version
+    event_processor.py         # ランナーのイベントを、そのターンに c-lord が出す投稿に変える
+    run_config.py              # 1 回の実行に要る引数をまとめた RunConfig
+    _run_helper.py             # Claude CLI を 1 ターン走らせる共有ロジック（DRY）
+  claude/
+    config.py                  # ClaudeConfig dataclass (CLI settings)
+    tmux_runner.py             # tmux pane runner — yields SYSTEM/RESULT events ONLY
+                               # (#723). Tool activity is read from the jsonl.
+                               # ASSISTANT text events are no longer yielded (#53).
+    types.py                   # セッションが報告・質問する内容の値型（StreamEvent ほか）
+    context_usage.py           # コンテキスト使用量（jsonl と /context から）
+  transcript/
+    mirror.py                  # スレッドごとの jsonl → Discord のパイプ
+    tail.py                    # 追記されていく jsonl を追う
+    resolver.py                # tmux の cwd から、いまの transcript を特定する
+    claim.py                   # c-lord が自分の transcript に名前を付ける (#773)
+    formatter.py               # jsonl の 1 イベントを Discord 向けの文字列にする
+    pane_echo.py               # c-lord 自身がペインに打った本文の控え (#682/#808)
+    recovery.py                # 最後に完了したターンの回答を jsonl から取り戻す
+    repeat_fold.py             # 同じ行の暴走的な繰り返しを 1 通に畳む (#747)
+    ask_result.py              # AskUserQuestion の実際の結果を transcript から読む (#651)
+    subagents.py               # サブエージェントのしたことを Discord に出す (#971)
+  skills/                      # Per-session SKILL.md generator
+    discord_read.py            # discord-read SKILL.md template (#259) — reads other
+                               # Discord channels; nothing to do with delivery
+    injector.py                # Writes discord-read into <session_dir>/.claude/skills/
+                               # and scrubs the retired output skills (#712)
+    reply_tracker.py           # 各スレッドに最後に投稿した回答メッセージの記録（メモリ上）
+  database/
+    models.py                  # SQLite のスキーマと初期化
+    repository.py              # セッションの CRUD（スレッド ↔ セッション）
+    channel_repo.py            # channel_repo_bindings（チャンネルの bind）
+    thread_repo.py             # thread_repo_bindings（スレッドの bind）
+    task_repo.py               # 定期タスクの CRUD（SchedulerCog）
+    notification_repo.py       # 予約通知の CRUD（REST API）
+    settings_repo.py           # bot 設定の key-value
+    ask_repo.py                # 回答待ちの AskUserQuestion
+    resume_repo.py             # 再起動後に再開するセッション
+    lounge_repo.py             # AI Lounge のメッセージ
+    menu_bridge_repo.py        # watchdog が Discord に橋渡し済みのメニュー (#633)
+    sweep_cursor_repo.py       # 起動時の「死んだボタン」掃除の読み進み位置 (#752)
+    devenv_repo.py             # ワークスペース ↔ 開発環境（docker）の対応 (#573)
+  discord_ui/
+    status.py                  # Emoji reaction status manager (applied immediately)
+    embeds.py                  # Discord embed の組み立て
+    reply_chunker.py           # 長い返信を Discord に送れる長さに分ける
+    turn_progress.py           # ターン中の長い沈黙を埋める、自己更新の 1 行 (#539)
+    views.py                   # セッション操作のボタン（Stop など）
+    authorization.py           # 誰が c-lord を動かせるか — 許可リストの唯一の規則 (#466/#713)
+    ask_handler.py  ask_view.py  ask_bus.py  ask_menus.py
+                               # AskUserQuestion / plan 承認のボタンと、その経路
+    bridged_context.py  pane_context.py
+                               # メニュー直前の地の文を二重に出さないための記録 (#399/#686)
+    thread_dashboard.py        # 📊 Session Status（全スレッドの状態を示す embed）
+    subagent_poster.py         # サブエージェントのログの Discord 側 (#971)
+    lamp_recovery.py           # 再起動で取り残されたランプを戻す (#718)
+    slash_io.py                # スラッシュコマンドの応答（ephemeral を守る、#748）
+    error_reporting.py         # View 共通の on_error (#444)
+    permission_help.py         # Discord API の権限エラーを、対処の分かる文面にする (#443)
+    table_renderer.py  pane_renderer.py  conversation_renderer.py  fonts.py
+                               # 画像の描画（表、tmux ペイン、モック）。c-lord[table] が要る
+                               # NOTE: chunker.py / streaming_manager.py /
+                               # tui_strip.py / progress_buffer.py were removed in
+                               # #53 — the scrape→post path they served is gone.
+  coordination/
+    service.py                 # 共有の連絡チャンネルへの 1 行アナウンス
+    env.py                     # COORDINATION_CHANNEL_ID の読み取り (#1194)
+  ext/
+    api_server.py              # REST API control plane — always started (#712/#543);
+                               # a taken port logs a WARNING, it never kills the bot.
+    peer_uid.py                # loopback 接続の相手がどの Unix ユーザーか (#457)
+  utils/
+    logger.py                  # ログの設定と、[thread=…] の前置き（log_ctx）
+tests/                         # pytest のテスト（e2e/ は実機が要るので既定では走らない）
+scripts/                       # staging.sh、release.sh、証跡の撮影・アップロード、fuzz/、monitor/
+deploy/c-lord.service          # 本番の systemd unit
+docs/                          # 理念、仕様（specs/）、利用者ガイド、STAGING、SECURITY ほか
+pyproject.toml                 # パッケージのメタデータと依存
+uv.lock                        # 依存のロックファイル
+CONTRIBUTING.md                # コントリビューションの案内
+```
