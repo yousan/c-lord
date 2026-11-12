@@ -1,6 +1,6 @@
 # c-lord (c-lord)
 
-Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a personal bot.**
+Claude Code CLI を Discord から使うためのフロントエンド。**このリポジトリはフレームワーク（OSS ライブラリ）であって、個人用の bot ではない。**
 
 **略称: c-lord** (c-lord)
 
@@ -8,27 +8,27 @@ Discord frontend for Claude Code CLI. **This is a framework (OSS library), not a
 
 C-lord が「何のため・誰のどの痛みを解決するか」を定めた理念は **[docs/PHILOSOPHY.md](docs/PHILOSOPHY.md)** にある。機能や仕様の良し悪しで迷ったとき、コードや好みではなく**まずこの理念に照らして判断する**。理念と現実がぶつかったら「理念を見直す / 例外として記録する / 実装上の制約として切り分ける」のいずれかを明示的に選ぶ。下の各規律（行動規範・DoD 等）はこの理念の手段side。
 
-## Framework vs Instance
+## Framework vs Instance — 何をこのリポジトリに置くか
 
 - **c-lord** (this repo) = reusable OSS framework. No personal config, no secrets, no server-specific logic.
 - Personal instances (e.g. a personal Discord bot) install this as a package and import the Cog. The instance repo handles server-specific config, additional Cogs, and secrets.
-- When adding features: if it's useful to anyone → add here. If it's personal workflow → add in the instance repo.
+- 機能を足すときの振り分け: 誰にとっても役に立つものはこのリポジトリへ。個人のワークフローはインスタンス側のリポジトリへ。
 
-### Zero-Config Principle (Critical)
+### Zero-Config Principle（最重要）
 
-**Consumers must get new features by updating the package alone — no code changes required.**
+**利用側は、パッケージを更新するだけで新機能を受け取れなければならない。利用側のコード変更を前提にしない。**
 
-- New features should be enabled by default (auto-discovery, sensible defaults)
-- New constructor parameters must have backward-compatible defaults (`= None`)
+- 新機能は既定で有効にする（自動検出と、そのまま使える既定値）
+- コンストラクタに引数を足すときは、後方互換な既定値（`= None`）を必ず付ける
 - If a feature requires consumers to wire something up, the design is wrong — fix it in c-lord
 - Consumers should NEVER need to copy, wrap, or subclass c-lord Cogs. If they do, c-lord is missing an extension point
 
-## Architecture
+## Architecture（土台にしているもの）
 
-- **Python 3.10+** with discord.py v2
-- **Cog pattern** for modular features
-- **Repository pattern** for data access (SQLite via aiosqlite)
-- **asyncio.subprocess** for Claude Code CLI invocation (never shell=True)
+- 言語とライブラリ: **Python 3.10 以上**、discord.py v2
+- 機能は **Cog** 単位に分けて足す
+- データアクセスは **Repository パターン**（aiosqlite 経由の SQLite）
+- Claude Code CLI まわりのプロセス起動は **asyncio.subprocess**（`shell=True` は決して使わない）
 
 ## Key Design Decisions
 
@@ -40,7 +40,7 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
    - **transcript が 1 本も見つからないとき、ミラーは黙るが黙っていることは隠さない** (#773/#585): ターンが走っているスレッドには「転送できていない」と 1 ターン 1 回投稿し、ログには `ERROR` を出す。アイドルのスレッド（`on_ready` で復元されたミラー）には投稿せず、ログも `ERROR` ではなく**スレッドごとに 1 時間 1 行の `WARNING`**（#810 — アイドル分が本番 ERROR の 99.99% を占めて本物を埋めていた）。
    - **REST API (`ext/api_server.py`) は配信経路ではなく制御面**なので、bridge とは無関係に**常に起動する** (#712/#543)。ポートが埋まっていれば WARNING を出して API 無しで動き続ける（bot 本体は落とさない）。
    - 残っている非等価性: reply 層の装飾 (quote-reply / cli-prefix / prompt-choice) が経路A にあって経路B にまだ無い (#237)。添付ファイルは #233 で解消済み — ミラーが harness の `SendUserFile` `tool_use` を jsonl から読んで自分で添付する (`docs/specs/user-file-delivery.md`)。
-2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
+2. **Thread = Session**: one Discord thread is one Claude Code session ID, 1:1. A reply in the thread carries the same session on with `--resume`.
 3. **Emoji reactions for status** (#246): The per-turn lamp is a single reaction on the user's trigger message — 🟢 running (kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall as temporary overrides. Applied immediately (no debounce). Reactions use a different Discord rate-limit bucket than thread renames, so this replaced the per-turn thread-name lamp that saturated the ~2-renames-per-10-min limit (#241); the thread-name 🟢/🟡 is now a slow, poll-driven sidebar view that is **off by default** (#329 — opt in with `CLORD_THREAD_LAMP=1`). See `docs/specs/thread-lamp.md`.
    - **🗜️ compact のリアクションは無い** (#753/#1316): かつて `StatusManager.set_compact()` と `EventProcessor._on_system` の compaction 分岐があったが、`StreamEvent.is_compact` をセットする箇所が無く一度も到達しない（実測: 2026-06-10〜09-18 のリアクション 1,493 個に 🗜️ は 0 件）ので、**#1316 で `set_compact()`・`EMOJI_COMPACT`・その分岐ごと消した**。文脈圧縮が利用者に見えるのは、ミラーがスレッドに出す `🗜️ コンテキストを圧縮しました` の1行だけ (#628。minimal モードでも `progress.txt` に畳まずスレッドに出す — #914)。
 4. **ツールの実行状況は embed ではなく jsonl ミラー由来の 2 か所に出る** (#723): `tmux_runner.py` はいまも `capture-pane` を polling しているが、**yield するイベントは SYSTEM と RESULT の 2 種だけ**。SYSTEM は (a) session_id を DB に保存させる合成イベント、(b) TUI のメニューを Discord のボタンへ橋渡しする `pane_ask` (#166/#251)、(c) 未知の対話プロンプトを知らせる `unknown_tui_prompt` の 3 用途。RESULT はターン完了 / エラー / usage limit。**`tool_use` / `todo_list` / `permission_request` / `elicitation` / `thinking` をセットする箇所はコードのどこにも無い**ので、それを描く側（`tool_use_embed()` ほかの embed builder、`discord_ui/tool_timer.py`、`permission_view.py` / `plan_view.py` / `elicitation_view.py`、`EventProcessor._handle_tool_use()` ほか）は本番で一度も呼ばれていなかった（実測: 2026-06-05〜2026-09-11 の bot メッセージ 10,607 通に tool-use embed は 0 件）。**#1316 でまとめて消した**。`EventProcessor` に残っているのは session_id の保存・`pane_ask` の橋渡し・未知プロンプトの警告・ターン終わりのランプとエラー embed・session-start embed の後片付けだけ。
@@ -48,9 +48,9 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
    - **permission プロンプトは Discord に出ない** — `tmux_runner._accept_permission_prompt()` がペイン内で自動承認する。**plan 承認 (ExitPlanMode) と AskUserQuestion は同じ `pane_ask` の ask bridge** を通って Discord のボタンになる (#166/#251、`discord_ui/ask_handler.py`)。ステータス絵文字はターン開始と SYSTEM / RESULT から駆動される (決定 3)。
    - `StreamEvent`（`claude/types.py`）には `tool_use` / `todo_list` / `permission_request` / `elicitation` / `is_compact` などの**誰もセットも参照もしないフィールドが残っている**（#1316 では `types.py` を触らなかった）。runner のイベントから embed を出す仕組みを戻すなら、まず「誰がそのフィールドをセットするのか」から作ること — ツールの様子は上の 2 か所（jsonl ミラー）に出すのが今の設計。
 5. **Installable package**: `c_lord` is a proper Python package. Consumers install via `uv add git+...` or `pip install git+...`, not by copying files.
-6. **Shared run helper**: `cogs/_run_helper.py` centralizes Claude CLI execution logic used by both ClaudeChatCog and SkillCommandCog.
+6. **Shared run helper**: the logic that runs the Claude CLI lives in one place, `cogs/_run_helper.py`, and both ClaudeChatCog and SkillCommandCog go through it.
 7. **REST API as the control plane**: Claude Code subprocesses communicate back to c-lord via REST API (`CLORD_API_URL` env var — `start_claude` puts it on the `claude` command line with the port the API **actually bound**, which need not be `CLORD_API_PORT`: an unpinned API walks past a taken port, #258. Between #712 and #258 no session received it at all), not via stdout markers or special output formats. This makes the interface explicit, testable, and usable by external systems (GitHub Actions, etc.). See `ext/api_server.py`.
-8. **SQLite-backed dynamic scheduler**: Scheduled tasks are stored in `scheduled_tasks` DB table and executed by a single `discord.ext.tasks` master loop (every 30s). Tasks are registered at runtime via REST API — no code changes needed to add new tasks. `discord.ext.tasks` decorators are only used for the master loop, not per-task (they're static/compile-time constructs).
+8. **SQLite-backed dynamic scheduler**: a scheduled task is a row in the `scheduled_tasks` DB table, and one `discord.ext.tasks` master loop (every 30s) runs whatever is due. Tasks are registered at runtime through the REST API, so adding one needs no code change. The `discord.ext.tasks` decorator is used for that master loop only, never per task (decorators are static/compile-time constructs).
 9. **Claude handles "what", c-lord handles "when"**: For scheduled tasks, c-lord only manages the schedule. All domain logic (what to check, how to deduplicate, what to post) lives in the Claude prompt. No GitHub/AzureDevOps-specific code in c-lord itself.
 10. **tmux session name follows the *repo*, not the channel** (auto-derived from the binding): the session name comes from the repo URL (`derive_session_name()` → e.g. `https://github.com/yousan/c-lord` → `c-lord`), with one window per thread (`w1`, `w2`, ...). In the common case a channel is bound via `/clord-init` and all its threads share that one session. A thread bound to a *different* repo (`/clord-thread-init`) gets the session of **its own** repo — session_dir and tmux session then still agree, which is the point (#427). Channels without a binding fall back to the global default `clord` session. Implemented in `c_lord/cogs/channel_repo.py::resolve_tmux_manager()` (cached per channel and per thread) and consumed by `claude_chat`, `skill_command`, `session_manage`, `webhook_trigger`, `scheduler` cogs. **Sessions are addressed by exact name** (`-t =<name>`, window `=<name>:<window>` — #1120): tmux's `-t <name>` is a prefix match, so a thread bound to `x/foo` got its window inside an existing `foobar` session when `foo` did not exist yet. **Do not assume a single global session, and always pass `thread_id` when a thread is in scope — `resolve_tmux_manager(channel_id, thread_id=...)`.** Omitting it silently resolves the parent channel's session, which is exactly the bug #427 fixed. When a thread's binding changes after its window already exists, `TmuxSessionManager.create_session()` **moves** that window into the newly-resolved session rather than creating a second one (a duplicate window would mean two Claude processes on one checkout). **どのセッションであれ、実体は 1 台の tmux サーバ**なので、サーバを落とす操作はフリート全滅と同義: 実機 tmux の検証は必ず `-L <ソケット名>` で分離する（[docs/STAGING.md](docs/STAGING.md#実機-tmux-を触る検証は必ず--l-で分離する-701)、#701）。落ちた場合に走っていたスレッドへ理由を出す仕組みは [`docs/specs/fleet-tmux-restart.md`](docs/specs/fleet-tmux-restart.md)。
 11. **Commits record who asked for them** (#518): every session dir gets a `prepare-commit-msg` hook (`c_lord/coauthor.py`) that appends `Co-authored-by: <Discord 表示名> <<user_id>@users.noreply.discord.com>` plus Claude's own trailer to any commit Claude makes there. The hook is refreshed on every turn by `create_session_dir(thread_id, coauthor=...)`, so the trailer names **the user who triggered that turn** — not whoever created the thread. A hook, not a prompt instruction: an instruction depends on Claude remembering, which is the #491 failure mode. The display name never enters the hook script (it is written to `<git_dir>/clord-coauthors` and read as data), so a hostile display name cannot become shell. Every failure path in the hook exits 0 — trailers must never be able to fail a commit. Foreign `prepare-commit-msg` hooks are never overwritten. The hook is only ever written inside the session's own `.git`: if `core.hooksPath` points into the working tree (`git-hooks/`, `.husky/` — `yousan/openclaw` is one) or outside the checkout, nothing is installed, that session's commits carry **no** `Co-authored-by`, and a WARNING is logged (#1141). Opt out with `CLORD_COAUTHOR=0`. あるべき動きは `docs/specs/commit-coauthors.md`。
@@ -60,13 +60,15 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
 
 Alternative considered: Claude embeds `<!-- c-lord:schedule {...} -->` in response text; c-lord parses stdout.
 
-**Rejected because**: fragile text parsing, untestable, can't be triggered externally, implicit side effect from output.
+**Why it was rejected**: parsing free text is fragile, it cannot be tested, nothing outside can trigger it, and it makes output carry an implicit side effect.
 
 **REST API chosen because**: clean interface, independently testable, usable by external systems, already an established c-lord pattern (`ext/api_server.py`). Claude uses its Bash tool to `curl $CLORD_API_URL/api/tasks`.
 
-## Development
+## Development（開発の始め方）
 
-### Setup
+### セットアップ
+
+依存は `uv` で入れる。
 
 ```bash
 git clone https://github.com/yousan/c-lord.git
@@ -74,28 +76,28 @@ cd c-lord
 uv sync --dev
 ```
 
-### Running Tests
+### テストを流す
 
 ```bash
 uv run pytest tests/ -v --cov=c_lord
 ```
 
-All tests must pass before submitting a PR. CI runs on Python 3.10, 3.11, and 3.12.
+PR を出す前に、全テストが通っていること。CI は Python 3.10 / 3.11 / 3.12 の 3 つで走る。
 
-### Linting & Formatting
+### lint と format
 
 ```bash
 uv run ruff check c_lord/    # lint
 uv run ruff format c_lord/   # format
 ```
 
-CI enforces both `ruff check` and `ruff format --check`. Fix all issues before pushing.
+CI は `ruff check` と `ruff format --check` の両方を必須にしている。push する前に指摘をすべて直す。
 
-### Running (standalone)
+### 単体で動かす（standalone）
 
 ```bash
 cp .env.example .env
-# Edit .env with your Discord bot token and channel ID
+# .env に Discord の bot token とチャンネル ID を書く
 uv run python -m c_lord.main
 ```
 
@@ -230,128 +232,211 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 
 これでも切り分かないときは Discord 側の状態 (リアクション・スレッド存在・最終メッセージの author) を上の curl で確認するのが速い。
 
-## Code Conventions
+## Code Conventions（コード規約）
 
-### Style
+### Style — 書式
 
-- **Formatter/Linter**: ruff (config in `pyproject.toml`)
-- **Type hints**: Required on all function signatures
-- **Python**: 3.10+ — use `from __future__ import annotations` in every file
-- **Line length**: 100 characters max
-- **Imports**: Sorted by ruff (`I` rule). Use `TYPE_CHECKING` for type-only imports
+- **整形と lint**: ruff（設定は `pyproject.toml`）
+- **型ヒント**: すべての関数シグネチャに必須
+- **Python**: 3.10 以上。`from __future__ import annotations` を全ファイルに書く
+- **行の長さ**: 100 文字まで
+- **import**: 並びは ruff（`I` ルール）に任せる。型にしか使わない import は `TYPE_CHECKING` の下に置く
 
-### Error Handling
+### Error Handling — エラーの扱い
 
-- Use `contextlib.suppress(discord.HTTPException)` for Discord API calls that may fail (reactions, message edits)
-- Never silently swallow errors in business logic — log them
-- CLI subprocess errors should yield a `StreamEvent` with `error` field, not raise exceptions
+- 失敗しうる Discord API 呼び出し（リアクション、メッセージの編集）は `contextlib.suppress(discord.HTTPException)` で包む
+- ビジネスロジックのエラーは黙って握りつぶさない — ログに出す
+- CLI のサブプロセスで起きたエラーは、例外を投げずに `error` フィールドを持つ `StreamEvent` として yield する
 
 ### Security (Critical — Auto-Enforced)
 
-This project runs arbitrary Claude Code sessions. Security is non-negotiable.
+このプロジェクトは任意の Claude Code セッションを走らせる。セキュリティに妥協の余地は無い。
 
-**Before every commit**, run the security audit (see `.claude/skills/security-audit/SKILL.md`):
+**コミットの前に毎回**、セキュリティ監査を通す（手順は `.claude/skills/security-audit/SKILL.md`）。守ること:
 
-- **Always `create_subprocess_exec`**: Never use `shell=True`. The prompt is a direct argument, not shell-interpolated.
-- **`--` separator**: Always use `--` before the prompt argument to prevent flag injection
-- **Session ID validation**: Strict regex `^[a-f0-9\-]+$` before passing to `--resume`
-- **Skill name validation**: Strict regex `^[\w-]+$` before passing to Claude
+- **必ず `create_subprocess_exec`**: `shell=True` は決して使わない。プロンプトは引数としてそのまま渡し、シェルに展開させない
+- **`--` 区切り**: プロンプトの引数の前には必ず `--` を置く（フラグとして解釈されるのを防ぐ）
+- **session ID の検証**: `--resume` に渡す前に、厳密な正規表現 `^[a-f0-9\-]+$` で検証する
+- **スキル名の検証**: Claude に渡す前に、厳密な正規表現 `^[\w-]+$` で検証する
 - **Environment stripping (#353)**: `SENSITIVE_ENV_KEYS` (`c_lord/tmux.py`) are kept out of the tmux server env, marked `set-environment -r` on bot-managed sessions, and `env -u`'d on the `claude` command line. This prevents **accidental inheritance** (the #322 contamination vector — a process started in a pane silently becoming a second production bot). It does **not** make the token secret from the session: `.env` is readable by the same Unix user and the `discord-read` skill reads it from there (see `docs/SECURITY.md`)
-- **No `dangerously_skip_permissions` by default**: This flag exists for advanced users who understand the risk
+- **`dangerously_skip_permissions` は既定で使わない**: このフラグは、リスクを理解している上級者のために残してあるもの
 
 If you modify `tmux_runner.py`, `_run_helper.py`, or any Cog, the security audit is **mandatory** before committing.
 
-### Naming
+### Naming — 命名
 
-- Files: `snake_case.py`
-- Classes: `PascalCase` (e.g., `ClaudeRunner`, `StatusManager`)
-- Functions/methods: `snake_case`
-- Private: prefix with `_` (e.g., `_build_args`, `_run_helper.py`)
-- Constants: `UPPER_SNAKE_CASE`
+- ファイル: `snake_case.py`
+- クラス: `PascalCase`（例: `TmuxClaudeRunner`、`StatusManager`）
+- 関数・メソッド: `snake_case`
+- 非公開のもの: 先頭に `_`（例: `_session_flags`、`_run_helper.py`）
+- 定数: `UPPER_SNAKE_CASE`
 
 ### Testing (TDD Enforced)
 
-**All new features and bug fixes MUST follow TDD: write tests FIRST, then implement.**
+**新機能もバグ修正も、必ず TDD で進める: テストを先に書き、それから実装する。**
 
-1. **RED**: Write a failing test → `uv run pytest tests/test_xxx.py -v` → confirm it FAILS
-2. **GREEN**: Write minimal code to pass → confirm it PASSES
-3. **REFACTOR**: Clean up, keeping tests green
+1. **RED**: 落ちるテストを書く → `uv run pytest tests/test_xxx.py -v` → **落ちる**ことを確かめる
+2. **GREEN**: 通すための最小のコードを書く → **通る**ことを確かめる
+3. **REFACTOR**: テストを緑に保ったまま整える
 4. **VERIFY**: `uv run ruff check c_lord/ && uv run pytest tests/ -v --cov=c_lord`
 
-See `.claude/skills/tdd/SKILL.md` for detailed patterns per module type.
+モジュールの種類ごとの詳しい進め方は `.claude/skills/tdd/SKILL.md`。
 
-- Use `pytest` with `pytest-asyncio` (auto mode)
-- Test files go in `tests/` mirroring the source structure
-- Pure logic (parser, chunker, types): 90%+ coverage
-- Discord-dependent code (Cogs, StatusManager): use mocks, 30%+ coverage
-- **Never write implementation code without a corresponding test**
+- `pytest` と `pytest-asyncio`（auto モード）を使う
+- テストは `tests/` に、ソースの構成に対応させて置く
+- 純粋なロジック（parser, chunker, types）: カバレッジ 90%+
+- Discord に依存するコード（Cog、StatusManager）: モックを使い、30%+
+- **対応するテストの無い実装コードを書かない**
 
-## Project Structure
+## Project Structure（どこに何があるか）
+
+`c_lord/` に実在するファイルの一覧。説明は各ファイル冒頭の docstring をもとにしている。ファイルを足したら、ここにも足す。
 
 ```
-c_lord/          # Installable Python package
-  __init__.py            # Public API exports
-  protocols.py           # Shared protocols (DrainAware)
-  main.py                # Standalone entry point
-  bot.py                 # Discord Bot class
-  session_dir.py         # Git clone based session directory management
-  coauthor.py            # prepare-commit-msg hook: Co-authored-by trailers (#518)
-  command_gate.py        # 担当 (#596) / 認可 (#508) — text-command gate
-  tmux.py                # Tmux session management wrapper
+c_lord/                        # Installable Python package
+  __init__.py                  # 公開 API（利用側が import する名前と __version__）
+  main.py                      # 単体で動かすときの入口（python -m c_lord.main）
+  cli.py                       # `c-lord` コマンド: setup（.env を作る）/ start / version
+  bot.py                       # Discord の Bot クラス（ClaudeDiscordBot）
+  setup.py                     # setup_bridge(): 全 Cog と常駐ループを 1 回の呼び出しで登録
+  protocols.py                 # Cog が継承なしで満たせるインターフェース（DrainAware）
+  version.py                   # 版の解決（git タグ由来、vX.Y.Z-b<commit>-<date>）
+  tmux.py                      # Tmux session management wrapper
+  session_dir.py               # Git clone based session directory management
+  coauthor.py                  # prepare-commit-msg hook: Co-authored-by trailers (#518)
+  command_gate.py              # 担当 (#596) / 認可 (#508) — text-command gate
+  legacy_env.py                # Startup notice for removed env switches (#712)
+
+  # ── ワークスペース（作業ディレクトリ）と git ──
+  workspace_dir.py  clord_home.py  git_mirrors.py  git_exclude.py
+  attachments.py  devenv.py  session_plugins.py
+  # ── ワークスペースの寿命（スリープ・停止・掃除）──
+  idle_sweep.py  idle_sleep.py  idle_stop.py  resident_cap.py  retention.py
+  orphan_dirs.py  stopped_sweep.py  session_cleanup.py  session_close.py
+  session_stop.py  tool_shells.py  workspace_notice.py  workspace_failure.py
+  # ── 継続と、再起動からの立て直し ──
+  session_resume.py  session_reattach.py  startup_recovery.py
+  ask_menu_recovery.py  ask_confirm_recovery.py  stale_stop_buttons.py
+  gateway_backfill.py  host_restart_notice.py  shutdown_watchdog.py
+  # ── ターンの状態 ──
+  concurrency.py  pane_running.py  turn_activity.py  turn_end_bus.py
+  turn_events.py  api_error.py  usage_limit.py  menu_ledger.py
+  # ── 誰の入力か・誰に知らせるか ──
+  denied_notice.py  notify_policy.py  thread_owner.py  thread_origin.py
+  voice_webhooks.py  login_alert.py  login_relay.py
+  # ── スレッド名 ──
+  thread_name.py  topic.py  issue_ref.py  thread_rename.py
+  thread_settings.py  thread_state_sync.py
+  # ── その他 ──
+  api_endpoint.py  discord_ref.py  discord_failures.py  log_sampler.py
+  model_scopes.py  status_view.py
+
   cogs/
-    claude_chat.py       # Main chat Cog (thread creation, message handling)
-    skill_command.py     # /skill slash command with autocomplete
-    webhook_trigger.py   # Webhook → Claude Code task execution (CI/CD)
-    auto_upgrade.py      # Webhook → package upgrade + restart
-    scheduler.py         # Scheduled task executor (SQLite-backed, master loop)
-    _run_helper.py       # Shared Claude CLI execution logic (DRY)
+    claude_chat.py             # 中心の Cog（スレッド作成、メッセージ処理）
+    skill_command.py           # /skill（オートコンプリートつき）
+    channel_repo.py            # /clord-init・/clord-thread-init（チャンネル / スレッドとリポジトリの bind）、
+                               # resolve_tmux_manager()
+    session_manage.py          # /clord-status、/workspace-*、/tmux-* などの管理コマンド
+    transcript_mirror.py       # jsonl transcript → スレッドへの転送。唯一の配信経路 (#71/#712)
+    webhook_trigger.py         # webhook → Claude Code のタスク実行（CI/CD）
+    auto_upgrade.py            # webhook / /upgrade → パッケージ更新 + 再起動
+    scheduler.py               # 定期タスクの実行（SQLite、マスターループ）
+    session_cleanup.py         # 掃除したセッション記録をスレッドに知らせる (#554)
+    version_cmd.py             # /version
+    event_processor.py         # ランナーのイベントを、そのターンに c-lord が出す投稿に変える
+    run_config.py              # 1 回の実行に要る引数をまとめた RunConfig
+    _run_helper.py             # Claude CLI を 1 ターン走らせる共有ロジック（DRY）
   claude/
-    config.py            # ClaudeConfig dataclass (CLI settings)
-    tmux_runner.py       # tmux pane runner — yields SYSTEM/RESULT events ONLY
-                         # (#723). Tool activity is read from the jsonl.
-                         # ASSISTANT text events are no longer yielded (#53).
-    types.py             # Type definitions for SDK messages
-  legacy_env.py          # Startup notice for removed env switches (#712)
-  skills/                # Per-session SKILL.md generator
-    discord_read.py      # discord-read SKILL.md template (#259) — reads other
-                         # Discord channels; nothing to do with delivery
-    injector.py          # Writes discord-read into <session_dir>/.claude/skills/
-                         # and scrubs the retired output skills (#712)
+    config.py                  # ClaudeConfig dataclass (CLI settings)
+    tmux_runner.py             # tmux pane runner — yields SYSTEM/RESULT events ONLY
+                               # (#723). Tool activity is read from the jsonl.
+                               # ASSISTANT text events are no longer yielded (#53).
+    types.py                   # セッションが報告・質問する内容の値型（StreamEvent ほか）
+    context_usage.py           # コンテキスト使用量（jsonl と /context から）
+  transcript/
+    mirror.py                  # スレッドごとの jsonl → Discord のパイプ
+    tail.py                    # 追記されていく jsonl を追う
+    resolver.py                # tmux の cwd から、いまの transcript を特定する
+    claim.py                   # c-lord が自分の transcript に名前を付ける (#773)
+    formatter.py               # jsonl の 1 イベントを Discord 向けの文字列にする
+    pane_echo.py               # c-lord 自身がペインに打った本文の控え (#682/#808)
+    recovery.py                # 最後に完了したターンの回答を jsonl から取り戻す
+    repeat_fold.py             # 同じ行の暴走的な繰り返しを 1 通に畳む (#747)
+    ask_result.py              # AskUserQuestion の実際の結果を transcript から読む (#651)
+    subagents.py               # サブエージェントのしたことを Discord に出す (#971)
+  skills/                      # Per-session SKILL.md generator
+    discord_read.py            # discord-read SKILL.md template (#259) — reads other
+                               # Discord channels; nothing to do with delivery
+    injector.py                # Writes discord-read into <session_dir>/.claude/skills/
+                               # and scrubs the retired output skills (#712)
+    reply_tracker.py           # 各スレッドに最後に投稿した回答メッセージの記録（メモリ上）
   database/
-    models.py            # SQLite schema
-    repository.py        # Session CRUD operations
-    notification_repo.py # Scheduled notification CRUD (REST API)
-    task_repo.py         # Scheduled task CRUD (SchedulerCog)
+    models.py                  # SQLite のスキーマと初期化
+    repository.py              # セッションの CRUD（スレッド ↔ セッション）
+    channel_repo.py            # channel_repo_bindings（チャンネルの bind）
+    thread_repo.py             # thread_repo_bindings（スレッドの bind）
+    task_repo.py               # 定期タスクの CRUD（SchedulerCog）
+    notification_repo.py       # 予約通知の CRUD（REST API）
+    settings_repo.py           # bot 設定の key-value
+    ask_repo.py                # 回答待ちの AskUserQuestion
+    resume_repo.py             # 再起動後に再開するセッション
+    lounge_repo.py             # AI Lounge のメッセージ
+    menu_bridge_repo.py        # watchdog が Discord に橋渡し済みのメニュー (#633)
+    sweep_cursor_repo.py       # 起動時の「死んだボタン」掃除の読み進み位置 (#752)
+    devenv_repo.py             # ワークスペース ↔ 開発環境（docker）の対応 (#573)
   discord_ui/
-    status.py            # Emoji reaction status manager (applied immediately)
-    embeds.py            # Discord embed builders
-                         # NOTE: chunker.py / streaming_manager.py /
-                         # tui_strip.py / progress_buffer.py were removed in
-                         # #53 — the scrape→post path they served is gone.
+    status.py                  # Emoji reaction status manager (applied immediately)
+    embeds.py                  # Discord embed の組み立て
+    reply_chunker.py           # 長い返信を Discord に送れる長さに分ける
+    turn_progress.py           # ターン中の長い沈黙を埋める、自己更新の 1 行 (#539)
+    views.py                   # セッション操作のボタン（Stop など）
+    authorization.py           # 誰が c-lord を動かせるか — 許可リストの唯一の規則 (#466/#713)
+    ask_handler.py  ask_view.py  ask_bus.py  ask_menus.py
+                               # AskUserQuestion / plan 承認のボタンと、その経路
+    bridged_context.py  pane_context.py
+                               # メニュー直前の地の文を二重に出さないための記録 (#399/#686)
+    thread_dashboard.py        # 📊 Session Status（全スレッドの状態を示す embed）
+    subagent_poster.py         # サブエージェントのログの Discord 側 (#971)
+    lamp_recovery.py           # 再起動で取り残されたランプを戻す (#718)
+    slash_io.py                # スラッシュコマンドの応答（ephemeral を守る、#748）
+    error_reporting.py         # View 共通の on_error (#444)
+    permission_help.py         # Discord API の権限エラーを、対処の分かる文面にする (#443)
+    table_renderer.py  pane_renderer.py  conversation_renderer.py  fonts.py
+                               # 画像の描画（表、tmux ペイン、モック）。c-lord[table] が要る
+                               # NOTE: chunker.py / streaming_manager.py /
+                               # tui_strip.py / progress_buffer.py were removed in
+                               # #53 — the scrape→post path they served is gone.
+  coordination/
+    service.py                 # 共有の連絡チャンネルへの 1 行アナウンス
+    env.py                     # COORDINATION_CHANNEL_ID の読み取り (#1194)
   ext/
-    api_server.py        # REST API control plane — always started (#712/#543);
-                         # a taken port logs a WARNING, it never kills the bot.
+    api_server.py              # REST API control plane — always started (#712/#543);
+                               # a taken port logs a WARNING, it never kills the bot.
+    peer_uid.py                # loopback 接続の相手がどの Unix ユーザーか (#457)
   utils/
-    logger.py            # Logging setup
-tests/                   # pytest test suite
-pyproject.toml           # Package metadata + dependencies
-uv.lock                  # Dependency lock file
-CONTRIBUTING.md          # Contribution guidelines
+    logger.py                  # ログの設定と、[thread=…] の前置き（log_ctx）
+tests/                         # pytest のテスト（e2e/ は実機が要るので既定では走らない）
+scripts/                       # staging.sh、release.sh、証跡の撮影・アップロード、fuzz/、monitor/
+deploy/c-lord.service          # 本番の systemd unit
+docs/                          # 理念、仕様（specs/）、利用者ガイド、STAGING、SECURITY ほか
+pyproject.toml                 # パッケージのメタデータと依存
+uv.lock                        # 依存のロックファイル
+CONTRIBUTING.md                # コントリビューションの案内
 ```
 
-### Adding a New Cog
+### Adding a New Cog — Cog を足す
 
 1. Create `c_lord/cogs/your_cog.py`
-2. If it runs Claude CLI, use `_run_helper.run_claude_in_thread()` — don't duplicate the streaming logic
+2. Claude CLI を走らせる Cog なら `_run_helper.run_claude_in_thread()` を使う — ストリーミングのロジックを Cog に複製しない
 3. Export from `c_lord/cogs/__init__.py`
 4. Add to `c_lord/__init__.py` public API
-5. Write tests in `tests/test_your_cog.py`
+5. テストを `tests/test_your_cog.py` に書く
 
-### Adding a New Discord UI Component
+### Adding a New Discord UI Component — UI 部品を足す
 
 1. Add to the appropriate file in `c_lord/discord_ui/`
-2. Export from `__init__.py` if it's part of the public API
-3. Test edge cases (empty strings, very long strings, Unicode, code blocks)
+2. 公開 API の一部になるなら `__init__.py` から export する
+3. 境界のケースをテストする（空文字列、非常に長い文字列、Unicode、コードブロック）
 
 ## 開発の行動規範 (Working Conduct) — Issue/PR の前提
 
@@ -425,13 +510,13 @@ PR. When you (or Opus) author an Issue:
 - **Keep scope narrow.** If the Issue's title needs an "and", it is probably two Issues. A wide守備範囲 is where definitions go soft and items leak.
 - **Deferred work is escalated, never implied.** If something is explicitly out of scope, say so in the Issue and link the follow-up. Silence is not a decision.
 
-## Git & PR Workflow
+## Git & PR Workflow（ブランチと PR の決まり）
 
-- **Branch from `main`**: `feature/description`, `fix/description`, `docs/description`
-- **CI must pass**: All 3 Python versions x (ruff check + ruff format + pytest)
-- **No direct push to main**: Always create a PR
-- **Squash merge preferred**: Keeps main history clean
-- **Commit style**: `<type>: <description>` — types: feat, fix, refactor, docs, test, chore, security
+- **ブランチは `main` から切る**: `feature/description`、`fix/description`、`docs/description`
+- **CI が通っていること**: Python 3 バージョンすべて ×（ruff check + ruff format + pytest）
+- **`main` へ直接 push しない**: 必ず PR を作る
+- **squash merge を基本にする**: `main` の履歴を読みやすく保つため
+- **コミットメッセージ**: `<type>: <description>` — type は feat, fix, refactor, docs, test, chore, security
 - **Required checks**: `dod-gate` and `test (3.10/3.11/3.12)` are required status checks on `main`. **A PR with a red `dod-gate` cannot be merged — not by humans, not by sub-Claude.** If `dod-gate` is red, fix the PR body or the issue before merging. `enforce_admins=true` means the admin account is also blocked.
 
 ### Standard Development Flow (Mandatory)
@@ -485,45 +570,46 @@ webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッド�
 
 それ以外で staging 検証を省略するときは PR 本文に省略理由を書く。
 
-## AI Agent Configuration
+## AI Agent Configuration（AI エージェント向けの設定）
 
-This project ships AI agent configs for all major tools:
+主要な AI ツールそれぞれに向けた設定ファイルを、このリポジトリに同梱している。
 
-| File | Tool | Purpose |
-|------|------|---------|
-| `CLAUDE.md` | Claude Code | Project context (this file) |
-| `AGENTS.md` | OpenAI Codex | Symlink → CLAUDE.md |
-| `.github/copilot-instructions.md` | GitHub Copilot | Condensed instructions |
-| `.cursorrules` | Cursor | IDE-specific rules |
+| ファイル | 対象のツール | 役割 |
+|----------|--------------|------|
+| `CLAUDE.md` | Claude Code | プロジェクトの文脈（このファイル） |
+| `AGENTS.md` | OpenAI Codex | CLAUDE.md へのシンボリックリンク |
+| `.github/copilot-instructions.md` | GitHub Copilot | 要点だけに絞った指示 |
+| `.cursorrules` | Cursor | IDE 向けのルール |
 
 ### Skills (`.claude/skills/`)
 
-Project-specific skills that help AI agents work effectively on this codebase:
+このコードベースで AI エージェントが作業するための、プロジェクト固有のスキル。
 
-| Skill | Purpose |
-|-------|---------|
-| `tdd` | **Enforced** test-driven development — write tests FIRST, then implement |
-| `verify` | Pre-commit quality gate (lint + format + test + security) |
-| `add-cog` | Step-by-step guide to scaffold a new Cog |
-| `security-audit` | Security checklist specific to subprocess/injection threats |
-| `python-quality` | Python coding patterns and project conventions |
-| `test-guide` | Testing patterns, mocking Discord objects, coverage goals |
+| スキル | 用途 |
+|--------|------|
+| `tdd` | テスト駆動開発（**必須**）— テストを先に書き、それから実装する |
+| `verify` | コミット前の品質ゲート（lint + format + test + security） |
+| `add-cog` | 新しい Cog を足すときの手順 |
+| `security-audit` | subprocess / インジェクションの脅威に絞ったセキュリティのチェックリスト |
+| `python-quality` | Python の書き方とプロジェクトの規約 |
+| `test-guide` | テストの書き方、Discord オブジェクトのモック、カバレッジの目安 |
+| `release` | バージョンとリリースの手順（タグ、CHANGELOG、`scripts/release.sh`） |
 
 ### Commands (`.claude/commands/`)
 
-| Command | Usage |
-|---------|-------|
-| `/verify` | Run full verification pipeline |
-| `/new-cog <name>` | Scaffold a new Cog with tests |
+| コマンド | 使いみち |
+|----------|----------|
+| `/verify` | 検証のパイプラインをひととおり流す |
+| `/new-cog <name>` | 新しい Cog をテストごと用意する |
 
 ### Hooks (`.claude/settings.json`)
 
-- **PostToolUse (Edit/Write)**: Auto-format `.py` files with ruff after editing
+- **PostToolUse (Edit/Write)**: 編集した `.py` ファイルを ruff で自動整形する
 
-## What Does NOT Belong Here
+## What Does NOT Belong Here（このリポジトリに置かないもの）
 
-- Personal bot configuration (tokens, channel IDs, user IDs)
-- Server-specific Cogs or workflows
-- Direct Anthropic API calls (we use Claude Code CLI, not the API)
-- Heavy dependencies that most users won't need
-- Anything that requires secrets to import the package
+- 個人の bot の設定（token、チャンネル ID、ユーザー ID）
+- 特定のサーバのための Cog やワークフロー
+- Anthropic API の直接呼び出し（使うのは Claude Code CLI であって、API ではない）
+- ほとんどの利用者には要らない重い依存
+- import するのに秘密を必要とするもの
