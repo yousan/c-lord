@@ -1,40 +1,47 @@
-# Security Model
+# Security Model — what c-lord defends, and what it does not
+
+This document states the trust boundary c-lord draws, the mechanisms that hold it, and the risks
+that are accepted on purpose. The pre-commit checklist that goes with it is the `security-audit`
+skill (`.claude/skills/security-audit/SKILL.md`).
 
 ## Threat Model
 
 c-lord spawns Claude Code CLI subprocesses that can execute arbitrary code on the host machine (read/write files, run commands, make network requests). This is **by design** — Claude Code's value comes from its ability to interact with the development environment.
 
-The bridge's security goal is:
+That fixes what c-lord can and cannot promise. It cannot make a running session harmless. What it
+is responsible for is narrower:
 
-> **Ensure that only authorized users can trigger Claude Code sessions, and that the bridge layer itself does not introduce additional attack surfaces beyond what Claude Code CLI already exposes.**
+> **Only people who are allowed to may start or steer a session — and putting Discord in front of
+> Claude Code must not open any door that the Claude Code CLI does not already open by itself.**
 
 ### What We Protect Against
 
-| Threat | Mitigation |
-|--------|-----------|
+| Threat | How it is held |
+|--------|----------------|
 | Unauthorized users invoking Claude | One `Authorizer` shared by every gate — messages, buttons, `/skill`, `/clord-init`. **Unconfigured, it allows only the Discord application's owner** (#713) |
 | Unauthorized users clicking decision buttons (answer a question / approve a plan / Stop) | Same allowlist enforced in every View via `AuthorizedViewMixin.interaction_check` (#466) |
-| Shell injection via user prompts | `create_subprocess_exec` (no shell), `--` separator before prompt arg |
-| Flag injection via prompts | `--` separator prevents `-p`, `--resume` etc. in prompt text |
-| Session hijacking via crafted IDs | Strict regex validation: `^[a-f0-9\-]+$` |
-| Skill name injection | Strict regex validation: `^[\w-]+$` |
+| A prompt being executed by a shell | c-lord never builds a shell command out of message text. A new session receives its prompt through a `0600` temp file read into a quoted variable and passed as one positional argument (`TmuxSessionManager.start_claude`); later messages are typed into the resident pane literally (`tmux send-keys -l`). c-lord's own child processes are started from argument lists — no `shell=True` anywhere |
+| A prompt being read as command-line flags | `--` precedes the prompt on the `claude` command line and the text on `send-keys`, so `--dangerously-skip-permissions` or `--resume …` inside a message stays text |
+| A crafted session ID turning into a flag or a path | Only a value shaped like a UUID is ever written to a session claim or handed to `--resume` (`is_session_id()` in `c_lord/transcript/claim.py`) |
+| A crafted skill name | `/skill` accepts `^[\w-]+$` only, and then only a name that matches a skill it has loaded |
+| A repository URL that makes `git` run a command | `validate_repo_url()` refuses `ext::` transports, a leading `-` and embedded newlines; the clone passes `--` before the URL (#514/#923) |
 | Secrets *inherited* by tmux panes | `SENSITIVE_ENV_KEYS` (`c_lord/tmux.py`) is removed from every tmux client env, marked `set-environment -r` on bot-managed sessions, and `env -u`'d on the `claude` command line (#353) |
 | A process started inside a pane silently becoming a second production bot | Same mechanism — this inheritance is what caused the #322 contamination incidents |
-| Nesting detection bypass | `CLAUDECODE` env var stripped — subprocess won't think it's already inside Claude Code |
+| Claude refusing to start because it believes it is nested | `CLAUDECODE` is removed from the launch environment (`env -u CLAUDECODE`), so the session does not mistake the bot's environment for an enclosing Claude Code |
 
 ### What We Do NOT Protect Against
 
-| Scenario | Why |
-|----------|-----|
-| Claude Code accessing host filesystem | This is Claude Code's core functionality — restricting it defeats the purpose |
-| Claude Code making network requests | Same as above — Claude Code needs internet access for web search, API calls, etc. |
-| Claude Code modifying its own config | This is expected behavior (CLAUDE.md, memory files, etc.) |
-| Discord server admin abuse | If someone has admin on your Discord server, they already have control |
-| Physical access to the host | Out of scope — standard server security applies |
+| Scenario | Why it is out of scope |
+|----------|------------------------|
+| Claude Code reading and writing files on the host | That is the product. A session that could not touch the checkout would be useless |
+| Claude Code talking to the network | Likewise — web search, package installs, `git push` and API calls all need it |
+| Claude Code editing its own configuration (CLAUDE.md, memory, settings) | Expected behaviour of the CLI, not something the bridge adds |
+| Someone with admin rights on the Discord server | They can already grant themselves the role or the channel. The server's own permissions are the control there |
+| Someone with physical or shell access to the host | Ordinary host security; nothing c-lord could add |
 | Claude reading the bot token from c-lord's `.env` | Accepted (#259). Same-UID processes can already read `.env`; the spawn-read skill relies on that. See below. |
 | A process running as the **same** Unix user driving the REST API | Accepted (#457). It can already read `.env` and every session directory. Access from **another** Unix user is blocked — see [REST API exposure](#rest-api-exposure-712-457). |
 
-**The security boundary is at the Discord layer, not the CLI layer.** Once a session starts, Claude Code has full CLI-level access. The bridge's job is to ensure only the right person can start sessions.
+**The boundary is drawn at Discord, not at the CLI.** Deciding who may start and steer a session is c-lord's job. Once a session runs, it has whatever the Unix user running the bot has — treat "may talk to c-lord" as "may run commands on this host".
 
 ### Accepted risk: `discord-read` skill exposes the bot token to the session (#259)
 
@@ -72,43 +79,53 @@ This means the bot token is **readable by the Claude session** (it `grep`s the
 
 ## Input Validation
 
-### Prompt Handling (runner.py)
+Text from Discord reaches four places where it could be mistaken for something other than text.
+Each has one check, in one place.
 
-```python
-# All arguments passed as a list — no shell interpolation
-args = [self.command, "-p", "--output-format", "stream-json", ...]
+### The prompt (`c_lord/tmux.py`)
 
-# -- separator prevents the prompt from being interpreted as flags
-args.append("--")
-args.append(prompt)
+A turn's prompt takes one of two routes, and neither lets it be interpreted:
 
-# Spawned without shell
-self._process = await asyncio.create_subprocess_exec(*args, ...)
-```
+- **Starting `claude`** (`start_claude`). The launch is a command line typed into the pane's shell,
+  so the prompt is never spliced into it. It is written to a private temp file, read into a shell
+  variable and deleted before `claude` runs, and passed as `-- "$CLORD_PROMPT"`: one quoted
+  positional argument after the `--` separator. A message such as `$(rm -rf ~)` is therefore not
+  expanded, and one such as `--dangerously-skip-permissions` is not a flag. If the temp file cannot
+  be written, the fallback is the same argument single-quoted, with embedded quotes escaped.
+  The other values that reach that line from outside the code (the API URL, plugin settings) go
+  through `shlex.quote`, and a model name set from Discord is validated first (below).
+- **Typing into a resident `claude`** (`send_input`). The text is sent with
+  `tmux send-keys -l -t <window> -- <text>` — literal keys, in pieces, with tmux itself invoked
+  from an argument list. When the text begins with one of Claude Code's mode characters (`/`, `!`,
+  `#`, `&`, `?`) a single space is put in front, so an ordinary message cannot become a slash
+  command or a shell escape; the dedicated commands (`/compact`, `/skill` …) are the only way to
+  send one deliberately.
 
-Why this matters:
-- A prompt like `--dangerously-skip-permissions` won't be interpreted as a flag
-- A prompt like `$(rm -rf /)` won't be shell-expanded
-- `create_subprocess_exec` passes arguments directly to the exec syscall
+c-lord's own subprocesses (`tmux`, `git`, `du`, `claude -p` for the context probe) are started with
+`asyncio.create_subprocess_exec` or `subprocess.run` on an argument list. Nothing uses a shell.
 
-### Session ID Validation (runner.py)
+### Session IDs (`c_lord/transcript/claim.py`)
 
-```python
-if not re.match(r"^[a-f0-9\-]+$", session_id):
-    raise ValueError(f"Invalid session_id format: {session_id!r}")
-```
+c-lord names the session it starts (`claude --session-id <uuid>`) and records that name in
+`<project_dir>/.clord-session`; a later start resumes with `--resume <recorded uuid>` (#773).
+`is_session_id()` accepts only the 8-4-4-4-12 hexadecimal UUID shape, both when a claim is written
+and when it is read back, so a damaged or planted claim cannot become a flag or a path such as
+`../../etc/passwd`.
 
-Session IDs come from Claude Code CLI output and are stored in SQLite. Before passing back via `--resume`, they're validated against a strict hex-and-hyphens pattern.
+### Skill names (`c_lord/cogs/skill_command.py`)
 
-### Skill Name Validation (skill_command.py)
+`/skill` runs `/<name> [args]` in the session. The name must match `^[\w-]+$` — letters, digits,
+underscore, hyphen — and must be one of the skills c-lord has loaded from `~/.claude/skills/`;
+anything else is answered with `Invalid skill name` or `not found` and nothing is run.
 
-```python
-if not re.match(r"^[\w-]+$", name):
-    await interaction.response.send_message(f"Invalid skill name: `{name}`", ephemeral=True)
-    return
-```
+### Repository URLs and model names
 
-Skill names are passed to Claude Code as `/{name}`. The regex ensures only alphanumeric characters, underscores, and hyphens are allowed.
+`/clord-init` and `/clord repo:` put a user-supplied string in front of `git clone`, which runs
+before Claude starts and so outside any tool-permission prompt. `validate_repo_url()`
+(`c_lord/database/channel_repo.py`) refuses `ext::…` (git would execute the rest), anything
+starting with `-` (git would read an option), and anything containing a line break. A model name
+given to `/model` must match `^[A-Za-z][A-Za-z0-9._-]{0,63}$` before it is stored or passed to
+`--model`.
 
 ## Environment Isolation
 
@@ -157,27 +174,23 @@ contamination-prevention, not confidentiality.
 `CLAUDECODE` is separately removed (`env -u CLAUDECODE`) so the spawned Claude
 does not think it is nested inside another Claude Code.
 
-### What's NOT Stripped
+### What stays in the environment
 
-General environment variables (PATH, HOME, ANTHROPIC_API_KEY, etc.) are passed through because Claude Code needs them to function. The `ANTHROPIC_API_KEY` is intentionally available — Claude Code uses it for API calls. If you need to restrict which API key Claude Code uses, configure it via Claude Code's own settings, not this bridge.
+Only the keys above (and `CLAUDECODE`) are removed. Everything else the bot was started with —
+`PATH`, `HOME`, and `ANTHROPIC_API_KEY` if you use one — is inherited by the pane, because Claude
+Code cannot work without it. The API key in particular is left in place deliberately: it is how
+Claude Code authenticates. To make a session use a different key or account, configure Claude Code
+itself; c-lord has no setting for it.
 
 ## Authorization Model
 
-### User-Level Authorization
+### Who may drive c-lord
 
-```python
-class ClaudeChatCog(commands.Cog):
-    def __init__(self, ..., allowed_user_ids: set[int] | None = None):
-        self._allowed_user_ids = allowed_user_ids
+There is one rule, held by one object: the `Authorizer` (`c_lord/discord_ui/authorization.py`),
+built once in `setup_bridge()` and handed to every Cog. A message, a slash or text command and a
+button click all ask the same instance.
 
-    async def on_message(self, message):
-        if message.author.bot:
-            return
-        if self._allowed_user_ids is not None and message.author.id not in self._allowed_user_ids:
-            return
-```
-
-- When `allowed_user_ids` is set: only listed Discord user IDs can invoke Claude
+- When `allowed_user_ids` is set (standalone: `DISCORD_OWNER_ID`): only those Discord users can
 - When `CLORD_ALLOWED_ROLE` is set: members holding that role can (OR logic)
 - When **neither** is set: only the Discord application's own owner can — the
   account that created the bot, which Discord already knows, so nothing has to
@@ -230,41 +243,67 @@ in-session Views (via `RunConfig`), the persistent-view restore path
 (`bot.py`), and `AutoUpgradeCog` — so configuring the allowlist alone protects
 every button, no extra wiring.
 
-### Channel-Level Authorization
+### Which channels and threads are acted on
 
-Both Cogs only respond to messages in the configured channel (`channel_id`) and its child threads. Messages in other channels are silently ignored.
+Being allowed is necessary, not sufficient — c-lord also has to consider the place its own.
 
-### Bot Messages
+- A plain message in the channel starts nothing. A conversation is opened deliberately: `/clord`,
+  `/skill`, or `POST /api/spawn`.
+- Inside a thread, a message is run only when the thread has a session record, or is a former
+  c-lord thread that can be reconnected or started again from its repository binding
+  (#538/#556/#862). Other threads under the same channel are left alone, silently.
+- Text commands (`!stop`, `!clord` …) are delivered to every bot that can read the channel, so each
+  instance answers only where it can point at its own record of the channel or thread — the
+  configured `DISCORD_CHANNEL_ID` or a `/clord-init` binding (#596, `c_lord/command_gate.py`).
 
-`message.author.bot` check ensures bot messages (including webhook messages) don't trigger Claude sessions. This prevents infinite loops if Claude's output triggers another bot.
+### Messages that do not come from a person
+
+`is_message_authorized()` (`c_lord/command_gate.py`) decides these, in this order:
+
+- **Webhook messages are accepted.** Holding the webhook URL is the authorization (#507/#508) —
+  this is what CI triggers, E2E tests and one Claude handing work to another rely on. Treat a
+  channel's webhook URL as a credential that can start sessions.
+- **Except c-lord's own voice.** The webhook c-lord uses to speak for a sub-agent is recorded in
+  `~/.c-lord/voice-webhooks.json` before its first post and is never obeyed; otherwise everything
+  an agent said would come back to the parent as an order (#971).
+- **Other bots are refused**, unless their ID is listed in `CLORD_TRUSTED_BOT_IDS`.
+- c-lord's own ordinary posts are bot messages like any other, so its output does not come back
+  in as input.
 
 ## Webhook Security (Consumer Cog Pattern)
 
+A webhook that should *do one fixed thing* — as opposed to holding a conversation — belongs in a
+trigger Cog. `WebhookTriggerCog` (`c_lord/cogs/webhook_trigger.py`) is the built-in one and the
+model to follow:
+
+- it looks only at messages that have a `webhook_id`, optionally only from `allowed_webhook_ids`
+  and only in `channel_ids`;
+- the message merely *selects* a trigger by its prefix. The prompt that runs is the one configured
+  on the server (`WebhookTrigger.prompt`) — the text after the prefix is not executed;
+- one run per trigger at a time (a lock per prefix);
+- a message a trigger Cog claims is left to it, so it is not also run as a conversation (#862).
+
 When building custom Cogs that respond to webhooks (for example, a docs-sync trigger), follow this pattern:
 
-```python
-# Only respond to webhook messages
-if not message.webhook_id:
-    return
+1. **Require `message.webhook_id`**, so the path cannot be reached by an ordinary user message.
+2. **Match a fixed trigger string**, so the sender chooses *which* predefined action runs and
+   nothing more.
+3. **Keep the prompt in your own code or configuration**, never assembled from the webhook's
+   content.
 
-# Fixed trigger string — no arbitrary command execution
-if message.content.strip() != "🔄 expected-trigger":
-    return
-
-# Hardcoded behavior — webhook cannot inject commands
-prompt = HARDCODED_PROMPT  # Server-side, not from webhook
-```
-
-Key principles:
-1. **Check `webhook_id`** — distinguishes webhooks from regular users
-2. **Fixed trigger strings** — webhook cannot specify what to do, only trigger predefined actions
-3. **Hardcoded prompts** — all Claude Code prompts are defined server-side, never from webhook content
+Note that `WebhookTrigger.dangerously_skip_permissions` defaults to `True`: a trigger runs
+unattended. That is one more reason its prompt must not be influenced by the message.
 
 ## Database Security
 
-- SQLite database stores `thread_id` → `session_id` mappings only
-- No user data, no messages, no secrets stored
-- Parameterized queries throughout (`?` placeholders, no string formatting)
+- The SQLite files hold c-lord's bookkeeping: the thread → session mapping with each thread's
+  working directory and topic, channel / thread → repository bindings, settings, questions waiting
+  for an answer, scheduled tasks and notifications (including their prompt text), and lounge
+  messages.
+- c-lord writes no token or secret into them. What people type — a task prompt, a repository URL —
+  is stored as given, so do not put credentials in either.
+- Values always travel as `?` parameters. The only SQL assembled with string formatting is column
+  lists and conditions fixed in the code.
 - `cleanup_old()` for age-based sweeping — since #818 it marks rows 片付け済み (`closed_reason = 'swept'`) instead of deleting them; the heavy data (session dirs) is what gets removed
 
 ## REST API exposure (#712, #457)
@@ -343,22 +382,33 @@ Notes and limits:
 
 ## Deployment Recommendations
 
-1. **Private Discord server**: Run the bot on a server only you have access to
-2. **Dedicated channel**: Use a specific channel for Claude interactions, not a general chat
+1. **Run it on a Discord server you control.** Everyone who can post where c-lord listens is one
+   allowlist mistake away from a shell on the host.
+2. **Give it its own channel(s)** rather than a general chat, and keep the webhook URLs of those
+   channels as private as a password.
 3. **Set `allowed_user_ids`**: Always set this in production — don't rely solely on channel permissions. Left unset the bot falls back to its application owner, which is safe but implicit; naming the allowlist makes it reviewable. Never set `CLORD_ALLOW_ANYONE=1` on a host you care about
-4. **Review Claude Code permissions**: Configure `permission_mode` and `allowed_tools` to restrict Claude Code's capabilities as needed
-5. **Don't use `dangerously_skip_permissions`**: This flag exists for power users who understand the implications. It disables Claude Code's built-in safety prompts
-6. **Monitor the bot**: Check logs regularly. Claude Code sessions are logged with timing and cost data
+4. **Do not count on permission prompts as a checkpoint.** `permission_mode` (default
+   `acceptEdits`, `CLAUDE_PERMISSION_MODE`) is passed to `claude --permission-mode`, but a tool
+   permission prompt that appears in the pane is accepted by c-lord and never shown in Discord.
+   What a session may do is bounded by the Unix account the bot runs as and by Claude Code's own
+   settings on that host — choose those accordingly.
+5. **Leave `dangerously_skip_permissions` off** unless you have decided you want it. It is never
+   the default for conversations.
+6. **Read the log.** Each turn is bracketed by `run_claude: enter` / `exit (outcome=…)`, refused
+   messages and refused API calls are logged, and each start logs who the REST API serves.
 7. **Keep dependencies updated**: `uv lock --upgrade-package c-lord && uv sync`
+8. **Leave the REST API on loopback** (`CLORD_API_HOST`, default `127.0.0.1`) — see above.
 
 ## Security Audit Checklist
 
-Before merging changes to `runner.py`, `_run_helper.py`, or any Cog:
+Go through this before merging a change to `c_lord/tmux.py`, `c_lord/claude/tmux_runner.py`,
+`c_lord/cogs/_run_helper.py` or any Cog. The `security-audit` skill has the longer form, with the
+commands to run.
 
-- [ ] No `shell=True` in any subprocess call
-- [ ] `--` separator present before user-supplied arguments
-- [ ] All external input validated (session IDs, skill names, channel IDs)
+- [ ] No subprocess is started through a shell (`shell=True`, `create_subprocess_shell`, `os.system`), and nothing is `eval`'d
+- [ ] `--` comes before every user-supplied positional argument
+- [ ] Anything added to the `claude` launch line typed into the pane is `shlex.quote`d or passed through a variable
+- [ ] Every external input is validated where it enters (session IDs, skill names, repository URLs, model names, channel IDs)
 - [ ] `SENSITIVE_ENV_KEYS` (`c_lord/tmux.py`) covers any new secret variables
-- [ ] No string formatting in SQL queries (use `?` placeholders)
+- [ ] SQL values are bound with `?`; no user-influenced string is formatted into a query
 - [ ] The shared `Authorizer` is consulted in any new message handler, button or command — never a fresh copy of the rule (#713: the two copies that existed kept the fail-open default after it was fixed for the other two)
-- [ ] No new `os.system()`, `subprocess.run(shell=True)`, or `eval()` calls
