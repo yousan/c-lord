@@ -93,6 +93,21 @@ def test_c_lord_start_with_that_env_prints_the_reason_not_a_traceback(
 _COUNT_KEYS = ("MAX_CONCURRENT_SESSIONS", "SESSION_TIMEOUT_SECONDS")
 
 
+def _unset_and_restore_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start with no setting in the environment — and end the test the same way.
+
+    ``load_config(<file>)`` copies every key of that ``.env`` into ``os.environ``
+    (``override=True``, #324) and records the file as ``CLORD_ENV_PATH``. A bare
+    ``delenv(raising=False)`` of a key that was not set gives monkeypatch nothing
+    to undo, so those values stayed for every test that ran afterwards
+    (``COORDINATION_CHANNEL_ID`` turned the next file's lounge on). Setting each
+    key first puts it on monkeypatch's undo list.
+    """
+    for key in (*_ID_KEYS, *_COUNT_KEYS, "DISCORD_BOT_TOKEN", "CLORD_ENV_PATH"):
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+
+
 @pytest.mark.parametrize("key", ["DISCORD_CHANNEL_ID", "COORDINATION_CHANNEL_ID"])
 def test_id_with_surrounding_space_in_quoted_env_still_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
@@ -100,8 +115,7 @@ def test_id_with_surrounding_space_in_quoted_env_still_starts(
     """#1194: ``KEY="1505… "`` started before #1084 (``int()`` ignores the spaces)
     and stopped with exit 1 after it — an update alone broke a working .env. The
     counts in the same file (#1119) already allow the spaces; the IDs do now too."""
-    for k in (*_ID_KEYS, *_COUNT_KEYS):
-        monkeypatch.delenv(k, raising=False)
+    _unset_and_restore_after(monkeypatch)
     env = tmp_path / ".env"
     lines = ["DISCORD_BOT_TOKEN=x", "DISCORD_CHANNEL_ID=1"]
     lines.append(f'{key}="1505747831447883806 "')
@@ -129,8 +143,7 @@ def test_counts_in_the_same_file_accept_the_same_spaces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The contrast in #1194: #1119 strips spaces for counts."""
-    for k in (*_ID_KEYS, *_COUNT_KEYS):
-        monkeypatch.delenv(k, raising=False)
+    _unset_and_restore_after(monkeypatch)
     env = tmp_path / ".env"
     env.write_text('DISCORD_BOT_TOKEN=x\nDISCORD_CHANNEL_ID=1\nMAX_CONCURRENT_SESSIONS=" 4 "\n')
     assert load_config(env)["max_concurrent"] == "4"

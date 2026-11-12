@@ -29,6 +29,7 @@ def _make_cog() -> ClaudeChatCog:
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
     runner = MagicMock()
+    runner.working_dir = "/tmp/work"
     return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
 
 

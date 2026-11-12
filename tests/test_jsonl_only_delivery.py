@@ -33,11 +33,11 @@ def _clean_delivery_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def bot() -> MagicMock:
-    b = MagicMock()
-    channel = MagicMock()
-    channel.send = AsyncMock()
-    b.get_channel.return_value = channel
-    return b
+    """The bot the control plane acts through; it knows no cogs and no channels yet."""
+    double = MagicMock()
+    double.cogs = {}
+    double.get_channel = MagicMock(return_value=None)
+    return double
 
 
 class TestSkillBridgeIsGone:
@@ -205,18 +205,17 @@ class TestControlPlaneEndpoints:
         cog = MagicMock()
         cog.spawn_session = AsyncMock(return_value=thread)
         bot.cogs = {"ClaudeChatCog": cog}
-        bot.get_channel.return_value = MagicMock(spec=discord.TextChannel)
+        # /api/spawn only opens threads under a real text channel.
+        bot.get_channel = MagicMock(return_value=MagicMock(spec=discord.TextChannel))
 
-        server = TestServer(api.app)
-        client = TestClient(server)
-        await client.start_server()
-        yield client
-        await client.close()
+        async with TestClient(TestServer(api.app)) as http:
+            yield http
 
     @pytest.mark.asyncio
     async def test_health(self, client: TestClient) -> None:
         resp = await client.get("/api/health")
         assert resp.status == 200
+        assert (await resp.json())["status"] == "ok"
 
     @pytest.mark.asyncio
     async def test_spawn(self, client: TestClient) -> None:

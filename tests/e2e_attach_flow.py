@@ -34,7 +34,6 @@ def _make_thread_message(
     msg = MagicMock(spec=discord.Message)
     msg.content = content
     msg.channel = thread
-    msg.attachments = []
     msg.author = MagicMock()
     msg.author.bot = False
     msg.author.id = author_id
@@ -65,7 +64,7 @@ def _make_bot_and_cog() -> tuple[commands.Bot, ClaudeChatCog, MagicMock, MagicMo
     repo.save = AsyncMock()
 
     runner = MagicMock()
-    runner.clone = MagicMock(return_value=MagicMock())
+    runner.working_dir = "/tmp/work"
 
     tmux_mgr = MagicMock()
     tmux_mgr.remap_window.return_value = True

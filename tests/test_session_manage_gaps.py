@@ -529,6 +529,39 @@ class TestWorkspaceCleanupGaps:
         }
         assert embed.color.value == sm.COLOR_TOOL  # dirty wins the colour
 
+    @pytest.mark.parametrize(
+        ("outcomes", "colour"),
+        [
+            (["kept"], 0xFEE75C),
+            (["removed", "kept"], 0xFEE75C),
+            (["removed"], 0x57F287),
+            (["failed"], 0x5865F2),
+            ([], 0x5865F2),
+        ],
+        ids=["work-left", "work-left-beats-removed", "removed", "only-skips", "nothing-found"],
+    )
+    async def test_the_result_colour_says_what_needs_attention(
+        self, outcomes: list[str], colour: int
+    ) -> None:
+        """Yellow while someone's uncommitted work was left behind — even next to
+        successful removals; green when directories went and none was held back;
+        the neutral blurple when nothing was removed at all."""
+        from c_lord.session_dir import CleanupResult
+
+        results = {
+            "removed": CleanupResult("/s/1", 1, True, "removed"),
+            "kept": CleanupResult("/s/2", 2, False, "uncommitted changes", kept_work=True),
+            "failed": CleanupResult("/s/4", 4, False, "rm failed: EBUSY"),
+        }
+        sdm = MagicMock()
+        sdm.cleanup_orphaned = MagicMock(return_value=[results[o] for o in outcomes])
+        cog = self._cog(sdm=sdm)
+        respond, ack, sent, _ = _capture()
+
+        await cog._workspace_cleanup_impl(dry_run=False, respond=respond, ack=ack)
+
+        assert sent[-1]["embed"].color.value == colour
+
     async def test_slash_and_alias_route_to_impl(self):
         cog = _cog()
         cog._workspace_cleanup_impl = AsyncMock()

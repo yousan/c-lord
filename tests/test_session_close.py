@@ -56,7 +56,7 @@ class TestCloseMarksThread:
         from c_lord.cogs.session_manage import SessionManageCog
 
         bot = MagicMock()
-        bot.channel_id = 999
+        bot.settings_repo = None
         bot.get_cog = MagicMock(return_value=None)
         repo = MagicMock()
         repo.get = AsyncMock(return_value=record)
@@ -153,7 +153,7 @@ class TestReopenCommand:
         from c_lord.cogs.session_manage import SessionManageCog
 
         bot = MagicMock()
-        bot.channel_id = 999
+        bot.settings_repo = None
         bot.get_cog = MagicMock(return_value=None)
         repo = MagicMock()
         repo.get = AsyncMock(return_value=record)
@@ -314,7 +314,7 @@ class TestStopEndsTheRunningTurn:
         from c_lord.cogs.session_manage import SessionManageCog
 
         bot = MagicMock()
-        bot.channel_id = 999
+        bot.settings_repo = None
         bot.get_cog = MagicMock(side_effect=lambda name: chat if name == "ClaudeChatCog" else None)
         repo = MagicMock()
         repo.get = AsyncMock(return_value=_record())

@@ -1,93 +1,116 @@
-"""Tests for CoordinationService."""
+"""Session announcements in the shared coordination channel (``c_lord.coordination``).
+
+The announcement is a courtesy: it is posted when a channel is configured and
+can be found, and nothing that goes wrong on the way may reach the caller —
+the caller is a turn that has just finished.
+"""
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import pytest
 
-from c_lord.coordination.service import CoordinationService
+import c_lord.coordination as coordination_package
+from c_lord.coordination import CoordinationService
+
+COORDINATION_CHANNEL = 424242
 
 
-def _make_thread(name: str = "Test Thread") -> MagicMock:
-    thread = MagicMock(spec=discord.Thread)
-    thread.name = name
-    return thread
-
-
-def _make_channel() -> MagicMock:
-    channel = MagicMock(spec=discord.TextChannel)
-    channel.send = AsyncMock()
-    return channel
-
-
-def _make_bot(channel: MagicMock | None = None) -> MagicMock:
+def _bot(channel: MagicMock | None) -> MagicMock:
+    """A bot whose channel cache answers every lookup with *channel*."""
     bot = MagicMock(spec=discord.Client)
     bot.get_channel = MagicMock(return_value=channel)
     return bot
 
 
-class TestCoordinationServiceEnabled:
-    def test_enabled_when_channel_id_set(self) -> None:
-        svc = CoordinationService(_make_bot(), channel_id=1234)
-        assert svc.enabled is True
-
-    def test_disabled_when_channel_id_none(self) -> None:
-        svc = CoordinationService(_make_bot(), channel_id=None)
-        assert svc.enabled is False
+def _channel() -> MagicMock:
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+    return channel
 
 
-class TestCoordinationServiceNoOp:
-    """When no channel is configured all methods are no-ops."""
+def _thread(name: str = "refactor the parser") -> MagicMock:
+    thread = MagicMock(spec=discord.Thread)
+    thread.name = name
+    return thread
 
-    @pytest.mark.asyncio
-    async def test_post_session_end_noop(self) -> None:
-        bot = _make_bot()
-        svc = CoordinationService(bot, channel_id=None)
-        await svc.post_session_end(_make_thread())
+
+def test_the_package_exports_only_the_service() -> None:
+    assert coordination_package.__all__ == ["CoordinationService"]
+
+
+class TestEnabled:
+    def test_on_when_a_channel_is_configured(self) -> None:
+        assert CoordinationService(_bot(None), channel_id=COORDINATION_CHANNEL).enabled is True
+
+    def test_off_without_a_channel(self) -> None:
+        assert CoordinationService(_bot(None), channel_id=None).enabled is False
+
+    def test_the_channel_may_be_given_positionally(self) -> None:
+        assert CoordinationService(_bot(None), COORDINATION_CHANNEL).enabled is True
+
+
+class TestSessionEnd:
+    async def test_names_the_thread_in_the_coordination_channel(self) -> None:
+        channel = _channel()
+        bot = _bot(channel)
+        service = CoordinationService(bot, channel_id=COORDINATION_CHANNEL)
+
+        await service.post_session_end(_thread("refactor the parser"))
+
+        bot.get_channel.assert_called_once_with(COORDINATION_CHANNEL)
+        channel.send.assert_awaited_once_with("✅ **refactor the parser** セッション終了")
+
+    async def test_without_a_channel_discord_is_not_touched(self) -> None:
+        """Disabled means disabled: not even the channel cache is consulted."""
+        bot = _bot(_channel())
+        service = CoordinationService(bot, channel_id=None)
+
+        await service.post_session_end(_thread())
+
         bot.get_channel.assert_not_called()
 
+    async def test_a_channel_missing_from_the_cache_is_logged_not_raised(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The bot may not be able to see the configured channel; the turn still ends cleanly."""
+        service = CoordinationService(_bot(None), channel_id=COORDINATION_CHANNEL)
 
-class TestCoordinationServicePosts:
-    """When a channel is configured, posts are sent."""
+        with caplog.at_level(logging.WARNING, logger="c_lord.coordination.service"):
+            await service.post_session_end(_thread())
 
-    @pytest.mark.asyncio
-    async def test_post_session_end_sends_message(self) -> None:
-        channel = _make_channel()
-        bot = _make_bot(channel)
-        svc = CoordinationService(bot, channel_id=9999)
+        assert f"Coordination channel {COORDINATION_CHANNEL} not found" in caplog.text
 
-        thread = _make_thread("Issue #42")
-        await svc.post_session_end(thread)
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            discord.HTTPException(MagicMock(status=500, reason="boom"), "server error"),
+            aiohttp.ClientConnectionError("connection reset"),
+            OSError("network unreachable"),
+        ],
+        ids=["discord-http", "aiohttp", "os"],
+    )
+    async def test_a_failed_post_is_logged_not_raised(
+        self, failure: BaseException, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        channel = _channel()
+        channel.send.side_effect = failure
+        service = CoordinationService(_bot(channel), channel_id=COORDINATION_CHANNEL)
 
-        channel.send.assert_called_once()
-        sent = channel.send.call_args[0][0]
-        assert "Issue #42" in sent
+        with caplog.at_level(logging.WARNING, logger="c_lord.coordination.service"):
+            await service.post_session_end(_thread())
 
+        assert f"Failed to post to coordination channel {COORDINATION_CHANNEL}" in caplog.text
 
-class TestCoordinationServiceChannelNotFound:
-    """When get_channel returns None (not in cache), methods are silent no-ops."""
+    async def test_a_programming_error_is_not_swallowed(self) -> None:
+        """Only delivery failures are forgiven; a bug in the call still surfaces."""
+        channel = _channel()
+        channel.send.side_effect = ValueError("not a delivery problem")
+        service = CoordinationService(_bot(channel), channel_id=COORDINATION_CHANNEL)
 
-    @pytest.mark.asyncio
-    async def test_end_no_channel_in_cache(self) -> None:
-        bot = _make_bot(channel=None)
-        svc = CoordinationService(bot, channel_id=9999)
-        await svc.post_session_end(_make_thread())
-
-
-class TestCoordinationServiceHTTPError:
-    """HTTP errors from Discord are swallowed so they never crash the bot."""
-
-    @pytest.mark.asyncio
-    async def test_http_error_on_end_is_swallowed(self) -> None:
-        channel = _make_channel()
-        http_response = MagicMock()
-        http_response.status = 500
-        http_response.reason = "Internal Server Error"
-        channel.send.side_effect = discord.HTTPException(http_response, "error")
-
-        bot = _make_bot(channel)
-        svc = CoordinationService(bot, channel_id=9999)
-
-        await svc.post_session_end(_make_thread())
+        with pytest.raises(ValueError):
+            await service.post_session_end(_thread())

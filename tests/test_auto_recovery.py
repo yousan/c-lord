@@ -95,7 +95,7 @@ class TestIdleStoppedWorkspaceComesBackOnItsOwn:
         repo.get = AsyncMock(return_value=record)
         repo.set_closed = AsyncMock()
         runner = MagicMock()
-        runner.clone = MagicMock(return_value=MagicMock())
+        runner.working_dir = "/tmp/work"
         cog = ClaudeChatCog(bot=bot, repo=repo, runner=runner)
         cog._run_claude = AsyncMock()
         cog._apply_thread_naming = AsyncMock()

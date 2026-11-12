@@ -25,6 +25,12 @@ from c_lord.database.task_repo import TaskRepository
 from c_lord.ext.api_server import ApiServer
 
 
+@pytest.fixture(autouse=True)
+def _lounge_channel_not_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A leaked ``COORDINATION_CHANNEL_ID`` must not turn on lounge forwarding here."""
+    monkeypatch.delenv("COORDINATION_CHANNEL_ID", raising=False)
+
+
 @pytest.fixture
 async def env(tmp_path: Path) -> AsyncIterator[tuple[TestClient, TaskRepository]]:
     repo = NotificationRepository(str(tmp_path / "n.db"))

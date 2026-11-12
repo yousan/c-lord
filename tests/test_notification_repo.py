@@ -1,102 +1,274 @@
-"""Tests for NotificationRepository."""
+"""``NotificationRepository`` — notifications queued for later delivery.
+
+A notification waits as ``pending`` and leaves the queue exactly once: sent,
+failed or cancelled. ``scheduled_at`` is whatever text the caller gave and is
+compared as text, boundary included.
+"""
 
 from __future__ import annotations
 
-import os
-import tempfile
+import logging
+import re
+from pathlib import Path
+from typing import Any
 
+import aiosqlite
 import pytest
 
 from c_lord.database.notification_repo import NotificationRepository
 
+LOCAL_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
 
 @pytest.fixture
-async def repo() -> NotificationRepository:
-    """Create a temp database with notification schema."""
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    repo = NotificationRepository(path)
-    await repo.init_db()
-    yield repo
-    os.unlink(path)
+async def queue(tmp_path: Path) -> NotificationRepository:
+    repository = NotificationRepository(str(tmp_path / "notifications.db"))
+    await repository.init_db()
+    return repository
+
+
+async def _row(queue: NotificationRepository, notification_id: int) -> dict[str, Any]:
+    """A notification in whatever state it is in (``get_pending`` only shows pending)."""
+    async with aiosqlite.connect(queue.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM scheduled_notifications WHERE id = ?", (notification_id,)
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    return dict(row)
+
+
+class TestInitDb:
+    async def test_can_be_run_again_without_losing_the_queue(
+        self, queue: NotificationRepository
+    ) -> None:
+        await queue.create("still here", "2030-01-01T00:00:00")
+
+        await queue.init_db()
+
+        assert len(await queue.get_pending()) == 1
+
+    async def test_says_where_the_database_is(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = str(tmp_path / "fresh.db")
+
+        with caplog.at_level(logging.INFO, logger="c_lord.database.notification_repo"):
+            await NotificationRepository(path).init_db()
+
+        assert f"Notification DB initialized at {path}" in caplog.text
 
 
 class TestCreate:
-    @pytest.mark.asyncio
-    async def test_create_returns_id(self, repo: NotificationRepository) -> None:
-        nid = await repo.create(message="hello", scheduled_at="2026-01-01T09:00:00")
-        assert isinstance(nid, int)
-        assert nid > 0
+    async def test_returns_a_new_id_each_time(self, queue: NotificationRepository) -> None:
+        first = await queue.create("one", "2030-01-01T09:00:00")
+        second = await queue.create("two", "2030-01-01T09:00:00")
 
-    @pytest.mark.asyncio
-    async def test_create_with_all_fields(self, repo: NotificationRepository) -> None:
-        nid = await repo.create(
-            message="test",
-            scheduled_at="2026-01-01T09:00:00",
-            title="Title",
+        assert isinstance(first, int) and first > 0
+        assert second > first
+
+    async def test_message_and_time_alone_get_the_documented_defaults(
+        self, queue: NotificationRepository
+    ) -> None:
+        notification_id = await queue.create("ping", "2030-01-01T09:00:00")
+
+        row = await _row(queue, notification_id)
+
+        assert row["message"] == "ping"
+        assert row["scheduled_at"] == "2030-01-01T09:00:00"
+        assert row["title"] is None
+        assert row["color"] == 0x00BFFF
+        assert row["source"] == "api"
+        assert row["channel_id"] is None
+        assert row["status"] == "pending"
+        assert row["sent_at"] is None
+        assert row["error_message"] is None
+        assert LOCAL_TIMESTAMP.fullmatch(row["created_at"])
+
+    async def test_every_optional_field_is_stored_as_given(
+        self, queue: NotificationRepository
+    ) -> None:
+        notification_id = await queue.create(
+            "deploy finished",
+            "2030-06-01T12:30:00",
+            title="Deploy",
             color=0xFF0000,
-            source="webhook",
-            channel_id=12345,
+            source="ci",
+            channel_id=987654321,
         )
-        assert nid > 0
+
+        (pending,) = await queue.get_pending()
+
+        assert pending["id"] == notification_id
+        assert pending["message"] == "deploy finished"
+        assert pending["title"] == "Deploy"
+        assert pending["color"] == 0xFF0000
+        assert pending["source"] == "ci"
+        assert pending["channel_id"] == 987654321
+
+    async def test_scheduled_at_is_kept_verbatim(self, queue: NotificationRepository) -> None:
+        """No validation or reformatting here — that is the API's business."""
+        notification_id = await queue.create("odd", "  whenever, really ")
+
+        assert (await _row(queue, notification_id))["scheduled_at"] == "  whenever, really "
+
+    async def test_logs_what_was_queued(
+        self, queue: NotificationRepository, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="c_lord.database.notification_repo"):
+            notification_id = await queue.create("m", "2030-01-01T00:00:00")
+
+        assert (
+            f"Notification scheduled: id={notification_id}, at=2030-01-01T00:00:00" in caplog.text
+        )
 
 
 class TestGetPending:
-    @pytest.mark.asyncio
-    async def test_empty_db(self, repo: NotificationRepository) -> None:
-        result = await repo.get_pending()
-        assert result == []
+    async def test_an_empty_queue_is_an_empty_list(self, queue: NotificationRepository) -> None:
+        assert await queue.get_pending() == []
 
-    @pytest.mark.asyncio
-    async def test_returns_pending(self, repo: NotificationRepository) -> None:
-        await repo.create(message="a", scheduled_at="2026-01-01T09:00:00")
-        await repo.create(message="b", scheduled_at="2026-01-01T10:00:00")
-        result = await repo.get_pending()
-        assert len(result) == 2
-        assert result[0]["message"] == "a"
-        assert result[1]["message"] == "b"
+    async def test_lists_what_is_waiting_earliest_first(
+        self, queue: NotificationRepository
+    ) -> None:
+        await queue.create("third", "2030-03-01T00:00:00")
+        await queue.create("first", "2030-01-01T00:00:00")
+        await queue.create("second", "2030-02-01T00:00:00")
 
-    @pytest.mark.asyncio
-    async def test_filter_by_before(self, repo: NotificationRepository) -> None:
-        await repo.create(message="early", scheduled_at="2026-01-01T08:00:00")
-        await repo.create(message="late", scheduled_at="2026-01-01T12:00:00")
-        result = await repo.get_pending(before="2026-01-01T10:00:00")
-        assert len(result) == 1
-        assert result[0]["message"] == "early"
+        pending = await queue.get_pending()
+
+        assert [n["message"] for n in pending] == ["first", "second", "third"]
+
+    async def test_before_keeps_only_what_is_due_by_then(
+        self, queue: NotificationRepository
+    ) -> None:
+        await queue.create("due", "2030-01-01T00:00:00")
+        await queue.create("not yet", "2030-12-31T00:00:00")
+
+        pending = await queue.get_pending(before="2030-06-01T00:00:00")
+
+        assert [n["message"] for n in pending] == ["due"]
+
+    async def test_before_includes_the_exact_moment(self, queue: NotificationRepository) -> None:
+        await queue.create("on the dot", "2030-06-01T00:00:00")
+
+        assert len(await queue.get_pending(before="2030-06-01T00:00:00")) == 1
+        assert await queue.get_pending(before="2030-05-31T23:59:59") == []
+
+    @pytest.mark.parametrize("no_filter", [None, ""])
+    async def test_no_before_means_no_filter(
+        self, queue: NotificationRepository, no_filter: str | None
+    ) -> None:
+        """An empty string is "no cut-off", not "due before the beginning of
+        time" — it must not hide everything."""
+        await queue.create("soon", "2030-01-01T00:00:00")
+        await queue.create("far", "2999-01-01T00:00:00")
+
+        assert len(await queue.get_pending(before=no_filter)) == 2
+
+    async def test_rows_are_plain_dicts_with_every_column(
+        self, queue: NotificationRepository
+    ) -> None:
+        await queue.create("m", "2030-01-01T00:00:00")
+
+        (pending,) = await queue.get_pending()
+
+        assert type(pending) is dict
+        assert set(pending) == {
+            "id",
+            "message",
+            "title",
+            "color",
+            "scheduled_at",
+            "source",
+            "channel_id",
+            "status",
+            "sent_at",
+            "error_message",
+            "created_at",
+        }
 
 
 class TestMarkSent:
-    @pytest.mark.asyncio
-    async def test_mark_sent_removes_from_pending(self, repo: NotificationRepository) -> None:
-        nid = await repo.create(message="test", scheduled_at="2026-01-01T09:00:00")
-        await repo.mark_sent(nid)
-        result = await repo.get_pending()
-        assert len(result) == 0
+    async def test_a_sent_notification_leaves_the_queue(
+        self, queue: NotificationRepository
+    ) -> None:
+        sent = await queue.create("sent", "2030-01-01T00:00:00")
+        waiting = await queue.create("waiting", "2030-01-01T00:00:00")
+
+        await queue.mark_sent(sent)
+
+        assert [n["id"] for n in await queue.get_pending()] == [waiting]
+
+    async def test_records_the_status_and_when_it_went_out(
+        self, queue: NotificationRepository
+    ) -> None:
+        notification_id = await queue.create("m", "2030-01-01T00:00:00")
+
+        await queue.mark_sent(notification_id)
+
+        row = await _row(queue, notification_id)
+        assert row["status"] == "sent"
+        assert LOCAL_TIMESTAMP.fullmatch(row["sent_at"])
+        assert row["error_message"] is None
 
 
 class TestMarkFailed:
-    @pytest.mark.asyncio
-    async def test_mark_failed_removes_from_pending(self, repo: NotificationRepository) -> None:
-        nid = await repo.create(message="test", scheduled_at="2026-01-01T09:00:00")
-        await repo.mark_failed(nid, "connection error")
-        result = await repo.get_pending()
-        assert len(result) == 0
+    async def test_a_failed_notification_leaves_the_queue(
+        self, queue: NotificationRepository
+    ) -> None:
+        failed = await queue.create("failed", "2030-01-01T00:00:00")
+        waiting = await queue.create("waiting", "2030-01-01T00:00:00")
+
+        await queue.mark_failed(failed, "channel is gone")
+
+        assert [n["id"] for n in await queue.get_pending()] == [waiting]
+
+    async def test_records_the_error_and_no_send_time(self, queue: NotificationRepository) -> None:
+        notification_id = await queue.create("m", "2030-01-01T00:00:00")
+
+        await queue.mark_failed(notification_id, "403 Forbidden")
+
+        row = await _row(queue, notification_id)
+        assert row["status"] == "failed"
+        assert row["error_message"] == "403 Forbidden"
+        assert row["sent_at"] is None
 
 
 class TestCancel:
-    @pytest.mark.asyncio
-    async def test_cancel_pending(self, repo: NotificationRepository) -> None:
-        nid = await repo.create(message="test", scheduled_at="2026-01-01T09:00:00")
-        assert await repo.cancel(nid) is True
-        result = await repo.get_pending()
-        assert len(result) == 0
+    async def test_a_pending_notification_is_cancelled(self, queue: NotificationRepository) -> None:
+        notification_id = await queue.create("m", "2030-01-01T00:00:00")
 
-    @pytest.mark.asyncio
-    async def test_cancel_nonexistent(self, repo: NotificationRepository) -> None:
-        assert await repo.cancel(99999) is False
+        assert await queue.cancel(notification_id) is True
 
-    @pytest.mark.asyncio
-    async def test_cancel_already_sent(self, repo: NotificationRepository) -> None:
-        nid = await repo.create(message="test", scheduled_at="2026-01-01T09:00:00")
-        await repo.mark_sent(nid)
-        assert await repo.cancel(nid) is False
+        assert await queue.get_pending() == []
+        assert (await _row(queue, notification_id))["status"] == "cancelled"
+
+    async def test_unknown_id_is_false(self, queue: NotificationRepository) -> None:
+        assert await queue.cancel(424242) is False
+
+    async def test_what_was_already_sent_cannot_be_cancelled(
+        self, queue: NotificationRepository
+    ) -> None:
+        notification_id = await queue.create("m", "2030-01-01T00:00:00")
+        await queue.mark_sent(notification_id)
+
+        assert await queue.cancel(notification_id) is False
+
+        assert (await _row(queue, notification_id))["status"] == "sent"
+
+    async def test_cancelling_twice_only_counts_once(self, queue: NotificationRepository) -> None:
+        notification_id = await queue.create("m", "2030-01-01T00:00:00")
+        await queue.cancel(notification_id)
+
+        assert await queue.cancel(notification_id) is False
+
+    async def test_cancelling_one_leaves_the_others_waiting(
+        self, queue: NotificationRepository
+    ) -> None:
+        gone = await queue.create("gone", "2030-01-01T00:00:00")
+        kept = await queue.create("kept", "2030-01-01T00:00:00")
+
+        await queue.cancel(gone)
+
+        assert [n["id"] for n in await queue.get_pending()] == [kept]

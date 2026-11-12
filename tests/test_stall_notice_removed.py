@@ -23,12 +23,11 @@ _PACKAGE = Path(__file__).resolve().parent.parent / "c_lord"
 
 
 def _make_message() -> MagicMock:
-    msg = MagicMock()
-    msg.add_reaction = AsyncMock()
-    msg.remove_reaction = AsyncMock()
-    msg.guild = MagicMock()
-    msg.guild.me = MagicMock()
-    return msg
+    """The trigger message the lamp is painted on; every reaction call succeeds."""
+    message = MagicMock()
+    message.add_reaction = AsyncMock()
+    message.remove_reaction = AsyncMock()
+    return message
 
 
 class TestNoStallProse:

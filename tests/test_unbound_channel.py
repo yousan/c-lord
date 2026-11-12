@@ -20,9 +20,9 @@ from c_lord.discord_ui.authorization import Authorizer
 
 
 def _make_cog(**overrides: object) -> ClaudeChatCog:
-    """Return a ClaudeChatCog with minimal mocked dependencies."""
     bot = MagicMock()
     bot.channel_id = 999
+    bot.settings_repo = None
     # ChannelRepoCog returns None (no binding)
     channel_cog = MagicMock()
     channel_cog.resolve_manager = AsyncMock(return_value=None)
@@ -35,11 +35,11 @@ def _make_cog(**overrides: object) -> ClaudeChatCog:
     _default_ctx = MagicMock()
     _default_ctx.valid = False
     bot.get_context = AsyncMock(return_value=_default_ctx)
+
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
     repo.save = AsyncMock()
     runner = MagicMock()
-    runner.clone = MagicMock(return_value=MagicMock())
     runner.working_dir = "/tmp/test"
     runner.model = "sonnet"
     runner.timeout_seconds = 300

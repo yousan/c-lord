@@ -33,11 +33,12 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 async def repo() -> NotificationRepository:
+    """A real notification store in a throwaway file, removed afterwards."""
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
-    repo = NotificationRepository(path)
-    await repo.init_db()
-    yield repo
+    notifications = NotificationRepository(path)
+    await notifications.init_db()
+    yield notifications
     os.unlink(path)
 
 
@@ -53,17 +54,15 @@ async def task_repo() -> TaskRepository:
 
 @pytest.fixture
 def bot() -> MagicMock:
+    """A bot whose every channel lookup lands on one channel with a recordable ``send``."""
     b = MagicMock()
-    channel = MagicMock()
-    channel.send = AsyncMock()
-    b.get_channel.return_value = channel
+    b.get_channel.return_value.send = AsyncMock()
     b.cogs = {}
     return b
 
 
 async def _client(api: ApiServer) -> TestClient:
-    server = TestServer(api.app)
-    client = TestClient(server)
+    client = TestClient(TestServer(api.app))
     await client.start_server()
     return client
 
@@ -172,6 +171,7 @@ class TestOwnUidIsAllowed:
         try:
             resp = await client.post("/api/spawn", json={})
             assert resp.status == 400
+            assert (await resp.json()) == {"error": "prompt is required"}
         finally:
             await client.close()
 

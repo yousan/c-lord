@@ -65,7 +65,7 @@ def _repo(record: SessionRecord | None = None) -> MagicMock:
 
 def _thread(owner_id: object = OTHER_CLORD) -> MagicMock:
     thread = MagicMock(spec=discord.Thread)
-    thread.id = 42
+    thread.id = 4242
     thread.parent_id = 999
     thread.owner_id = owner_id
     thread.name = "機能実装について"

@@ -33,27 +33,33 @@ def _member() -> MagicMock:
     return member
 
 
-def _make_thread_interaction(thread_id: int = 12345, parent_id: int = 999) -> MagicMock:
+def _slash(channel: MagicMock) -> MagicMock:
+    """A slash interaction in *channel* whose first reply can be read back with ``_text``."""
     interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = channel
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
+def _make_thread_interaction(thread_id: int = 12345, parent_id: int = 999) -> MagicMock:
     thread = MagicMock(spec=discord.Thread)
     thread.id = thread_id
     thread.parent_id = parent_id
-    interaction.channel = thread
+    interaction = _slash(thread)
     interaction.user = _member()
-    interaction.response = MagicMock()
-    interaction.response.send_message = AsyncMock()
     interaction.response.is_done = MagicMock(return_value=False)
     return interaction
 
 
 def _make_channel_interaction(channel_id: int = 999) -> MagicMock:
-    interaction = MagicMock(spec=discord.Interaction)
+    interaction = _slash(MagicMock())
     channel = MagicMock(spec=discord.TextChannel)
     channel.id = channel_id
     interaction.channel = channel
     interaction.user = _member()
-    interaction.response = MagicMock()
-    interaction.response.send_message = AsyncMock()
     interaction.response.is_done = MagicMock(return_value=False)
     return interaction
 
@@ -62,17 +68,15 @@ def _make_channel_interaction(channel_id: int = 999) -> MagicMock:
 async def cog(tmp_path) -> SessionManageCog:
     db = str(tmp_path / "s.db")
     await init_db(db)
-    bot = MagicMock()
-    repo = MagicMock()
-    repo.get = AsyncMock(return_value=None)
+    # The startup configuration every layer falls back to.
     runner = MagicMock()
     runner.model = "sonnet"
     runner.effort = None
     runner.model_source = "組み込み既定"
     runner.effort_source = "未設定"
     return SessionManageCog(
-        bot=bot,
-        repo=repo,
+        bot=MagicMock(),
+        repo=MagicMock(),
         settings_repo=SettingsRepository(db),
         runner=runner,
         authorizer=Authorizer(allowed_user_ids={OWNER}),
@@ -84,7 +88,9 @@ def _text(interaction: MagicMock) -> str:
     return args[0] if args else kwargs.get("content", "")
 
 
-class TestModelShow:
+class TestShowingTheModel:
+    """``/model`` with no arguments only reads."""
+
     async def test_bare_model_displays_the_layers(self, cog):
         interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction)
@@ -104,17 +110,22 @@ class TestModelShow:
         assert await cog.settings_repo.get_all() == {}
 
     async def test_show_without_settings_repo_degrades(self):
-        bot = MagicMock()
-        repo = MagicMock()
-        runner = MagicMock()
-        runner.model = "sonnet"
-        cog = SessionManageCog(bot=bot, repo=repo, runner=runner)
+        """Without a settings store there is nothing to read: say so privately, don't crash."""
+        cog = SessionManageCog(
+            bot=MagicMock(),
+            repo=MagicMock(),
+            authorizer=Authorizer(allowed_user_ids={OWNER}),
+        )
         interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction)
-        assert interaction.response.send_message.called
+        interaction.response.send_message.assert_awaited_once()
+        assert _text(interaction).startswith("❌")
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
 
-class TestModelSet:
+class TestChangingTheGlobalModel:
+    """``/model <name> scope:global`` — what is accepted, and where it is stored."""
+
     async def test_global_scope_stores_in_the_legacy_key(self, cog):
         interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction, model="opus", scope="global")

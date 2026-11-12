@@ -15,18 +15,23 @@ from c_lord.discord_ui.status import (
     EMOJI_STALL_SOFT,
     EMOJI_WAITING,
     STALL_HARD_SECONDS,
+    STALL_SOFT_SECONDS,
     StatusManager,
 )
 
 
 def _make_message() -> MagicMock:
-    """Create a mock Discord message with guild.me for reactions."""
-    msg = MagicMock()
+    """A trigger message whose reaction calls succeed and are recorded."""
+    msg = MagicMock(spec=discord.Message)
     msg.add_reaction = AsyncMock()
     msg.remove_reaction = AsyncMock()
     msg.guild = MagicMock()
-    msg.guild.me = MagicMock()
     return msg
+
+
+def _silence(sm: StatusManager, seconds: float) -> None:
+    """Make the turn look as if nothing has happened for *seconds*."""
+    sm._last_activity = asyncio.get_running_loop().time() - seconds
 
 
 async def _until(condition, *, timeout: float = 10.0) -> None:
@@ -54,10 +59,10 @@ class TestHardStall:
         msg = _make_message()
         sm = StatusManager(msg)
         await sm.set_running()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
+        _silence(sm, STALL_HARD_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
+        msg.add_reaction.assert_awaited_with(EMOJI_STALL_HARD)
         await sm.cleanup()
 
     @pytest.mark.asyncio
@@ -66,9 +71,9 @@ class TestHardStall:
         msg = _make_message()
         sm = StatusManager(msg)
         await sm.set_running()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(5)
+        _silence(sm, STALL_HARD_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
+        await asyncio.sleep(2.5)  # at least one more tick, still stalled
         hard = [c for c in msg.add_reaction.await_args_list if c.args[0] == EMOJI_STALL_HARD]
         assert len(hard) == 1
         await sm.cleanup()
@@ -78,15 +83,14 @@ class TestHardStall:
         msg = _make_message()
         sm = StatusManager(msg)
         await sm.set_running()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        _silence(sm, STALL_HARD_SECONDS + 1)
         await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
 
         sm._reset_stall_timer()  # activity → the monitor takes ⚠️ back to 🟢
         await _until(lambda: sm._current_emoji == EMOJI_RUNNING)
         assert sm._current_emoji == EMOJI_RUNNING
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        _silence(sm, STALL_HARD_SECONDS + 1)
         await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
         await sm.cleanup()
@@ -97,11 +101,15 @@ class TestHardStall:
         msg.add_reaction = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
         sm = StatusManager(msg)
         await sm.set_running()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
-        assert sm._stall_task is not None
-        assert not sm._stall_task.done()
+        _silence(sm, STALL_HARD_SECONDS + 1)
+
+        def tried_the_warning() -> bool:
+            return any(c.args[0] == EMOJI_STALL_HARD for c in msg.add_reaction.await_args_list)
+
+        await _until(tried_the_warning)
+        assert tried_the_warning()
+        monitor = sm._stall_task
+        assert monitor is not None and not monitor.done()
         await sm.cleanup()
 
 
@@ -278,7 +286,7 @@ class TestStallOverrideIsTemporary:
         sm = StatusManager(msg)
         await sm.set_running()
         sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
         monitor = sm._stall_task
 
@@ -366,8 +374,8 @@ class TestActivityFromTheTranscript:
         msg = _make_message()
         sm = StatusManager(msg, thread_id=7690)
         await sm.set_running()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
+        # Long silent as far as the clock can tell — then the transcript moves.
+        _silence(sm, STALL_HARD_SECONDS + 1)
         turn_activity.note(7690)
         await asyncio.sleep(2.5)
         assert sm._current_emoji == EMOJI_RUNNING
@@ -380,9 +388,8 @@ class TestActivityFromTheTranscript:
         msg = _make_message()
         sm = StatusManager(msg, thread_id=7691)
         await sm.set_running()
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
+        _silence(sm, STALL_HARD_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
         turn_activity.note(7691)
         await asyncio.sleep(2.2)
@@ -396,7 +403,7 @@ class TestActivityFromTheTranscript:
         sm = StatusManager(msg, thread_id=7692)
         await sm.set_running()
         sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
         await sm.cleanup()
 
@@ -445,7 +452,7 @@ class TestARunningToolIsNotAStall:
         turn_activity.note(9051, started=["toolu_a"])
         turn_activity.note(9051, finished=["toolu_a"])
         sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
         await sm.cleanup()
 
@@ -601,3 +608,197 @@ class TestANetworkFailureIsNotATurnFailure:
         msg.down = False
         await sm.set_waiting()
         assert msg.reactions == [EMOJI_WAITING]
+
+
+class TestSoftStall:
+    """Ten silent seconds read ⏳, thirty read ⚠️ — one lamp at a time throughout."""
+
+    @pytest.mark.asyncio
+    async def test_soft_stall_paints_the_hourglass_in_place_of_green(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        _silence(sm, STALL_SOFT_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_SOFT)
+        assert msg.reactions == [EMOJI_STALL_SOFT]
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_a_soft_stall_that_lasts_becomes_the_warning(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        _silence(sm, STALL_SOFT_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_SOFT)
+        _silence(sm, STALL_HARD_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
+        assert msg.reactions == [EMOJI_STALL_HARD]
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_activity_takes_the_hourglass_back_to_green(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        _silence(sm, STALL_SOFT_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_SOFT)
+        sm._reset_stall_timer()
+        await _until(lambda: sm._current_emoji == EMOJI_RUNNING)
+        assert msg.reactions == [EMOJI_RUNNING]
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_turn_still_ends_on_its_final_lamp(self) -> None:
+        """⏳/⚠️ are overrides: the finish replaces them like it replaces 🟢."""
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        _silence(sm, STALL_HARD_SECONDS + 1)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
+        await sm.set_error()
+        assert msg.reactions == [EMOJI_ERROR]
+        assert sm._stall_task is None
+
+
+class TestLampBookkeeping:
+    """The edges around a turn: clearing the lamp, lamps without a guild, taking one over."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_takes_the_lamp_off(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        await sm.cleanup()
+        assert msg.reactions == []
+        assert sm._current_emoji is None
+        assert sm._stall_task is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_with_no_lamp_makes_no_call(self) -> None:
+        msg = _make_message()
+        sm = StatusManager(msg)
+        await sm.cleanup()
+        msg.remove_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_old_lamp_is_removed_as_the_bot_itself(self) -> None:
+        msg = _make_message()
+        sm = StatusManager(msg)
+        await sm.set_running()
+        await sm.set_done()
+        msg.remove_reaction.assert_awaited_once_with(EMOJI_RUNNING, msg.guild.me)
+
+    @pytest.mark.asyncio
+    async def test_without_a_guild_the_new_lamp_is_still_added(self) -> None:
+        """A DM has no guild member to remove as; the removal is skipped, not fatal."""
+        msg = _make_message()
+        msg.guild = None
+        sm = StatusManager(msg)
+        await sm.set_running()
+        await sm.set_done()
+        msg.remove_reaction.assert_not_called()
+        assert [c.args[0] for c in msg.add_reaction.await_args_list] == [
+            EMOJI_RUNNING,
+            EMOJI_WAITING,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_repeating_the_final_lamp_costs_no_call(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        await sm.set_done()
+        await sm.set_waiting()
+        assert msg.reactions == [EMOJI_WAITING]
+        assert msg.removes == [EMOJI_RUNNING]
+
+    @pytest.mark.asyncio
+    async def test_set_error_without_a_running_turn_just_paints_red(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_error()
+        assert msg.reactions == [EMOJI_ERROR]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_monitor_stops_watching_but_leaves_the_lamp(self) -> None:
+        msg = _FlakyMessage()
+        sm = StatusManager(msg)  # type: ignore[arg-type]
+        await sm.set_running()
+        monitor = sm._stall_task
+        await sm.cleanup_monitor()
+        assert monitor is not None and monitor.done()
+        assert msg.reactions == [EMOJI_RUNNING]
+
+
+class TestAdoptedLamp:
+    """#718: a lamp painted before a restart is replaced, not joined, by the next paint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("left_behind", [EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD])
+    async def test_first_paint_replaces_the_lamp_the_old_process_left(
+        self, left_behind: str
+    ) -> None:
+        msg = _FlakyMessage()
+        msg.reactions.append(left_behind)
+        sm = StatusManager.adopt(msg, left_behind)  # type: ignore[arg-type]
+        await sm.set_waiting()
+        assert msg.reactions == [EMOJI_WAITING]
+
+    @pytest.mark.asyncio
+    async def test_adopting_makes_no_discord_call(self) -> None:
+        msg = _make_message()
+        StatusManager.adopt(msg, EMOJI_RUNNING, thread_id=7180)
+        msg.add_reaction.assert_not_called()
+        msg.remove_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_turn_is_left_on_the_warning(self) -> None:
+        """#992: claude died mid-turn — ⚠️ is the honest reading, and nobody watches on."""
+        msg = _FlakyMessage()
+        msg.reactions.append(EMOJI_RUNNING)
+        sm = StatusManager.adopt(msg, EMOJI_RUNNING)  # type: ignore[arg-type]
+        await sm.set_running()
+        await sm.mark_abandoned()
+        assert msg.reactions == [EMOJI_STALL_HARD]
+        assert sm._stall_task is None
+
+
+class TestDisplacedByANewerTurn:
+    """#718: once a newer turn in the thread subscribes, the older lamp is displaced."""
+
+    @pytest.mark.asyncio
+    async def test_a_running_turn_is_not_displaced(self) -> None:
+        sm = StatusManager(_make_message(), thread_id=7181)
+        await sm.set_running()
+        assert sm.displaced is False
+        await sm.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_the_next_turn_in_the_thread_displaces_it(self) -> None:
+        older = StatusManager(_make_message(), thread_id=7182)
+        newer = StatusManager(_make_message(), thread_id=7182)
+        await older.set_running()
+        await newer.set_running()
+        assert older.displaced is True
+        assert newer.displaced is False
+        await older.cleanup()
+        await newer.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_an_older_turn_unwinding_does_not_silence_the_newer_one(self) -> None:
+        from c_lord.turn_activity import turn_activity
+
+        older = StatusManager(_make_message(), thread_id=7183)
+        newer = StatusManager(_make_message(), thread_id=7183)
+        await older.set_running()
+        await newer.set_running()
+        await older.set_waiting()
+        newer._last_activity = 0.0
+        turn_activity.note(7183)
+        assert newer._last_activity > 0.0
+        await newer.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_no_thread_or_no_turn_is_never_displaced(self) -> None:
+        assert StatusManager(_make_message()).displaced is False
+        assert StatusManager(_make_message(), thread_id=7184).displaced is False

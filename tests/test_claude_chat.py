@@ -1,8 +1,10 @@
-"""Tests for ClaudeChatCog: /stop command, attachment handling, and interrupt-on-new-message."""
+"""ClaudeChatCog: the commands, the message path, and what survives a restart."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import discord
@@ -29,7 +31,7 @@ def _make_channel_cog_mock(
 
 
 def _make_cog(*, channel_cog: MagicMock | None = None) -> ClaudeChatCog:
-    """Return a ClaudeChatCog with minimal mocked dependencies."""
+    """A cog on a mocked bot whose own channel is 999 and whose gate is open."""
     bot = MagicMock()
     bot.channel_id = 999
     # No settings repo → thread auto-archive resolver uses the 3-day default.
@@ -42,11 +44,10 @@ def _make_cog(*, channel_cog: MagicMock | None = None) -> ClaudeChatCog:
     # Tests that need a binding should pass a channel_cog mock.
     bot.get_cog = MagicMock(return_value=channel_cog)
     repo = MagicMock()
+    # No session row unless a test puts one there.
     repo.get = AsyncMock(return_value=None)
     repo.save = AsyncMock()
-    repo.delete = AsyncMock(return_value=True)
     runner = MagicMock()
-    runner.clone = MagicMock(return_value=MagicMock())
     # #713: this file is not about *who* may drive c-lord. The shipped
     # default is owner-only, resolved from Discord at on_ready — which a
     # unit test never reaches — so the gate is opened explicitly here and
@@ -56,119 +57,153 @@ def _make_cog(*, channel_cog: MagicMock | None = None) -> ClaudeChatCog:
     )
 
 
-def _make_thread_interaction(thread_id: int = 12345) -> MagicMock:
-    """Return an Interaction whose channel is a discord.Thread."""
+def _slash_in(channel: MagicMock) -> MagicMock:
+    """A slash interaction issued in *channel*, with every reply path awaitable."""
     interaction = MagicMock(spec=discord.Interaction)
-    thread = MagicMock(spec=discord.Thread)
-    thread.id = thread_id
-    interaction.channel = thread
+    interaction.channel = channel
+    interaction.user = MagicMock()
+    interaction.user.id = 1
+    interaction.extras = {}
     interaction.response = MagicMock()
     interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
     return interaction
+
+
+def _make_thread_interaction(thread_id: int = 12345) -> MagicMock:
+    """A slash interaction issued inside the thread *thread_id*."""
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
+    return _slash_in(thread)
 
 
 def _make_channel_interaction() -> MagicMock:
-    """Return an Interaction whose channel is NOT a thread."""
-    interaction = MagicMock(spec=discord.Interaction)
-    interaction.channel = MagicMock(spec=discord.TextChannel)
-    interaction.response = MagicMock()
-    interaction.response.send_message = AsyncMock()
-    return interaction
+    """A slash interaction issued in a plain text channel — not a thread."""
+    return _slash_in(MagicMock(spec=discord.TextChannel))
+
+
+def _first_reply(interaction: MagicMock):
+    """The one ``interaction.response.send_message`` call a command made."""
+    interaction.response.send_message.assert_awaited_once()
+    return interaction.response.send_message.call_args
 
 
 class TestStopCommand:
+    """/stop interrupts the running turn and leaves everything needed to resume."""
+
+    @staticmethod
+    def _running_turn(cog: ClaudeChatCog, thread_id: int = 12345) -> MagicMock:
+        """Register a runner for *thread_id*, as a turn in flight would have."""
+        runner = MagicMock()
+        runner.interrupt = AsyncMock()
+        cog._active_runners[thread_id] = runner
+        return runner
+
     @pytest.mark.asyncio
-    async def test_stop_outside_thread_sends_ephemeral(self) -> None:
-        """Using /stop outside a thread sends an ephemeral error."""
+    async def test_outside_a_thread_it_is_refused_privately(self) -> None:
         cog = _make_cog()
         interaction = _make_channel_interaction()
 
         await cog.stop_session.callback(cog, interaction)
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        reply = _first_reply(interaction)
+        assert reply.kwargs.get("ephemeral") is True
+        assert "thread" in reply.args[0].lower()
 
     @pytest.mark.asyncio
-    async def test_stop_no_active_runner_sends_ephemeral(self) -> None:
-        """Using /stop when nothing is running sends an ephemeral notice."""
+    async def test_with_nothing_running_it_says_so_privately(self) -> None:
         cog = _make_cog()
-        interaction = _make_thread_interaction(thread_id=12345)
-
-        # _active_runners is empty — no session running
-        await cog.stop_session.callback(cog, interaction)
-
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
-
-    @pytest.mark.asyncio
-    async def test_stop_calls_runner_interrupt(self) -> None:
-        """Using /stop with an active runner calls runner.interrupt()."""
-        cog = _make_cog()
-        thread_id = 12345
-        interaction = _make_thread_interaction(thread_id=thread_id)
-
-        mock_runner = MagicMock()
-        mock_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = mock_runner
+        interaction = _make_thread_interaction(12345)
 
         await cog.stop_session.callback(cog, interaction)
 
-        mock_runner.interrupt.assert_called_once()
+        reply = _first_reply(interaction)
+        assert reply.kwargs.get("ephemeral") is True
+        assert reply.kwargs.get("embed") is None
 
     @pytest.mark.asyncio
-    async def test_stop_does_not_delete_session_from_db(self) -> None:
-        """/stop must NOT delete the session from the DB (so resume works)."""
+    async def test_the_running_turn_is_interrupted(self) -> None:
         cog = _make_cog()
-        thread_id = 12345
-        interaction = _make_thread_interaction(thread_id=thread_id)
+        runner = self._running_turn(cog)
 
-        mock_runner = MagicMock()
-        mock_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = mock_runner
+        await cog.stop_session.callback(cog, _make_thread_interaction(12345))
 
-        await cog.stop_session.callback(cog, interaction)
+        runner.interrupt.assert_awaited_once()
 
-        # repo.delete should NEVER be called by /stop
+    @pytest.mark.asyncio
+    async def test_another_threads_turn_is_left_running(self) -> None:
+        cog = _make_cog()
+        elsewhere = self._running_turn(cog, thread_id=777)
+
+        await cog.stop_session.callback(cog, _make_thread_interaction(12345))
+
+        elsewhere.interrupt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_session_row_is_not_touched(self) -> None:
+        """What separates /stop from /clear: the next message resumes the session."""
+        cog = _make_cog()
+        cog.repo.delete = AsyncMock()
+        cog.repo.reset = AsyncMock()
+        self._running_turn(cog)
+
+        await cog.stop_session.callback(cog, _make_thread_interaction(12345))
+
         cog.repo.delete.assert_not_called()
+        cog.repo.reset.assert_not_called()
+        cog.repo.save.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_stop_does_not_remove_from_active_runners(self) -> None:
-        """/stop should leave _active_runners cleanup to _run_claude's finally."""
+    async def test_the_runner_stays_registered(self) -> None:
+        """Unregistering belongs to the turn's own cleanup, not to /stop."""
         cog = _make_cog()
-        thread_id = 12345
-        interaction = _make_thread_interaction(thread_id=thread_id)
+        runner = self._running_turn(cog)
 
-        mock_runner = MagicMock()
-        mock_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = mock_runner
+        await cog.stop_session.callback(cog, _make_thread_interaction(12345))
+
+        assert cog._active_runners[12345] is runner
+
+    @pytest.mark.asyncio
+    async def test_a_stop_is_confirmed_with_a_public_embed(self) -> None:
+        cog = _make_cog()
+        self._running_turn(cog)
+        interaction = _make_thread_interaction(12345)
 
         await cog.stop_session.callback(cog, interaction)
 
-        # Still in dict — _run_claude's finally handles removal
-        assert thread_id in cog._active_runners
+        reply = _first_reply(interaction)
+        embed = reply.kwargs.get("embed")
+        assert embed is not None and "stopped" in embed.title.lower()
+        assert reply.kwargs.get("ephemeral") is False
 
     @pytest.mark.asyncio
-    async def test_stop_sends_stopped_embed(self) -> None:
-        """/stop success response should use the stopped_embed (orange, not red)."""
+    async def test_the_stop_embed_is_orange(self) -> None:
+        """Orange — neither the red of an error nor the green of a finished turn."""
         cog = _make_cog()
-        thread_id = 12345
-        interaction = _make_thread_interaction(thread_id=thread_id)
-
-        mock_runner = MagicMock()
-        mock_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = mock_runner
+        self._running_turn(cog)
+        interaction = _make_thread_interaction(12345)
 
         await cog.stop_session.callback(cog, interaction)
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        embed = call_kwargs.get("embed")
-        assert embed is not None
-        assert "stopped" in embed.title.lower()
-        # Orange color (not red error)
+        embed = _first_reply(interaction).kwargs["embed"]
+        assert embed.color is not None
         assert embed.color.value == 0xFFA500
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_stops_nothing(self) -> None:
+        cog = _make_cog()
+        cog._authorizer = Authorizer(allowed_user_ids={42})
+        runner = self._running_turn(cog)
+        interaction = _make_thread_interaction(12345)  # user id 1
+
+        await cog.stop_session.callback(cog, interaction)
+
+        runner.interrupt.assert_not_awaited()
+        reply = _first_reply(interaction)
+        assert reply.kwargs.get("ephemeral") is True
+        assert "not authorized" in reply.args[0].lower()
 
 
 def _attach_human_message(ctx: MagicMock, webhook_id: int | None = None) -> MagicMock:
@@ -236,7 +271,7 @@ class TestStopTextCommand:
         mock_runner.interrupt = AsyncMock()
         cog._active_runners[12345] = mock_runner
         await cog.stop_text.callback(cog, ctx)
-        mock_runner.interrupt.assert_called_once()
+        mock_runner.interrupt.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_does_not_delete_session(self) -> None:
@@ -313,7 +348,7 @@ class TestRestartClaudeCommand:
         tmux.kill_session.assert_called_once_with(12345)
         # KEY: the session row must survive so --continue can resume it.
         cog.repo.reset.assert_not_called()
-        interaction.response.send_message.assert_called_once()
+        interaction.response.send_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_kills_active_runner(self) -> None:
@@ -414,22 +449,29 @@ class TestRestartClaudeTextCommand:
 
 
 class TestActiveCountAlias:
-    """Tests for ClaudeChatCog.active_count (DrainAware alias)."""
+    """``active_count`` is the ``DrainAware`` spelling of ``active_session_count``."""
 
-    def test_active_count_equals_active_session_count(self) -> None:
-        """active_count should be an alias for active_session_count."""
+    def test_both_names_count_the_turns_in_flight(self) -> None:
         cog = _make_cog()
+        assert cog.active_session_count == 0
         assert cog.active_count == 0
-        assert cog.active_count == cog.active_session_count
 
-        # Add a fake runner
         cog._active_runners[1] = MagicMock()
-        assert cog.active_count == 1
+        cog._active_runners[2] = MagicMock()
+
+        assert cog.active_session_count == 2
         assert cog.active_count == cog.active_session_count
 
+    def test_a_turn_that_ended_is_no_longer_counted(self) -> None:
+        cog = _make_cog()
+        cog._active_runners[1] = MagicMock()
         cog._active_runners[2] = MagicMock()
-        assert cog.active_count == 2
-        assert cog.active_count == cog.active_session_count
+        assert cog.active_session_count == 2
+
+        del cog._active_runners[1]
+
+        assert cog.active_session_count == 1
+        assert cog.active_count == 1
 
 
 class TestBuildPrompt:
@@ -446,7 +488,7 @@ class TestBuildPrompt:
         filename: str = "test.txt",
         content_type: str = "text/plain",
         size: int = 100,
-        content: bytes = b"hello world",
+        body: bytes = b"file content here",
         url: str = "https://cdn.discordapp.com/attachments/123/456/test.txt?ex=abc&is=def&hm=xyz",
     ) -> MagicMock:
         att = MagicMock(spec=discord.Attachment)
@@ -454,11 +496,11 @@ class TestBuildPrompt:
         att.content_type = content_type
         att.size = size
         att.url = url
-        att.read = AsyncMock(return_value=content)
+        att.read = AsyncMock(return_value=body)
         return att
 
     @staticmethod
-    def _make_message(content: str = "my message", attachments: list | None = None) -> MagicMock:
+    def _make_message(content: str = "", attachments: list | None = None) -> MagicMock:
         msg = MagicMock(spec=discord.Message)
         msg.id = 4242
         msg.content = content
@@ -466,66 +508,75 @@ class TestBuildPrompt:
         return msg
 
     @pytest.mark.asyncio
-    async def test_no_attachments_returns_content(self) -> None:
+    async def test_plain_text_is_the_prompt(self) -> None:
         cog = _make_cog()
         assert await cog._build_prompt(self._make_message(content="hello")) == "hello"
+
+    @pytest.mark.asyncio
+    async def test_a_message_without_text_gives_an_empty_prompt(self) -> None:
+        cog = _make_cog()
+        msg = self._make_message()
+        msg.content = None
+        assert await cog._build_prompt(msg) == ""
 
     @pytest.mark.asyncio
     async def test_attachment_contents_are_not_inlined(self) -> None:
         """Inlining is what pushed a 20KB .md past tmux's input cap (#527)."""
         cog = _make_cog()
-        att = self._make_attachment(filename="notes.txt", content=b"file content here")
+        att = self._make_attachment()
         msg = self._make_message(content="check this", attachments=[att])
 
         result = await cog._build_prompt(msg)
-
         assert result == "check this"
         assert "file content here" not in result
-        att.read.assert_not_called()
+        att.read.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_image_url_is_not_embedded(self) -> None:
         """Images are saved as files too — no signed CDN URL to expire (#529)."""
         cog = _make_cog()
         att = self._make_attachment(filename="image.png", content_type="image/png")
-        msg = self._make_message(content="see image", attachments=[att])
+        msg = self._make_message(content="look", attachments=[att])
 
         prompt, image_paths = await cog._build_prompt_and_images(msg)
 
+        assert prompt == "look"
         assert "cdn.discordapp.com" not in prompt
         assert image_paths == []
 
 
 class TestRegistryAutoDiscovery:
-    """Registry should be auto-discovered from bot.session_registry."""
+    """Zero-config: the cog finds the bot's ``SessionRegistry`` without being handed it."""
 
-    def test_auto_discovers_from_bot(self) -> None:
-        """When registry=None, Cog picks up bot.session_registry."""
+    def test_the_registry_on_the_bot_is_used(self) -> None:
         bot = MagicMock()
         bot.session_registry = SessionRegistry()
+
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+
         assert cog._registry is bot.session_registry
 
-    def test_explicit_registry_takes_precedence(self) -> None:
-        """When registry is explicitly passed, it wins over bot attribute."""
+    def test_a_registry_passed_in_wins_over_the_bots(self) -> None:
         bot = MagicMock()
         bot.session_registry = SessionRegistry()
-        explicit = SessionRegistry()
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), registry=explicit)
-        assert cog._registry is explicit
+        mine = SessionRegistry()
 
-    def test_no_bot_attribute_falls_back_to_none(self) -> None:
-        """When bot has no session_registry, _registry stays None."""
-        bot = MagicMock(spec=[])  # no attributes
+        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), registry=mine)
+
+        assert cog._registry is mine
+
+    def test_a_bot_without_a_registry_leaves_it_unset(self) -> None:
+        bot = MagicMock(spec=["channel_id"])  # a bot that carries nothing else
+
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+
         assert cog._registry is None
 
 
 class TestInterruptOnNewMessage:
-    """New message in active thread should interrupt the running session."""
+    """A message that arrives mid-turn replaces the turn in flight (#315)."""
 
     def _make_thread_message(self, thread_id: int = 42) -> MagicMock:
-        """Return a discord.Message inside a Thread."""
         thread = MagicMock(spec=discord.Thread)
         thread.id = thread_id
         thread.parent_id = 999
@@ -536,9 +587,14 @@ class TestInterruptOnNewMessage:
         msg.content = "new instruction"
         msg.attachments = []
         msg.reference = None  # no Discord-reply → enrich_discord_references is a no-op
-        msg.author = MagicMock()
-        msg.author.bot = False
         return msg
+
+    @staticmethod
+    async def _let_the_new_turn_run(cog: ClaudeChatCog, thread_id: int) -> None:
+        """The turn is dispatched as its own task off the lock — wait for it."""
+        spawned = cog._active_tasks.get(thread_id)
+        assert spawned is not None
+        await asyncio.wait_for(spawned, timeout=1.0)
 
     def _plant_active_turn(self, cog: ClaudeChatCog, thread_id: int) -> MagicMock:
         """Make ``thread_id`` look like it has an in-flight turn.
@@ -567,107 +623,124 @@ class TestInterruptOnNewMessage:
         """A new message interrupts the in-flight turn (USER_GUIDE behaviour, #315)."""
         cog = _make_cog()
         thread_id = 42
-        message = self._make_thread_message(thread_id)
-
-        existing_runner = self._plant_active_turn(cog, thread_id)
         cog._run_claude = AsyncMock()
+        existing_runner = self._plant_active_turn(cog, thread_id)
 
-        await cog._handle_thread_reply(message)
+        await cog._handle_thread_reply(self._make_thread_message(thread_id))
+        await self._let_the_new_turn_run(cog, thread_id)
 
-        existing_runner.interrupt.assert_called_once()
+        existing_runner.interrupt.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_interrupt_message_sent_when_preempting(self) -> None:
         """The thread is notified when an in-flight turn is interrupted (#315)."""
         cog = _make_cog()
         thread_id = 42
-        message = self._make_thread_message(thread_id)
-        thread = message.channel
-
+        cog._run_claude = AsyncMock()
+        msg = self._make_thread_message(thread_id)
         self._plant_active_turn(cog, thread_id)
-        cog._run_claude = AsyncMock()
 
-        await cog._handle_thread_reply(message)
+        await cog._handle_thread_reply(msg)
+        await self._let_the_new_turn_run(cog, thread_id)
 
-        thread.send.assert_called_once()
-        sent_text: str = thread.send.call_args.args[0]
-        assert "interrupted" in sent_text.lower() or "⚡" in sent_text
-
-    @pytest.mark.asyncio
-    async def test_no_interrupt_when_no_active_runner(self) -> None:
-        """When no runner is active, _handle_thread_reply skips interrupt."""
-        cog = _make_cog()
-        message = self._make_thread_message(thread_id=42)
-        thread = message.channel
-
-        cog._run_claude = AsyncMock()
-
-        await cog._handle_thread_reply(message)
-
-        # No notification message sent for interruption
-        thread.send.assert_not_called()
+        notices = [c.args[0] for c in msg.channel.send.call_args_list if c.args]
+        assert len(notices) == 1
+        assert "Interrupted" in notices[0]
 
     @pytest.mark.asyncio
-    async def test_awaits_existing_task_before_new_session(self) -> None:
-        """_handle_thread_reply must await the existing task to ensure cleanup completes."""
+    async def test_an_idle_thread_gets_no_interrupt(self) -> None:
+        """Nothing in flight: the message just runs, and nobody is told otherwise."""
         cog = _make_cog()
         thread_id = 42
-        message = self._make_thread_message(thread_id)
+        cog._run_claude = AsyncMock()
+        bystander = MagicMock()
+        bystander.interrupt = AsyncMock()
+        cog._active_runners[777] = bystander  # another thread's turn
+        msg = self._make_thread_message(thread_id)
 
-        existing_runner = MagicMock()
-        existing_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = existing_runner
+        await cog._handle_thread_reply(msg)
+        await self._let_the_new_turn_run(cog, thread_id)
 
-        # A future that we can control to simulate a running task
-        cleanup_done = asyncio.Event()
-        call_order: list[str] = []
+        bystander.interrupt.assert_not_awaited()
+        msg.channel.send.assert_not_called()
+        cog._run_claude.assert_awaited_once()
 
-        async def slow_task() -> None:
-            await cleanup_done.wait()
-            call_order.append("task_done")
+    @pytest.mark.asyncio
+    async def test_a_finished_turn_left_registered_is_not_interrupted(self) -> None:
+        """Only a turn still running counts as in flight."""
+        cog = _make_cog()
+        thread_id = 42
+        cog._run_claude = AsyncMock()
 
-        task = asyncio.ensure_future(slow_task())
-        cog._active_tasks[thread_id] = task
+        async def already_over() -> None:
+            return None
 
-        async def run_claude_stub(*args, **kwargs) -> None:
-            call_order.append("new_session_started")
+        finished = asyncio.ensure_future(already_over())
+        await finished
+        cog._active_tasks[thread_id] = finished
+        msg = self._make_thread_message(thread_id)
 
-        cog._run_claude = run_claude_stub
+        await cog._handle_thread_reply(msg)
+        await self._let_the_new_turn_run(cog, thread_id)
 
-        # Let cleanup complete so the await resolves
-        cleanup_done.set()
+        msg.channel.send.assert_not_called()
 
-        await cog._handle_thread_reply(message)
+    @pytest.mark.asyncio
+    async def test_the_new_turn_starts_only_after_the_old_one_has_finished(self) -> None:
+        """The replaced turn's teardown completes before the new turn begins."""
+        cog = _make_cog()
+        thread_id = 42
+        order: list[str] = []
+        interrupted = asyncio.Event()
+        runner = MagicMock()
+        runner.interrupt = AsyncMock(side_effect=lambda *a, **k: interrupted.set())
+        cog._active_runners[thread_id] = runner
+
+        async def old_turn() -> None:
+            await interrupted.wait()
+            await asyncio.sleep(0)  # its teardown takes a moment
+            order.append("old turn finished")
+            cog._active_runners.pop(thread_id, None)
+
+        async def new_turn(*args, **kwargs) -> None:
+            order.append("new turn started")
+
+        cog._active_tasks[thread_id] = asyncio.ensure_future(old_turn())
+        cog._run_claude = new_turn
+
+        await cog._handle_thread_reply(self._make_thread_message(thread_id))
 
         # The new turn now runs as its own task off the lock (#315) — let it run.
         spawned = cog._active_tasks.get(thread_id)
         assert spawned is not None
         await asyncio.wait_for(spawned, timeout=1.0)
 
-        assert call_order == ["task_done", "new_session_started"]
+        assert order == ["old turn finished", "new turn started"]
 
     @pytest.mark.asyncio
-    async def test_run_claude_called_with_session_id_after_interrupt(self) -> None:
-        """After interrupt, _run_claude is called with the session_id from the DB."""
+    async def test_the_new_turn_continues_the_same_session(self) -> None:
+        """Interrupting does not start a new conversation: the session id is handed on."""
         cog = _make_cog()
         thread_id = 42
-        message = self._make_thread_message(thread_id)
-
-        # Simulate a saved session in DB
         record = MagicMock()
-        record.session_id = "abc-123"
+        record.session_id = "sess-keep"
+        record.closed_at = None
+        record.slept_at = None
+        record.working_dir = None
         cog.repo.get = AsyncMock(return_value=record)
-
-        existing_runner = MagicMock()
-        existing_runner.interrupt = AsyncMock()
-        cog._active_runners[thread_id] = existing_runner
         cog._run_claude = AsyncMock()
+        self._plant_active_turn(cog, thread_id)
+        msg = self._make_thread_message(thread_id)
 
-        await cog._handle_thread_reply(message)
+        await cog._handle_thread_reply(msg)
+        await self._let_the_new_turn_run(cog, thread_id)
 
-        cog._run_claude.assert_called_once()
-        _, kwargs = cog._run_claude.call_args
-        assert kwargs.get("session_id") == "abc-123"
+        cog._run_claude.assert_awaited_once()
+        call = cog._run_claude.await_args
+        assert call.args[:3] == (msg, msg.channel, "new instruction")
+        assert call.kwargs["session_id"] == "sess-keep"
+        # The pane is alive — it was only interrupted — so nothing is resumed from disk.
+        assert call.kwargs["try_continue"] is False
 
     @pytest.mark.asyncio
     async def test_parked_menu_run_does_not_wedge_thread(self) -> None:
@@ -731,19 +804,18 @@ class TestInterruptOnNewMessage:
                 "input would never reach tmux (#315 repro)."
             )
 
-        existing_runner.interrupt.assert_called_once()
+        existing_runner.interrupt.assert_awaited_once()
         await asyncio.sleep(0.05)
         assert len(run_calls) == 2, "the new message's own turn should have run"
         assert not ask_bus.is_active(thread_id), "the bridged menu should be dismissed"
         await asyncio.wait_for(task1, timeout=1.0)
 
-    @pytest.mark.asyncio
-    async def test_active_tasks_dict_initialized(self) -> None:
-        """ClaudeChatCog must initialize _active_tasks as an empty dict."""
+    def test_a_new_cog_tracks_no_turns(self) -> None:
+        """Both per-thread tables exist from the start, and start empty."""
         cog = _make_cog()
-        assert hasattr(cog, "_active_tasks")
-        assert isinstance(cog._active_tasks, dict)
-        assert len(cog._active_tasks) == 0
+        assert cog._active_tasks == {}
+        assert cog._active_runners == {}
+        assert cog.is_processing(42) is False
 
     def test_is_processing_reflects_active_tasks(self) -> None:
         """is_processing() is the lamp's source of truth for 🟢 running (#236):
@@ -780,8 +852,7 @@ class TestResumeAfterPaneDeath:
         msg.channel = thread
         msg.content = "what is my name?"
         msg.attachments = []
-        msg.author = MagicMock()
-        msg.author.bot = False
+        msg.reference = None
         return msg
 
     @staticmethod
@@ -817,7 +888,7 @@ class TestResumeAfterPaneDeath:
         await cog._handle_thread_reply(self._make_thread_message())
 
         cog._run_claude.assert_called_once()
-        _, kwargs = cog._run_claude.call_args
+        kwargs = cog._run_claude.call_args.kwargs
         assert kwargs.get("try_continue") is True
 
     @pytest.mark.asyncio
@@ -862,7 +933,7 @@ class TestResumeAfterPaneDeath:
         await cog._handle_thread_reply(self._make_thread_message())
 
         cog._run_claude.assert_called_once()
-        _, kwargs = cog._run_claude.call_args
+        kwargs = cog._run_claude.call_args.kwargs
         assert not kwargs.get("try_continue")
 
     @pytest.mark.asyncio
@@ -875,142 +946,203 @@ class TestResumeAfterPaneDeath:
         await cog._handle_thread_reply(self._make_thread_message())
 
         cog._run_claude.assert_called_once()
-        _, kwargs = cog._run_claude.call_args
+        kwargs = cog._run_claude.call_args.kwargs
         assert not kwargs.get("try_continue")
 
 
 class TestZeroConfigCoordination:
-    """_get_coordination() must work without any consumer wiring (Zero-Config Principle).
-
+    """The coordination service needs no wiring from the consumer.
     Consumers must get new features by updating the package alone —
-    no code changes, no bot.coordination wiring required.
+    so the cog finds a ``CoordinationService`` on its own, or builds one.
     """
 
-    def test_auto_creates_from_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """No bot.coordination → auto-creates CoordinationService from env var."""
-        monkeypatch.setenv("COORDINATION_CHANNEL_ID", "1234567890")
-        bot = MagicMock(spec=[])  # no attributes at all
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
-        svc = cog._get_coordination()
-        assert isinstance(svc, CoordinationService)
-        assert svc.enabled is True
+    ENV = "COORDINATION_CHANNEL_ID"
 
-    def test_no_op_when_env_var_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """No env var → returns a no-op CoordinationService (never None)."""
-        monkeypatch.delenv("COORDINATION_CHANNEL_ID", raising=False)
-        bot = MagicMock(spec=[])
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
-        svc = cog._get_coordination()
-        assert isinstance(svc, CoordinationService)
-        assert svc.enabled is False  # no-op, but not None
-
-    def test_bot_attribute_takes_precedence(self) -> None:
-        """Explicitly set bot.coordination wins over env var auto-creation."""
-        explicit = CoordinationService(MagicMock(), channel_id=9999)
+    @staticmethod
+    def _cog(bot_service: object = None, **kwargs: object) -> ClaudeChatCog:
         bot = MagicMock()
-        bot.coordination = explicit
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
-        assert cog._get_coordination() is explicit
+        bot.coordination = bot_service
+        return ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), **kwargs)
 
-    def test_constructor_arg_takes_precedence(self) -> None:
-        """Explicitly passed coordination= wins over everything."""
-        explicit = CoordinationService(MagicMock(), channel_id=9999)
-        bot = MagicMock()
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), coordination=explicit)
-        assert cog._get_coordination() is explicit
+    def test_one_is_built_from_the_environment(self, monkeypatch) -> None:
+        monkeypatch.setenv(self.ENV, "4242")
+        cog = self._cog()
 
-    def test_result_is_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Second call returns same object (no repeated env var reads)."""
-        monkeypatch.setenv("COORDINATION_CHANNEL_ID", "1234567890")
-        bot = MagicMock(spec=[])
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
-        assert cog._get_coordination() is cog._get_coordination()
+        service = cog._get_coordination()
+
+        assert isinstance(service, CoordinationService)
+        assert service.channel_id == 4242
+        assert service.enabled is True
+        assert service.bot is cog.bot
+
+    def test_without_the_variable_the_service_does_nothing(self, monkeypatch) -> None:
+        """There is always a service to call — unconfigured, it is just inert."""
+        monkeypatch.delenv(self.ENV, raising=False)
+
+        service = self._cog()._get_coordination()
+
+        assert isinstance(service, CoordinationService)
+        assert service.channel_id is None
+        assert service.enabled is False
+
+    def test_a_bot_with_no_coordination_attribute_at_all_is_fine(self, monkeypatch) -> None:
+        """A consumer's own bot class need not know the attribute exists."""
+        monkeypatch.setenv(self.ENV, "4242")
+        bare_bot = MagicMock(spec=[])
+        assert not hasattr(bare_bot, "coordination")
+        cog = ClaudeChatCog(bot=bare_bot, repo=MagicMock(), runner=MagicMock())
+
+        service = cog._get_coordination()
+
+        assert isinstance(service, CoordinationService)
+        assert service.channel_id == 4242
+        assert service.bot is bare_bot
+
+    def test_the_bots_service_wins_over_the_environment(self, monkeypatch) -> None:
+        monkeypatch.setenv(self.ENV, "4242")
+        on_the_bot = CoordinationService(MagicMock(), 7)
+
+        assert self._cog(on_the_bot)._get_coordination() is on_the_bot
+
+    def test_the_constructor_argument_wins_over_the_bots(self, monkeypatch) -> None:
+        monkeypatch.setenv(self.ENV, "4242")
+        on_the_bot = CoordinationService(MagicMock(), 7)
+        handed_in = CoordinationService(MagicMock(), 8)
+
+        cog = self._cog(on_the_bot, coordination=handed_in)
+
+        assert cog._get_coordination() is handed_in
+
+    def test_the_service_is_built_once(self, monkeypatch) -> None:
+        monkeypatch.setenv(self.ENV, "4242")
+        cog = self._cog()
+
+        first = cog._get_coordination()
+        monkeypatch.setenv(self.ENV, "9999")  # a later change is not picked up
+
+        assert cog._get_coordination() is first
+        assert first.channel_id == 4242
 
 
 class TestSpawnSession:
-    """Tests for ClaudeChatCog.spawn_session()."""
+    """``spawn_session`` — the door for callers that are code rather than people."""
+
+    @staticmethod
+    def _thread_under_channel(thread_id: int = 4300) -> tuple[MagicMock, MagicMock]:
+        """A thread, and the channel whose ``create_thread`` hands it out."""
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 999
+        channel.create_thread = AsyncMock(return_value=thread)
+        return thread, channel
 
     @pytest.mark.asyncio
-    async def test_spawn_creates_thread_and_returns_it(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """spawn_session creates a thread with the right name and returns it."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        import discord
-
-        thread = MagicMock(spec=discord.Thread)
-        thread.id = 42
-        thread.name = "Test spawn"
-        thread.send = AsyncMock()
-
-        channel = MagicMock()
-        channel.create_thread = AsyncMock(return_value=thread)
-
+    async def test_a_public_thread_is_created_and_handed_back(self) -> None:
         bot = MagicMock()
         bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+        thread, channel = self._thread_under_channel()
 
         with patch.object(cog, "_run_claude", new=AsyncMock()):
-            result = await cog.spawn_session(channel, "Do the thing")
+            returned = await cog.spawn_session(channel, "fix the login bug")
+            await asyncio.sleep(0)  # let the background turn start
 
-        assert result is thread
-        channel.create_thread.assert_called_once()
+        assert returned is thread
+        channel.create_thread.assert_awaited_once()
         call_kwargs = channel.create_thread.call_args.kwargs
-        assert call_kwargs["name"] == "Do the thing"
         assert call_kwargs["type"] == discord.ChannelType.public_thread
+        assert call_kwargs["name"] == "fix the login bug"
         # Defaults to 3 days (4320 min) when no setting is configured.
         assert call_kwargs["auto_archive_duration"] == 4320
 
     @pytest.mark.asyncio
-    async def test_spawn_uses_custom_thread_name(self) -> None:
-        """thread_name overrides the default (prompt[:100])."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        import discord
-
-        thread = MagicMock(spec=discord.Thread)
-        thread.send = AsyncMock()
-
-        channel = MagicMock()
-        channel.create_thread = AsyncMock(return_value=thread)
-
+    async def test_a_given_thread_name_is_used(self) -> None:
         bot = MagicMock()
         bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+        _thread, channel = self._thread_under_channel()
 
         with patch.object(cog, "_run_claude", new=AsyncMock()):
-            await cog.spawn_session(channel, "Very long prompt text", thread_name="Short name")
+            await cog.spawn_session(channel, "a long prompt nobody wants as a title", "Nightly")
+            await asyncio.sleep(0)
 
-        kwargs = channel.create_thread.call_args.kwargs
-        assert kwargs["name"] == "Short name"
+        assert channel.create_thread.call_args.kwargs["name"] == "Nightly"
 
     @pytest.mark.asyncio
-    async def test_spawn_posts_seed_message(self) -> None:
-        """spawn_session sends the prompt as the first thread message."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        import discord
-
-        thread = MagicMock(spec=discord.Thread)
-        seed_msg = MagicMock()
-        thread.send = AsyncMock(return_value=seed_msg)
-
-        channel = MagicMock()
-        channel.create_thread = AsyncMock(return_value=thread)
-
+    async def test_the_prompt_is_posted_and_the_turn_runs_on_that_message(self) -> None:
+        """The status reactions need a real message, so the bot posts the prompt
+        itself and Claude is started on it — in the background."""
         bot = MagicMock()
         bot.settings_repo = None
         cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
+        thread, channel = self._thread_under_channel()
+        seed = thread.send.return_value
 
-        mock_run = AsyncMock()
-        with patch.object(cog, "_run_claude", new=mock_run):
-            await cog.spawn_session(channel, "Hello Claude")
+        with patch.object(cog, "_run_claude", new=AsyncMock()) as run:
+            await cog.spawn_session(channel, "do the thing", session_id="sess-9")
+            await asyncio.sleep(0)
 
-        thread.send.assert_called_once_with("Hello Claude")
-        # _run_claude receives the seed message (not a user message)
-        user_msg_arg = mock_run.call_args.args[0]
-        assert user_msg_arg is seed_msg
+        thread.send.assert_awaited_once_with("do the thing")
+        run.assert_awaited_once_with(
+            seed, thread, "do the thing", session_id="sess-9", requester=None, started_by=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_named_repo_is_bound_to_the_thread_before_claude_starts(self) -> None:
+        """#514: the binding decides where the session dir is cloned from."""
+        channel_cog = _make_channel_cog_mock()
+        order: list[str] = []
+        channel_cog.bind_thread = AsyncMock(side_effect=lambda *a, **k: order.append("bind"))
+        cog = _make_cog(channel_cog=channel_cog)
+        thread, channel = self._thread_under_channel()
+        thread.send = AsyncMock(side_effect=lambda *a, **k: order.append("seed"))
+
+        with patch.object(cog, "_run_claude", new=AsyncMock()):
+            await cog.spawn_session(channel, "go", repo="https://github.com/x/y")
+            await asyncio.sleep(0)
+
+        channel_cog.bind_thread.assert_awaited_once_with(4300, "https://github.com/x/y", 999)
+        assert order == ["bind", "seed"]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_thread_creation_is_reported_as_such(self) -> None:
+        """#443: the caller is told it was a permission problem, and nothing runs."""
+        from c_lord.cogs.claude_chat import ThreadCreateForbiddenError
+
+        cog = _make_cog()
+        _thread, channel = self._thread_under_channel()
+        channel.create_thread = AsyncMock(
+            side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions")
+        )
+
+        with (
+            patch.object(cog, "_run_claude", new=AsyncMock()) as run,
+            pytest.raises(ThreadCreateForbiddenError),
+        ):
+            await cog.spawn_session(channel, "go")
+
+        run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_seed_message_is_explained_in_the_channel(self) -> None:
+        """#75: the thread exists but cannot be written to — say so where it can be read."""
+        cog = _make_cog()
+        thread, channel = self._thread_under_channel()
+        thread.send = AsyncMock(
+            side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions")
+        )
+        channel.send = AsyncMock()
+
+        with (
+            patch.object(cog, "_run_claude", new=AsyncMock()) as run,
+            pytest.raises(discord.Forbidden),
+        ):
+            await cog.spawn_session(channel, "go")
+
+        channel.send.assert_awaited_once()
+        run.assert_not_called()
 
 
 class TestDefaultThreadName:
@@ -1084,32 +1216,93 @@ class TestDefaultThreadName:
 
 
 class TestOnReady:
-    """Tests for ClaudeChatCog.on_ready — startup session resume logic."""
+    """What ``on_ready`` does with the restart records the last shutdown left."""
+
+    @staticmethod
+    def _thread(thread_id: int) -> MagicMock:
+        """A thread under a text channel — the only kind a notice is posted to."""
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = thread_id
+        thread.send = AsyncMock()
+        thread.parent = MagicMock(spec=discord.TextChannel)
+        return thread
 
     @pytest.mark.asyncio
-    async def test_on_ready_no_resume_repo_is_noop(self) -> None:
-        """If resume_repo is not set, on_ready should do nothing."""
-        # spec=[] prevents MagicMock from auto-generating resume_repo attribute
-        bot = MagicMock(spec=[])
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock())
-        assert cog._resume_repo is None
-        # Should complete without error and without touching bot
+    async def test_without_a_resume_repo_nothing_is_looked_up(self) -> None:
+        cog = _make_cog()
+        cog._resume_repo = None
+        cog.bot.get_channel = MagicMock(return_value=None)
+
         await cog.on_ready()
 
-    @pytest.mark.asyncio
-    async def test_on_ready_no_pending_is_noop(self) -> None:
-        """If resume_repo returns no pending entries, on_ready does nothing."""
-        from unittest.mock import AsyncMock, MagicMock
+        assert cog._lamp_recovery_tasks == set()
+        cog.bot.get_channel.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_a_bot_with_no_optional_attributes_starts_up_cleanly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Zero-config: a bot carrying no ``resume_repo`` / ``ask_repo`` — not even
+        a ``user`` yet — still gets through ``on_ready`` and its startup recovery.
+
+        Each recovery step has an "there is nothing to do" way out for exactly
+        this bot. Missing one of them does not crash startup (the steps are
+        isolated) — it shows up as a WARNING about something that could not be
+        read, so that is what is watched for.
+        """
+        bare_bot = MagicMock(spec=[])
+        repo = MagicMock()
+        repo.get = AsyncMock(return_value=None)
+        cog = ClaudeChatCog(
+            bot=bare_bot,
+            repo=repo,
+            runner=MagicMock(),
+            authorizer=Authorizer(allow_anyone=True),
+        )
+        assert cog._resume_repo is None
+        assert cog._ask_repo is None
+
+        recovery_loggers = (
+            "c_lord.ask_menu_recovery",
+            "c_lord.stale_stop_buttons",
+            "c_lord.startup_recovery",
+        )
+        with caplog.at_level(logging.DEBUG):
+            await cog.on_ready()
+            await asyncio.wait_for(cog._stop_sweep_task, timeout=5)
+
+        assert cog._stop_sweep_task.exception() is None
+        assert cog._lamp_recovery_tasks == set()
+        complaints = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name in recovery_loggers and r.levelno >= logging.WARNING
+        ]
+        assert complaints == []
+        # The dead-button sweep says why it did nothing: nobody is logged in.
+        assert any(
+            r.name == "c_lord.stale_stop_buttons" and "not logged in" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_with_no_records_nothing_is_posted(self) -> None:
         from c_lord.database.resume_repo import PendingResumeRepository
 
         resume_repo = MagicMock(spec=PendingResumeRepository)
         resume_repo.get_pending = AsyncMock(return_value=[])
+        resume_repo.delete = AsyncMock()
+        cog = _make_cog()
+        cog._resume_repo = resume_repo
+        cog.bot.get_channel = MagicMock(return_value=None)
 
-        bot = MagicMock()
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
         await cog.on_ready()
-        bot.get_channel.assert_not_called()
+
+        resume_repo.get_pending.assert_awaited_once()
+        resume_repo.delete.assert_not_called()
+        assert cog._lamp_recovery_tasks == set()
+        # No record, no thread to look for.
+        cog.bot.get_channel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_on_ready_deletes_before_acting(self) -> None:
@@ -1119,41 +1312,29 @@ class TestOnReady:
         but the delete-first ordering that prevents a double-fire across a racy
         reconnect must be preserved.
         """
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        import discord
-
         from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
 
-        entry = PendingResume(
-            id=7,
-            thread_id=555,
-            session_id="sess-abc",
+        call_order: list[str] = []
+        pending = PendingResume(
+            id=1,
+            thread_id=6100,
+            session_id="sess-6100",
             reason="bot_shutdown",
-            resume_prompt="Continue please.",
-            created_at="2026-02-21 20:00:00",
+            resume_prompt=None,
+            created_at="2026-06-12 05:00:00",
         )
         resume_repo = MagicMock(spec=PendingResumeRepository)
-        resume_repo.get_pending = AsyncMock(return_value=[entry])
-        resume_repo.delete = AsyncMock()
-
-        thread = MagicMock(spec=discord.Thread)
-        thread.id = 555
-        parent = MagicMock(spec=discord.TextChannel)
-        thread.parent = parent
-
-        bot = MagicMock()
-        bot.get_channel.return_value = thread
-
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
-
-        call_order: list[str] = []
-        resume_repo.delete.side_effect = lambda _: call_order.append("delete")
+        resume_repo.get_pending = AsyncMock(return_value=[pending])
+        resume_repo.delete = AsyncMock(side_effect=lambda *a, **k: call_order.append("delete"))
+        thread = self._thread(6100)
+        cog = _make_cog()
+        cog._resume_repo = resume_repo
+        cog.bot.get_channel = MagicMock(return_value=thread)
         thread.send = AsyncMock(side_effect=lambda *a, **k: call_order.append("notice"))
 
         with patch.object(cog, "_run_claude", new=AsyncMock()) as mock_run:
             await cog.on_ready()
-            await asyncio.sleep(0)
+            await asyncio.gather(*cog._lamp_recovery_tasks)
 
         assert call_order == ["delete", "notice"], (
             "delete() must be called before the restart notice to prevent double-fire"
@@ -1161,36 +1342,93 @@ class TestOnReady:
         # #406: no re-prompt — Claude is never re-run on restart.
         mock_run.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_on_ready_skips_non_thread_channels(self) -> None:
-        """If get_channel returns a non-Thread, skip gracefully."""
-        from unittest.mock import AsyncMock, MagicMock
-
-        import discord
-
+    def _cog_with_records(self, *pairs: tuple[int, int]) -> tuple[ClaudeChatCog, MagicMock]:
+        """A cog whose resume repo holds one record per (record id, thread id) pair."""
         from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
 
-        entry = PendingResume(
-            id=1,
-            thread_id=100,
-            session_id=None,
-            reason="self_restart",
-            resume_prompt=None,
-            created_at="2026-02-21 20:00:00",
-        )
+        records = [
+            PendingResume(
+                id=record_id,
+                thread_id=thread_id,
+                session_id=f"sess-{thread_id}",
+                reason="bot_shutdown",
+                resume_prompt=None,
+                created_at="2026-06-12 05:00:00",
+            )
+            for record_id, thread_id in pairs
+        ]
         resume_repo = MagicMock(spec=PendingResumeRepository)
-        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.get_pending = AsyncMock(return_value=records)
         resume_repo.delete = AsyncMock()
+        cog = _make_cog()
+        cog._resume_repo = resume_repo
+        return cog, resume_repo
 
-        # Return a TextChannel (not a Thread) — should be skipped
-        bot = MagicMock()
-        bot.get_channel.return_value = MagicMock(spec=discord.TextChannel)
+    @pytest.mark.asyncio
+    async def test_a_record_for_a_plain_channel_is_dropped_without_a_notice(self) -> None:
+        """Only threads get a notice — but the record is used up all the same."""
+        cog, resume_repo = self._cog_with_records((5, 6300))
+        not_a_thread = MagicMock(spec=discord.TextChannel)
+        not_a_thread.send = AsyncMock()
+        cog.bot.get_channel = MagicMock(return_value=not_a_thread)
 
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
-        # Should not raise
         await cog.on_ready()
-        # delete was still called (single-fire)
-        resume_repo.delete.assert_called_once_with(1)
+
+        resume_repo.delete.assert_awaited_once_with(5)
+        not_a_thread.send.assert_not_called()
+        assert cog._lamp_recovery_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_a_thread_outside_a_text_channel_is_skipped(self) -> None:
+        cog, resume_repo = self._cog_with_records((6, 6400))
+        thread = self._thread(6400)
+        thread.parent = MagicMock(spec=discord.ForumChannel)
+        cog.bot.get_channel = MagicMock(return_value=thread)
+
+        await cog.on_ready()
+
+        resume_repo.delete.assert_awaited_once_with(6)
+        thread.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_thread_missing_from_the_cache_is_fetched(self) -> None:
+        cog, _resume_repo = self._cog_with_records((7, 6500))
+        thread = self._thread(6500)
+        cog.bot.get_channel = MagicMock(return_value=None)
+        cog.bot.fetch_channel = AsyncMock(return_value=thread)
+
+        await cog.on_ready()
+        await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        cog.bot.fetch_channel.assert_awaited_once_with(6500)
+        thread.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_one_unreachable_thread_does_not_cost_the_others_their_notice(self) -> None:
+        cog, resume_repo = self._cog_with_records((8, 6600), (9, 6700))
+        reachable = self._thread(6700)
+        cog.bot.get_channel = MagicMock(return_value=None)
+        cog.bot.fetch_channel = AsyncMock(
+            side_effect=[discord.NotFound(MagicMock(status=404), "Unknown Channel"), reachable]
+        )
+
+        await cog.on_ready()
+        await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        assert [c.args[0] for c in resume_repo.delete.await_args_list] == [8, 9]
+        reachable.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_notice_that_cannot_be_posted_does_not_stop_startup(self) -> None:
+        cog, _resume_repo = self._cog_with_records((10, 6800), (11, 6900))
+        broken, fine = self._thread(6800), self._thread(6900)
+        broken.send = AsyncMock(side_effect=RuntimeError("discord is having a day"))
+        cog.bot.get_channel = MagicMock(side_effect={6800: broken, 6900: fine}.get)
+
+        await cog.on_ready()
+        await asyncio.gather(*cog._lamp_recovery_tasks)
+
+        fine.send.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_on_ready_posts_quiet_notice_and_does_not_reprompt(self) -> None:
@@ -1203,16 +1441,12 @@ class TestOnReady:
         "jump".  on_ready must instead post a subtle ``-#`` subtext notice and
         leave the live session alone.
         """
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        import discord
-
         from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
 
-        entry = PendingResume(
+        pending = PendingResume(
             id=9,
-            thread_id=555,
-            session_id="sess-abc",
+            thread_id=6200,
+            session_id="sess-6200",
             reason="bot_shutdown",
             resume_prompt=(
                 "ボットが再起動しました。前の作業の続きを確認し、必要な残作業があれば完了してください。"
@@ -1220,18 +1454,16 @@ class TestOnReady:
             created_at="2026-06-12 05:00:00",
         )
         resume_repo = MagicMock(spec=PendingResumeRepository)
-        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.get_pending = AsyncMock(return_value=[pending])
         resume_repo.delete = AsyncMock()
-
         thread = MagicMock(spec=discord.Thread)
-        thread.id = 555
-        thread.send = AsyncMock(return_value=MagicMock())
+        thread.id = 6200
+        thread.send = AsyncMock()
         thread.parent = MagicMock(spec=discord.TextChannel)
 
-        bot = MagicMock()
-        bot.get_channel.return_value = thread
-
-        cog = ClaudeChatCog(bot=bot, repo=MagicMock(), runner=MagicMock(), resume_repo=resume_repo)
+        cog = _make_cog()
+        cog._resume_repo = resume_repo
+        cog.bot.get_channel = MagicMock(return_value=thread)
 
         with patch.object(cog, "_run_claude", new=AsyncMock()) as mock_run:
             await cog.on_ready()
@@ -1252,49 +1484,59 @@ class TestOnReady:
 
 
 class TestCogUnloadMarkForResume:
-    """Tests for cog_unload() auto-marking active sessions for restart-resume."""
+    """At shutdown, every turn still running is written down for a restart notice."""
 
     def _make_cog_with_resume_repo(self) -> tuple[ClaudeChatCog, MagicMock, MagicMock]:
-        """Return (cog, repo, resume_repo) with resume_repo configured."""
-        bot = MagicMock()
-        bot.channel_id = 999
+        """Return (cog, session repo, resume repo); the session repo has no rows."""
+        from c_lord.database.resume_repo import PendingResumeRepository
+
         repo = MagicMock()
         repo.get = AsyncMock(return_value=None)
-        resume_repo = MagicMock()
-        resume_repo.mark = AsyncMock(return_value=1)
-        cog = ClaudeChatCog(bot=bot, repo=repo, runner=MagicMock(), resume_repo=resume_repo)
+        repo.flush_unapplied_clears = AsyncMock()
+        resume_repo = MagicMock(spec=PendingResumeRepository)
+        resume_repo.mark = AsyncMock()
+        cog = ClaudeChatCog(bot=MagicMock(), repo=repo, runner=MagicMock(), resume_repo=resume_repo)
         return cog, repo, resume_repo
 
     @pytest.mark.asyncio
-    async def test_no_op_when_no_active_runners(self) -> None:
-        """cog_unload is a no-op when no sessions are running."""
-        cog, _, resume_repo = self._make_cog_with_resume_repo()
-        assert len(cog._active_runners) == 0
+    async def test_with_no_turn_running_nothing_is_recorded(self) -> None:
+        cog, repo, resume_repo = self._make_cog_with_resume_repo()
 
         await cog.cog_unload()
 
         resume_repo.mark.assert_not_called()
+        repo.get.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_op_when_no_resume_repo(self) -> None:
-        """cog_unload is a no-op when resume_repo is not configured."""
-        cog = _make_cog()  # no resume_repo
+    async def test_without_a_resume_repo_shutdown_still_completes(self) -> None:
+        cog, repo, _resume_repo = self._make_cog_with_resume_repo()
+        cog._resume_repo = None
         cog._active_runners[111] = MagicMock()
 
-        await cog.cog_unload()  # Should not raise
+        await cog.cog_unload()
+
+        repo.get.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_marks_each_active_runner(self) -> None:
-        """Calls resume_repo.mark() for every thread in _active_runners."""
-        cog, repo, resume_repo = self._make_cog_with_resume_repo()
+    async def test_every_running_thread_is_recorded_once(self) -> None:
+        cog, _repo, resume_repo = self._make_cog_with_resume_repo()
         cog._active_runners[111] = MagicMock()
         cog._active_runners[222] = MagicMock()
 
         await cog.cog_unload()
 
-        assert resume_repo.mark.call_count == 2
-        called_thread_ids = {call.args[0] for call in resume_repo.mark.call_args_list}
-        assert called_thread_ids == {111, 222}
+        assert [c.args[0] for c in resume_repo.mark.await_args_list] == [111, 222]
+
+    @pytest.mark.asyncio
+    async def test_a_thread_both_running_and_adopted_is_recorded_once(self) -> None:
+        cog, repo, resume_repo = self._make_cog_with_resume_repo()
+        repo.update_trigger_message = AsyncMock()
+        cog._active_runners[111] = MagicMock()
+        cog._adopted_lamps[111] = 4444
+
+        await cog.cog_unload()
+
+        resume_repo.mark.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_an_adopted_lamp_is_recorded_again(self) -> None:
@@ -1324,53 +1566,85 @@ class TestCogUnloadMarkForResume:
         repo.update_trigger_message.assert_awaited_once_with(111, 5555)
 
     @pytest.mark.asyncio
-    async def test_uses_bot_shutdown_reason(self) -> None:
-        """Marks sessions with reason='bot_shutdown'."""
-        cog, _, resume_repo = self._make_cog_with_resume_repo()
-        cog._active_runners[333] = MagicMock()
+    async def test_the_record_says_shutdown_and_carries_no_prompt(self) -> None:
+        """#406: the notice is all a restart posts — there is no prompt to replay."""
+        cog, _repo, resume_repo = self._make_cog_with_resume_repo()
+        cog._active_runners[111] = MagicMock()
 
         await cog.cog_unload()
 
-        call_kwargs = resume_repo.mark.call_args.kwargs
-        assert call_kwargs["reason"] == "bot_shutdown"
+        kwargs = resume_repo.mark.await_args.kwargs
+        assert kwargs["reason"] == "bot_shutdown"
+        assert kwargs["resume_prompt"] is None
 
     @pytest.mark.asyncio
-    async def test_resolves_session_id_from_repo(self) -> None:
-        """Looks up session_id from self.repo for --resume continuity."""
+    async def test_the_session_id_comes_from_the_session_row(self) -> None:
         cog, repo, resume_repo = self._make_cog_with_resume_repo()
-        session_record = MagicMock()
-        session_record.session_id = "test-session-xyz"
-        repo.get = AsyncMock(return_value=session_record)
+        repo.get = AsyncMock(return_value=MagicMock(session_id="sess-on-record"))
+        cog._active_runners[111] = MagicMock()
 
-        cog._active_runners[444] = MagicMock()
         await cog.cog_unload()
 
-        repo.get.assert_awaited_once_with(444)
-        assert resume_repo.mark.call_args.kwargs["session_id"] == "test-session-xyz"
+        repo.get.assert_awaited_once_with(111)
+        assert resume_repo.mark.await_args.kwargs["session_id"] == "sess-on-record"
 
     @pytest.mark.asyncio
-    async def test_continues_on_mark_failure(self) -> None:
-        """Failure to mark one thread does not prevent marking others."""
-        cog, _, resume_repo = self._make_cog_with_resume_repo()
-        resume_repo.mark = AsyncMock(side_effect=[RuntimeError("db error"), 2])
+    async def test_a_thread_without_a_row_is_recorded_with_no_session_id(self) -> None:
+        cog, _repo, resume_repo = self._make_cog_with_resume_repo()
+        cog._active_runners[111] = MagicMock()
+
+        await cog.cog_unload()
+
+        assert resume_repo.mark.await_args.kwargs["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_one_failed_record_does_not_cost_the_others_theirs(self) -> None:
+        cog, _repo, resume_repo = self._make_cog_with_resume_repo()
+        resume_repo.mark = AsyncMock(side_effect=[RuntimeError("database is locked"), None])
         cog._active_runners[111] = MagicMock()
         cog._active_runners[222] = MagicMock()
 
-        # Should not raise
-        await cog.cog_unload()
+        await cog.cog_unload()  # must not raise
 
-        assert resume_repo.mark.call_count == 2
+        assert [c.args[0] for c in resume_repo.mark.await_args_list] == [111, 222]
 
     @pytest.mark.asyncio
-    async def test_uses_none_session_id_when_repo_has_no_record(self) -> None:
-        """Falls back to session_id=None when no session record exists."""
+    async def test_a_lamp_that_cannot_be_saved_does_not_cost_the_notice(self) -> None:
         cog, repo, resume_repo = self._make_cog_with_resume_repo()
-        repo.get = AsyncMock(return_value=None)
-        cog._active_runners[555] = MagicMock()
+        repo.update_trigger_message = AsyncMock(side_effect=RuntimeError("database is locked"))
+        cog._active_runners[111] = MagicMock()
+        cog._turn_triggers[111] = 5555
 
         await cog.cog_unload()
 
-        assert resume_repo.mark.call_args.kwargs["session_id"] is None
+        resume_repo.mark.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_trigger_whose_clear_is_waiting_is_not_written_back(self) -> None:
+        """#1262: a trigger the turn already forgot must not come back at shutdown."""
+        cog, repo, resume_repo = self._make_cog_with_resume_repo()
+        repo.update_trigger_message = AsyncMock()
+        repo.clear_is_waiting = MagicMock(return_value=True)
+        cog._active_runners[111] = MagicMock()
+        cog._turn_triggers[111] = 5555
+
+        await cog.cog_unload()
+
+        repo.clear_is_waiting.assert_called_once_with(111, 5555)
+        repo.update_trigger_message.assert_not_called()
+        resume_repo.mark.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_waiting_trigger_clears_are_flushed_last(self) -> None:
+        cog, repo, resume_repo = self._make_cog_with_resume_repo()
+        order: list[str] = []
+        resume_repo.mark = AsyncMock(side_effect=lambda *a, **k: order.append("mark"))
+        repo.flush_unapplied_clears = AsyncMock(side_effect=lambda: order.append("flush"))
+        cog._active_runners[111] = MagicMock()
+
+        await cog.cog_unload()
+
+        assert order == ["mark", "flush"]
 
 
 class TestStartSessionCommand:
@@ -1388,9 +1662,9 @@ class TestStartSessionCommand:
 
         await cog.start_session.callback(cog, interaction, prompt="hello")
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        reply = _first_reply(interaction)
+        assert reply.kwargs.get("ephemeral") is True
+        assert "not authorized" in reply.args[0].lower()
 
     @pytest.mark.asyncio
     async def test_an_authorized_user_reaches_the_command(self) -> None:
@@ -1403,7 +1677,7 @@ class TestStartSessionCommand:
         """
         cc = _make_channel_cog_mock(tmux_manager=MagicMock())
         cog = _make_cog(channel_cog=cc)
-        interaction = _make_channel_interaction()
+        interaction = MagicMock(spec=discord.Interaction)
         interaction.user = MagicMock()
         interaction.user.id = 42
         interaction.channel = MagicMock(spec=discord.TextChannel)
@@ -1478,8 +1752,8 @@ class TestStartSessionCommand:
         await cog.start_session.callback(cog, interaction, prompt="continue this")
 
         interaction.response.defer.assert_called_once()
-        cog._run_claude.assert_called_once()
-        _, kwargs = cog._run_claude.call_args
+        cog._run_claude.assert_awaited_once()
+        kwargs = cog._run_claude.await_args.kwargs
         assert kwargs["session_id"] == "sess-abc"
         assert kwargs["prompt"] == "continue this"
 
@@ -1518,9 +1792,11 @@ class TestStartSessionCommand:
         await cog.start_session.callback(cog, interaction, prompt="start fresh")
 
         cog._run_claude.assert_not_called()
-        thread.send.assert_not_called()
+        interaction.response.defer.assert_not_called()
         said = str(interaction.response.send_message.call_args.args[0])
         assert "c-lord のスレッドではない" in said, said
+        # Somebody else's conversation: the refusal goes to the caller alone.
+        thread.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_other_clords_thread_names_the_owner(self) -> None:
@@ -1555,10 +1831,12 @@ class TestStartSessionCommand:
         await cog.start_session.callback(cog, interaction, prompt="start fresh")
 
         cog._run_claude.assert_not_called()
-        thread.send.assert_not_called()
+        interaction.response.defer.assert_not_called()
         said = str(interaction.response.send_message.call_args.args[0])
         assert f"<@{other}>" in said, said
         assert "c-lord のスレッドではない" not in said, said
+        # Nothing is posted into the other bot's thread.
+        thread.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_any_channel_allowed(self) -> None:
@@ -1639,8 +1917,8 @@ class TestClordTextCommand:
 
         await cog.clord_text.callback(cog, ctx, prompt="continue this")
 
-        cog._run_claude.assert_called_once()
-        _, kwargs = cog._run_claude.call_args
+        cog._run_claude.assert_awaited_once()
+        kwargs = cog._run_claude.await_args.kwargs
         assert kwargs["session_id"] == "sess-abc"
         assert kwargs["prompt"] == "continue this"
 
@@ -1673,9 +1951,9 @@ class TestAttachWindowCommand:
 
         await cog.attach_window.callback(cog, interaction, window="work1")
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        reply = _first_reply(interaction)
+        assert reply.kwargs.get("ephemeral") is True
+        assert "thread" in reply.args[0].lower()
 
     @pytest.mark.asyncio
     async def test_attach_unauthorized_user_rejected(self) -> None:
@@ -1689,9 +1967,9 @@ class TestAttachWindowCommand:
 
         await cog.attach_window.callback(cog, interaction, window="work1")
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        reply = _first_reply(interaction)
+        assert reply.kwargs.get("ephemeral") is True
+        assert "not authorized" in reply.args[0].lower()
 
     @pytest.mark.asyncio
     async def test_attach_no_tmux_manager(self) -> None:
@@ -1704,9 +1982,9 @@ class TestAttachWindowCommand:
 
         await cog.attach_window.callback(cog, interaction, window="work1")
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        reply = _first_reply(interaction)
+        assert reply.kwargs.get("ephemeral") is True
+        assert "tmux" in reply.args[0].lower()
 
     @pytest.mark.asyncio
     async def test_attach_success(self) -> None:
@@ -1716,14 +1994,14 @@ class TestAttachWindowCommand:
         cc = _make_channel_cog_mock(tmux_manager=tmux_mgr)
         cog = _make_cog(channel_cog=cc)
 
-        interaction = _make_thread_interaction(thread_id=12345)
+        interaction = _make_thread_interaction(12345)
         interaction.user = MagicMock()
         interaction.user.id = 42
 
         await cog.attach_window.callback(cog, interaction, window="work3")
 
         tmux_mgr.remap_window.assert_called_once_with(12345, "work3")
-        interaction.response.send_message.assert_called_once()
+        interaction.response.send_message.assert_awaited_once()
         msg = interaction.response.send_message.call_args.args[0]
         assert "work3" in msg
         # DB session record must be created so on_message picks up thread replies
@@ -1737,15 +2015,15 @@ class TestAttachWindowCommand:
         cc = _make_channel_cog_mock(tmux_manager=tmux_mgr)
         cog = _make_cog(channel_cog=cc)
 
-        interaction = _make_thread_interaction(thread_id=12345)
+        interaction = _make_thread_interaction(12345)
         interaction.user = MagicMock()
         interaction.user.id = 42
 
         await cog.attach_window.callback(cog, interaction, window="nonexistent")
 
-        interaction.response.send_message.assert_called_once()
-        call_kwargs = interaction.response.send_message.call_args.kwargs
-        assert call_kwargs.get("ephemeral") is True
+        tmux_mgr.remap_window.assert_called_once_with(12345, "nonexistent")
+        cog.repo.save.assert_not_called()
+        assert _first_reply(interaction).kwargs.get("ephemeral") is True
         msg = interaction.response.send_message.call_args.args[0]
         assert "nonexistent" in msg
 
@@ -1862,9 +2140,10 @@ class TestOnMessageSkipsTextCommands:
         thread.parent_id = 999  # matches bot.channel_id
 
         msg = MagicMock(spec=discord.Message)
-        msg.channel = thread
+        # An ordinary message type, so it is the command check that stops it.
+        msg.type = discord.MessageType.default
         msg.content = "!attach work13"
-        msg.attachments = []
+        msg.channel = thread
         msg.author = MagicMock()
         msg.author.bot = False
         msg.author.id = 42
@@ -1890,9 +2169,9 @@ class TestOnMessageSkipsTextCommands:
         thread.parent_id = 999  # matches bot.channel_id
 
         msg = MagicMock(spec=discord.Message)
-        msg.channel = thread
+        msg.id = 1
         msg.content = "hello Claude"
-        msg.attachments = []
+        msg.channel = thread
         msg.author = MagicMock()
         msg.author.bot = False
         msg.author.id = 42
@@ -1923,9 +2202,9 @@ class TestOnMessageSkipsSystemMessages:
         thread.parent_id = 999
 
         msg = MagicMock(spec=discord.Message)
-        msg.channel = thread
+        msg.id = 1
         msg.content = ""
-        msg.attachments = []
+        msg.channel = thread
         msg.author = MagicMock()
         msg.author.bot = False
         msg.author.id = 99
@@ -2009,13 +2288,13 @@ class TestMultiChannelOnMessage:
         thread = MagicMock(spec=discord.Thread)
         thread.id = thread_id
         thread.parent_id = parent_id
-        thread.send = AsyncMock()
         msg = MagicMock(spec=discord.Message)
+        msg.id = 1
         msg.channel = thread
         msg.content = "follow up"
-        msg.attachments = []
         msg.author = MagicMock()
         msg.author.bot = False
+        msg.author.id = 42
         msg.webhook_id = None
         msg.type = discord.MessageType.default
         return msg
@@ -2150,7 +2429,7 @@ class TestClearCommand:
 
         await cog.clear_session.callback(cog, interaction)
 
-        interaction.response.send_message.assert_called_once()
+        interaction.response.send_message.assert_awaited_once()
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
     @pytest.mark.asyncio
@@ -2190,7 +2469,7 @@ class TestClearCommand:
 
         await cog.clear_session.callback(cog, interaction)
 
-        interaction.response.send_message.assert_called_once()
+        interaction.response.send_message.assert_awaited_once()
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
 
@@ -2221,19 +2500,19 @@ class TestCompactCommand:
 
         await cog.compact_session.callback(cog, interaction)
 
-        interaction.response.send_message.assert_called_once()
+        interaction.response.send_message.assert_awaited_once()
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
     @pytest.mark.asyncio
     async def test_compact_no_tmux_manager_sends_ephemeral(self) -> None:
         """/compact with no tmux binding sends an ephemeral error."""
         cog = _make_cog()  # channel_cog None → _resolve_tmux_manager returns None
-        interaction = _make_thread_interaction(thread_id=12345)
+        interaction = _make_thread_interaction(12345)
         interaction.channel.parent_id = 999
 
         await cog.compact_session.callback(cog, interaction)
 
-        interaction.response.send_message.assert_called_once()
+        interaction.response.send_message.assert_awaited_once()
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
 
     @pytest.mark.asyncio
@@ -2243,12 +2522,12 @@ class TestCompactCommand:
         tmux_manager.is_claude_running = MagicMock(return_value=False)
         channel_cog = _make_channel_cog_mock(tmux_manager=tmux_manager)
         cog = _make_cog(channel_cog=channel_cog)
-        interaction = _make_thread_interaction(thread_id=12345)
+        interaction = _make_thread_interaction(12345)
         interaction.channel.parent_id = 999
 
         await cog.compact_session.callback(cog, interaction)
 
-        interaction.response.send_message.assert_called_once()
+        interaction.response.send_message.assert_awaited_once()
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
         tmux_manager.send_literal.assert_not_called()
 
@@ -2787,7 +3066,6 @@ class TestDiscordLinkEnrichmentWireIn:
             return_value=self._channel_with_message("the linked content")
         )
         cog._run_claude = AsyncMock()
-
         thread = MagicMock(spec=discord.Thread)
         thread.id = 42
         thread.parent_id = 999
@@ -2798,8 +3076,6 @@ class TestDiscordLinkEnrichmentWireIn:
         msg.reference = None
         msg.content = "look 👉 https://discord.com/channels/111/222/333"
         msg.attachments = []
-        msg.author = MagicMock()
-        msg.author.bot = False
 
         await cog._handle_thread_reply(msg)
         # The run is now dispatched as its own task off the lock (#315) — await it
@@ -2843,13 +3119,12 @@ class TestDiscordLinkEnrichmentWireIn:
         # A channel that WOULD enrich if enrichment were (wrongly) called on the seed.
         cog.bot.get_channel = MagicMock(return_value=self._channel_with_message("LEAKED"))
         cog._run_claude = AsyncMock()
-
         thread = MagicMock(spec=discord.Thread)
         thread.id = 5
         thread.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
         channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 999
         channel.create_thread = AsyncMock(return_value=thread)
-
         prompt = "do it https://discord.com/channels/111/222/333"
         await cog.spawn_session(channel, prompt)
         await asyncio.sleep(0)  # let the create_task(_run_claude) run
@@ -2871,7 +3146,7 @@ class TestOnReadyLampRecovery:
     def _cog(self, record, thread):
         from c_lord.database.resume_repo import PendingResume, PendingResumeRepository
 
-        entry = PendingResume(
+        pending = PendingResume(
             id=3,
             thread_id=thread.id,
             session_id="sess",
@@ -2880,12 +3155,12 @@ class TestOnReadyLampRecovery:
             created_at="2026-09-30 10:00:00",
         )
         resume_repo = MagicMock(spec=PendingResumeRepository)
-        resume_repo.get_pending = AsyncMock(return_value=[entry])
+        resume_repo.get_pending = AsyncMock(return_value=[pending])
         resume_repo.delete = AsyncMock()
         repo = MagicMock()
         repo.get = AsyncMock(return_value=record)
         bot = MagicMock()
-        bot.get_channel.return_value = thread
+        bot.get_channel = MagicMock(return_value=thread)
         return ClaudeChatCog(bot=bot, repo=repo, runner=MagicMock(), resume_repo=resume_repo)
 
     def _thread(self, thread_id: int = 7188):
@@ -3131,7 +3406,7 @@ class TestOneStopPath:
         cog._stop_thread_work = AsyncMock(return_value=StopResult(StopOutcome.STOPPED))  # type: ignore[method-assign]
         ctx = _make_thread_ctx(thread_id=12345)
         await cog.stop_text.callback(cog, ctx)
-        interaction = _make_thread_interaction(thread_id=12345)
+        interaction = _make_thread_interaction(12345)
         await cog.stop_session.callback(cog, interaction)
         assert cog._stop_thread_work.await_count == 2
 
@@ -3151,7 +3426,8 @@ class TestOneStopPath:
         interaction.response.edit_message = AsyncMock()
         interaction.followup = MagicMock()
         interaction.followup.send = AsyncMock()
-        await btn.callback.callback(view, interaction, btn)
+
+        await btn.callback(interaction)
 
         cog._stop_thread_work.assert_awaited_once_with(thread)
 
@@ -3309,3 +3585,89 @@ class TestAdoptedLampOfADeadTurn(TestOnReadyLampRecovery):
     async def test_a_pane_that_cannot_be_read_keeps_the_watch(self, tmp_path) -> None:
         """#510's asymmetry: "could not tell" is never read as "it died"."""
         assert await self._adopt(tmp_path, None) == {9920: 4242}
+
+
+class TestSessionRunningNotice:
+    """The line a turn posts its ⏹ Stop button on.
+
+    The startup sweep (#634) recognises a dead button by this text, and a
+    reader recognises a running turn by it — so the wording is pinned here, on
+    the message a turn really posts.
+    """
+
+    class _ReachedClaude(BaseException):
+        """Raised in place of the Claude run: everything before it has happened."""
+
+    async def _notice_of_a_turn(self, window_name: str | None) -> tuple[str, object]:
+        """Run a turn up to the Claude call; return the text and view of its Stop notice."""
+        from c_lord.discord_ui.views import StopView
+
+        bot = MagicMock()
+        bot.channel_id = 999
+        bot.settings_repo = None
+        bot.transcript_mirror_cog = None
+        bot.user = MagicMock(id=1111)
+        bot.get_cog = MagicMock(return_value=None)
+        repo = MagicMock()
+        repo.get = AsyncMock(return_value=None)
+        repo.save = AsyncMock()
+        repo.update_trigger_message = AsyncMock()
+        config = MagicMock()
+        config.working_dir = "/tmp/work"
+        config.model = None
+        config.timeout_seconds = 60
+        config.effort = None
+        cog = ClaudeChatCog(bot=bot, repo=repo, runner=config)
+
+        sessions = MagicMock()
+        sessions.create_session_dir = MagicMock(return_value="/tmp/work")
+        tmux = MagicMock()
+        tmux.create_session = MagicMock(return_value=window_name)
+        cog._resolve_session_dir_manager = AsyncMock(return_value=sessions)  # type: ignore[method-assign]
+        cog._resolve_tmux_manager = AsyncMock(return_value=tmux)  # type: ignore[method-assign]
+        cog._get_dashboard = MagicMock(return_value=None)  # type: ignore[method-assign]
+        cog._get_coordination = MagicMock(return_value=None)  # type: ignore[method-assign]
+        cog._get_current_model = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        cog._apply_thread_naming = AsyncMock()  # type: ignore[method-assign]
+
+        author = MagicMock()
+        author.id = 4242
+        author.display_name = author.name = "someone"
+        author.bot = False
+        message = MagicMock(spec=discord.Message)
+        message.id = 77
+        message.author = author
+        message.add_reaction = AsyncMock()
+        message.remove_reaction = AsyncMock()
+        message.clear_reaction = AsyncMock()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id = 501
+        thread.parent_id = 500
+        thread.send = AsyncMock(return_value=MagicMock())
+
+        reached = AsyncMock(side_effect=self._ReachedClaude)
+        with (
+            patch("c_lord.cogs.claude_chat.run_claude_with_config", reached),
+            contextlib.suppress(self._ReachedClaude),
+        ):
+            await cog._run_claude(message, thread, "hi", None)
+        reached.assert_awaited_once()
+
+        (notice,) = [
+            call
+            for call in thread.send.await_args_list
+            if isinstance(call.kwargs.get("view"), StopView)
+        ]
+        return notice.args[0], notice.kwargs["view"]
+
+    @pytest.mark.asyncio
+    async def test_it_names_the_tmux_window_the_turn_runs_in(self) -> None:
+        text, _view = await self._notice_of_a_turn("w7")
+
+        assert text == "-# ⏺ Session running (`w7`)"
+
+    @pytest.mark.asyncio
+    async def test_without_a_window_name_it_is_the_bare_line(self) -> None:
+        text, _view = await self._notice_of_a_turn(None)
+
+        assert text == "-# ⏺ Session running"

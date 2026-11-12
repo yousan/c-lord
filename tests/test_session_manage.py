@@ -1,4 +1,4 @@
-"""Tests for SessionManageCog: /sessions, /resume-info, /sync-sessions commands."""
+"""SessionManageCog: the workspace commands and their ``!text`` twins."""
 
 from __future__ import annotations
 
@@ -7,55 +7,61 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 
 from c_lord.database.repository import SessionRecord
+from c_lord.discord_ui.authorization import Authorizer
 
 
 def _make_record(
-    thread_id: int = 100,
-    session_id: str = "abc-123",
-    origin: str = "discord",
-    summary: str | None = "Fix login bug",
-    working_dir: str | None = "/home/user",
-    model: str | None = "sonnet",
+    thread_id: int = 12345,
+    session_id: str = "tmux-12345",
+    summary: str | None = None,
 ) -> SessionRecord:
+    """A ``sessions`` row as the repository hands it out (open, never closed)."""
     return SessionRecord(
         thread_id=thread_id,
         session_id=session_id,
-        working_dir=working_dir,
-        model=model,
-        origin=origin,
+        working_dir=f"/sessions/{thread_id}",
+        model="sonnet",
+        origin="discord",
         summary=summary,
-        created_at="2026-02-19 10:00:00",
-        last_used_at="2026-02-19 11:00:00",
+        created_at="2026-08-01 09:00:00",
+        last_used_at="2026-08-01 09:30:00",
     )
 
 
-def _make_thread_interaction(thread_id: int = 12345) -> MagicMock:
-    interaction = MagicMock(spec=discord.Interaction)
-    thread = MagicMock(spec=discord.Thread)
-    thread.id = thread_id
-    interaction.channel = thread
-    interaction.response = MagicMock()
-    interaction.response.send_message = AsyncMock()
-    return interaction
-
-
-def _make_channel_interaction() -> MagicMock:
-    interaction = MagicMock(spec=discord.Interaction)
-    interaction.channel = MagicMock(spec=discord.TextChannel)
-    interaction.response = MagicMock()
-    interaction.response.send_message = AsyncMock()
-    return interaction
-
-
 def _make_cog():
+    """A cog on a bot with no ChannelRepoCog loaded, open to every caller.
+
+    ``bot.get_cog`` answers with a plain mock, which is not a ChannelRepoCog, so
+    the cog sees no channel bindings until a test wires its own managers in.
+    """
     from c_lord.cogs.session_manage import SessionManageCog
 
     bot = MagicMock()
-    bot.channel_id = 999
+    runner = MagicMock()
+    runner.model = "sonnet"
     repo = MagicMock()
     repo.get = AsyncMock(return_value=None)
-    repo.list_all = AsyncMock(return_value=[])
-    return SessionManageCog(bot=bot, repo=repo)
+    return SessionManageCog(
+        bot=bot,
+        repo=repo,
+        runner=runner,
+        authorizer=Authorizer(allow_anyone=True),
+    )
+
+
+def _make_interaction(channel: MagicMock | None = None) -> MagicMock:
+    """A slash interaction; in a plain text channel unless *channel* is given."""
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = channel if channel is not None else MagicMock(spec=discord.TextChannel)
+    interaction.user = MagicMock()
+    interaction.user.id = 1
+    interaction.extras = {}
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
 
 
 def _make_ctx(channel: MagicMock | None = None) -> MagicMock:
@@ -492,12 +498,17 @@ def _capture_responder():
 
 
 class TestTmuxScreenshot:
-    async def test_outside_thread_sends_ephemeral(self):
+    """/tmux-screenshot — the pane as a PNG (#285)."""
+
+    async def test_slash_command_outside_a_thread_answers_privately(self):
         cog = _make_cog()
-        interaction = _make_channel_interaction()
+        interaction = _make_interaction()  # a text channel, not a thread
         await cog.tmux_screenshot.callback(cog, interaction)
-        call_args = interaction.response.send_message.call_args
-        assert call_args.kwargs.get("ephemeral") is True
+        interaction.response.send_message.assert_awaited_once()
+        reply = interaction.response.send_message.call_args
+        assert reply.kwargs.get("ephemeral") is True
+        assert reply.kwargs.get("file") is None
+        assert "thread" in reply.args[0].lower()
 
     async def test_impl_sends_png_file(self, monkeypatch):
         import c_lord.cogs.session_manage as sm

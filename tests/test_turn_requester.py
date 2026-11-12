@@ -129,6 +129,7 @@ def _make_cog() -> ClaudeChatCog:
     runner.model = None
     runner.timeout_seconds = 60
     runner.effort = None
+    runner.clone = MagicMock(return_value=runner)
     return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
 
 

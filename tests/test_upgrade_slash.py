@@ -1,240 +1,263 @@
-"""Tests for /upgrade slash command on AutoUpgradeCog.
+"""``/upgrade`` — starting the upgrade pipeline by hand (``c_lord.cogs.auto_upgrade``).
 
-TDD: write tests first, then implement.
+The command is off unless the config turns it on. When it runs, it opens the
+progress thread in the text channel it was used in (or, from inside a thread,
+in that thread's parent channel) and hands over to the same pipeline the
+webhook trigger uses — which is covered in ``tests/test_auto_upgrade.py`` and
+replaced by a recorder here.
 
-The slash command should:
-- Create a thread in the current channel and run the same upgrade pipeline
-- Respect upgrade_approval / restart_approval config flags
-- Be a no-op when slash_command_enabled=False in UpgradeConfig
-- Reply ephemerally when upgrade is already running
+That strangers are refused is in ``tests/test_command_authorization.py``; the
+caller in these tests is always on the allowlist.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
-from discord.ext import commands
+import pytest
 
 from c_lord.cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
 from c_lord.discord_ui.authorization import Authorizer
+from c_lord.thread_settings import DEFAULT_AUTO_ARCHIVE_DURATION
 
-_PATCH_EXEC = "asyncio.create_subprocess_exec"
-_PATCH_WAIT = "asyncio.wait_for"
-
-
-def _make_bot() -> MagicMock:
-    bot = MagicMock(spec=commands.Bot)
-    bot.cogs = {}
-    bot.user = MagicMock()
-    bot.user.id = 1
-    # #781: /upgrade asks the process's allowlist. These tests are about the
-    # pipeline, so the invoker is allowed; the refusal is tested in
-    # tests/test_command_authorization.py.
-    bot.authorizer = Authorizer(allow_anyone=True)
-    return bot
+OWNER_ID = 4990
 
 
-def _make_config(slash_command_enabled: bool = True, **kwargs) -> UpgradeConfig:
-    defaults = {
-        "package_name": "c-lord",
-        "trigger_prefix": "🔄 upgrade",
-        "working_dir": "/tmp",
-    }
-    defaults.update(kwargs)
-    return UpgradeConfig(slash_command_enabled=slash_command_enabled, **defaults)
+class Timeline:
+    """The order things happened in, as short labels."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def note(self, label: str) -> Any:
+        async def record(*_args: Any, **_kwargs: Any) -> None:
+            self.events.append(label)
+
+        return record
 
 
-def _make_interaction(channel_id: int = 777) -> MagicMock:
+def make_cog(*, settings_repo: Any = None, **config: Any) -> AutoUpgradeCog:
+    """A cog whose pipeline is a recorder, on a bot that allows ``OWNER_ID``."""
+    bot = SimpleNamespace(
+        cogs={},
+        user=SimpleNamespace(id=9000),
+        authorizer=Authorizer(allowed_user_ids={OWNER_ID}),
+        settings_repo=settings_repo,
+    )
+    cog = AutoUpgradeCog(bot, UpgradeConfig(package_name="pkg", **config))  # type: ignore[arg-type]
+    cog._run_pipeline = AsyncMock()  # type: ignore[method-assign]
+    return cog
+
+
+def text_channel() -> MagicMock:
+    channel = MagicMock(spec=discord.TextChannel)
+    channel.create_thread = AsyncMock(return_value=MagicMock(spec=discord.Thread))
+    return channel
+
+
+def thread_in(parent: Any) -> MagicMock:
+    thread = MagicMock(spec=discord.Thread)
+    thread.parent = parent
+    return thread
+
+
+def used_in(channel: Any) -> MagicMock:
+    """The interaction of the owner running ``/upgrade`` in *channel*."""
     interaction = MagicMock(spec=discord.Interaction)
+    interaction.user = MagicMock(spec=discord.Member)
+    interaction.user.id = OWNER_ID
+    interaction.channel = channel
     interaction.response = MagicMock()
     interaction.response.send_message = AsyncMock()
     interaction.response.defer = AsyncMock()
-    # Channel that supports thread creation
-    channel = MagicMock(spec=discord.TextChannel)
-    channel.id = channel_id
-    thread = MagicMock(spec=discord.Thread)
-    thread.send = AsyncMock()
-    channel.create_thread = AsyncMock(return_value=thread)
-    interaction.channel = channel
     return interaction
 
 
-def _make_process(returncode: int = 0, stdout: bytes = b"ok") -> MagicMock:
-    proc = MagicMock()
-    proc.returncode = returncode
-    proc.communicate = AsyncMock(return_value=(stdout, b""))
-    return proc
+async def run_upgrade(cog: AutoUpgradeCog, interaction: MagicMock) -> None:
+    await cog.upgrade_command.callback(cog, interaction)  # type: ignore[arg-type]
 
 
-class TestUpgradeSlashCommandDisabled:
-    async def test_disabled_by_default(self):
-        """slash_command_enabled defaults to False — safe by default."""
-        config = UpgradeConfig(package_name="foo")
-        assert config.slash_command_enabled is False
-
-    async def test_command_responds_ephemerally_when_disabled(self):
-        """When slash_command_enabled=False, command sends ephemeral error."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=False)
-        cog = AutoUpgradeCog(bot=bot, config=config)
-        interaction = _make_interaction()
-
-        await cog.upgrade_command.callback(cog, interaction)
-
-        call_args = interaction.response.send_message.call_args
-        assert call_args.kwargs.get("ephemeral") is True
+def private_reply(interaction: MagicMock) -> str:
+    """The one message sent back to the caller alone."""
+    interaction.response.send_message.assert_awaited_once()
+    call = interaction.response.send_message.await_args
+    assert call.kwargs == {"ephemeral": True}
+    return call.args[0]
 
 
-class TestUpgradeSlashCommandEnabled:
-    async def test_creates_thread_and_runs_upgrade(self):
-        """When enabled, /upgrade creates a thread and runs the pipeline."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=True)
-        cog = AutoUpgradeCog(bot=bot, config=config)
-        interaction = _make_interaction()
+class TestRegistration:
+    def test_the_command_is_called_upgrade(self) -> None:
+        command = make_cog().upgrade_command
 
-        proc = _make_process(returncode=0)
-        with (
-            patch(_PATCH_EXEC, return_value=proc),
-            patch(_PATCH_WAIT, new=AsyncMock(return_value=(b"ok", b""))),
-        ):
-            await cog.upgrade_command.callback(cog, interaction)
-
-        # Thread should have been created in the channel
-        interaction.channel.create_thread.assert_awaited_once()
-
-    async def test_already_running_sends_ephemeral(self):
-        """When upgrade is already running, sends ephemeral 'already in progress' message."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=True)
-        cog = AutoUpgradeCog(bot=bot, config=config)
-        interaction = _make_interaction()
-
-        # Simulate lock already held
-        await cog._lock.acquire()
-        try:
-            await cog.upgrade_command.callback(cog, interaction)
-        finally:
-            cog._lock.release()
-
-        call_args = interaction.response.send_message.call_args
-        assert call_args.kwargs.get("ephemeral") is True
-
-    async def test_defers_response_before_long_operation(self):
-        """Slash command should defer() so Discord doesn't time out."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=True)
-        cog = AutoUpgradeCog(bot=bot, config=config)
-        interaction = _make_interaction()
-
-        proc = _make_process(returncode=0)
-        with (
-            patch(_PATCH_EXEC, return_value=proc),
-            patch(_PATCH_WAIT, new=AsyncMock(return_value=(b"ok", b""))),
-        ):
-            await cog.upgrade_command.callback(cog, interaction)
-
-        interaction.response.defer.assert_awaited_once()
-
-    async def test_thread_name_uses_trigger_prefix(self):
-        """The created thread should use trigger_prefix as the name."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=True, trigger_prefix="🔄 my-bot-upgrade")
-        cog = AutoUpgradeCog(bot=bot, config=config)
-        interaction = _make_interaction()
-
-        proc = _make_process(returncode=0)
-        with (
-            patch(_PATCH_EXEC, return_value=proc),
-            patch(_PATCH_WAIT, new=AsyncMock(return_value=(b"ok", b""))),
-        ):
-            await cog.upgrade_command.callback(cog, interaction)
-
-        call_args = interaction.channel.create_thread.call_args
-        assert "🔄 my-bot-upgrade" in call_args.kwargs.get("name", "")
+        assert command.name == "upgrade"
+        assert command.description == "Manually trigger a package upgrade"
 
 
-class TestUpgradeSlashCommandFromThread:
-    """Tests for /upgrade invoked from inside a Discord thread."""
+class TestDisabled:
+    def test_the_command_is_off_unless_configured(self) -> None:
+        assert UpgradeConfig(package_name="pkg").slash_command_enabled is False
 
-    def _make_thread_interaction(self) -> MagicMock:
-        """Return an interaction where channel is a Thread whose parent is a TextChannel."""
-        parent = MagicMock(spec=discord.TextChannel)
-        parent_thread = MagicMock(spec=discord.Thread)
-        parent_thread.send = AsyncMock()
-        parent.create_thread = AsyncMock(return_value=parent_thread)
+    def test_it_can_be_turned_on(self) -> None:
+        assert UpgradeConfig(package_name="pkg", slash_command_enabled=True).slash_command_enabled
 
-        thread_channel = MagicMock(spec=discord.Thread)
-        thread_channel.parent = parent
+    async def test_the_caller_is_told_privately_that_it_is_off(self) -> None:
+        cog = make_cog()
+        channel = text_channel()
+        interaction = used_in(channel)
 
-        interaction = MagicMock(spec=discord.Interaction)
-        interaction.response = MagicMock()
-        interaction.response.send_message = AsyncMock()
-        interaction.response.defer = AsyncMock()
-        interaction.channel = thread_channel
-        return interaction
+        await run_upgrade(cog, interaction)
 
-    async def test_creates_thread_in_parent_channel_when_invoked_from_thread(self):
-        """When /upgrade is run inside a thread, the upgrade thread is created in the parent."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=True)
-        cog = AutoUpgradeCog(bot=bot, config=config)
-        interaction = self._make_thread_interaction()
-
-        proc = _make_process(returncode=0)
-        with (
-            patch(_PATCH_EXEC, return_value=proc),
-            patch(_PATCH_WAIT, new=AsyncMock(return_value=(b"ok", b""))),
-        ):
-            await cog.upgrade_command.callback(cog, interaction)
-
-        # Thread created in the parent channel, not in the sub-thread
-        interaction.channel.parent.create_thread.assert_awaited_once()
-
-    async def test_defers_response_from_thread(self):
-        """Command defers even when invoked from a thread (no timeout)."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=True)
-        cog = AutoUpgradeCog(bot=bot, config=config)
-        interaction = self._make_thread_interaction()
-
-        proc = _make_process(returncode=0)
-        with (
-            patch(_PATCH_EXEC, return_value=proc),
-            patch(_PATCH_WAIT, new=AsyncMock(return_value=(b"ok", b""))),
-        ):
-            await cog.upgrade_command.callback(cog, interaction)
-
-        interaction.response.defer.assert_awaited_once()
-
-    async def test_unsupported_channel_type_sends_ephemeral_error(self):
-        """Non-text, non-thread channels return an ephemeral error."""
-        bot = _make_bot()
-        config = _make_config(slash_command_enabled=True)
-        cog = AutoUpgradeCog(bot=bot, config=config)
-
-        interaction = MagicMock(spec=discord.Interaction)
-        interaction.response = MagicMock()
-        interaction.response.send_message = AsyncMock()
-        interaction.channel = MagicMock(spec=discord.VoiceChannel)  # unsupported
-
-        await cog.upgrade_command.callback(cog, interaction)
-
-        call_args = interaction.response.send_message.call_args
-        assert call_args.kwargs.get("ephemeral") is True
-
-
-class TestUpgradeSlashCommandConfig:
-    async def test_slash_command_enabled_field_exists(self):
-        """UpgradeConfig should have slash_command_enabled field."""
-        config = UpgradeConfig(
-            package_name="test",
-            slash_command_enabled=True,
+        assert private_reply(interaction) == (
+            "⚠️ Slash command upgrades are not enabled for this bot."
         )
-        assert config.slash_command_enabled is True
 
-    async def test_slash_command_enabled_false_by_default(self):
-        """slash_command_enabled defaults to False for backward compatibility."""
-        config = UpgradeConfig(package_name="test")
-        assert config.slash_command_enabled is False
+    async def test_nothing_is_started_while_it_is_off(self) -> None:
+        cog = make_cog()
+        channel = text_channel()
+        interaction = used_in(channel)
+
+        await run_upgrade(cog, interaction)
+
+        channel.create_thread.assert_not_called()
+        cog._run_pipeline.assert_not_called()  # type: ignore[attr-defined]
+        interaction.response.defer.assert_not_called()
+
+
+class TestFromATextChannel:
+    async def test_opens_a_progress_thread_and_runs_the_pipeline_in_it(self) -> None:
+        cog = make_cog(slash_command_enabled=True)
+        channel = text_channel()
+
+        await run_upgrade(cog, used_in(channel))
+
+        thread = channel.create_thread.return_value
+        cog._run_pipeline.assert_awaited_once_with(thread, status_target=None)  # type: ignore[attr-defined]
+
+    async def test_the_thread_is_named_after_the_trigger_line(self) -> None:
+        cog = make_cog(slash_command_enabled=True, trigger_prefix="🚀 deploy")
+        channel = text_channel()
+
+        await run_upgrade(cog, used_in(channel))
+
+        channel.create_thread.assert_awaited_once_with(
+            name="🚀 deploy", auto_archive_duration=DEFAULT_AUTO_ARCHIVE_DURATION
+        )
+
+    async def test_a_long_trigger_line_is_cut_to_a_valid_thread_name(self) -> None:
+        cog = make_cog(slash_command_enabled=True, trigger_prefix="n" * 150)
+        channel = text_channel()
+
+        await run_upgrade(cog, used_in(channel))
+
+        assert channel.create_thread.await_args.kwargs["name"] == "n" * 100
+
+    async def test_the_thread_follows_the_configured_auto_archive_time(self) -> None:
+        settings_repo = MagicMock()
+        settings_repo.get = AsyncMock(return_value="60")
+        cog = make_cog(slash_command_enabled=True, settings_repo=settings_repo)
+        channel = text_channel()
+
+        await run_upgrade(cog, used_in(channel))
+
+        assert channel.create_thread.await_args.kwargs["auto_archive_duration"] == 60
+
+    async def test_the_interaction_is_acknowledged_before_the_slow_part(self) -> None:
+        """Discord drops an interaction not answered within three seconds."""
+        timeline = Timeline()
+        cog = make_cog(slash_command_enabled=True)
+        cog._run_pipeline = AsyncMock(side_effect=timeline.note("pipeline"))  # type: ignore[method-assign]
+        channel = text_channel()
+        channel.create_thread.side_effect = timeline.note("thread")
+        interaction = used_in(channel)
+        interaction.response.defer.side_effect = timeline.note("defer")
+
+        await run_upgrade(cog, interaction)
+
+        assert timeline.events == ["defer", "thread", "pipeline"]
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.response.send_message.assert_not_called()
+
+    async def test_other_upgrades_are_locked_out_while_this_one_runs(self) -> None:
+        cog = make_cog(slash_command_enabled=True)
+        locked: dict[str, bool] = {}
+        interaction = used_in(text_channel())
+
+        async def at_defer() -> None:
+            locked["defer"] = cog._lock.locked()
+
+        async def at_pipeline(_thread: Any, status_target: Any) -> None:
+            locked["pipeline"] = cog._lock.locked()
+
+        interaction.response.defer.side_effect = at_defer
+        cog._run_pipeline = at_pipeline  # type: ignore[method-assign]
+
+        await run_upgrade(cog, interaction)
+
+        assert locked == {"defer": False, "pipeline": True}
+        assert not cog._lock.locked()
+
+
+class TestAlreadyRunning:
+    async def test_a_second_request_is_turned_away_privately(self) -> None:
+        cog = make_cog(slash_command_enabled=True)
+        channel = text_channel()
+        interaction = used_in(channel)
+
+        async with cog._lock:
+            await run_upgrade(cog, interaction)
+
+        assert private_reply(interaction) == "⏳ Upgrade is already running. Please wait."
+        channel.create_thread.assert_not_called()
+        cog._run_pipeline.assert_not_called()  # type: ignore[attr-defined]
+        interaction.response.defer.assert_not_called()
+
+
+class TestFromInsideAThread:
+    async def test_the_progress_thread_is_opened_in_the_parent_channel(self) -> None:
+        """A thread cannot hold a thread, so the upgrade's own thread goes one level up."""
+        cog = make_cog(slash_command_enabled=True)
+        parent = text_channel()
+
+        await run_upgrade(cog, used_in(thread_in(parent)))
+
+        parent.create_thread.assert_awaited_once()
+        cog._run_pipeline.assert_awaited_once_with(  # type: ignore[attr-defined]
+            parent.create_thread.return_value, status_target=None
+        )
+
+    async def test_the_interaction_is_acknowledged_there_too(self) -> None:
+        cog = make_cog(slash_command_enabled=True)
+        interaction = used_in(thread_in(text_channel()))
+
+        await run_upgrade(cog, interaction)
+
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.response.send_message.assert_not_called()
+
+
+class TestUnsupportedPlaces:
+    @pytest.mark.parametrize(
+        "channel",
+        [
+            MagicMock(spec=discord.DMChannel),
+            MagicMock(spec=discord.VoiceChannel),
+            thread_in(MagicMock(spec=discord.ForumChannel)),
+            thread_in(None),
+            None,
+        ],
+        ids=["dm", "voice", "forum-post", "orphan-thread", "no-channel"],
+    )
+    async def test_the_caller_is_told_where_the_command_works(self, channel: Any) -> None:
+        cog = make_cog(slash_command_enabled=True)
+        interaction = used_in(channel)
+
+        await run_upgrade(cog, interaction)
+
+        assert private_reply(interaction) == (
+            "⚠️ This command can only be used in a text channel or thread."
+        )
+        cog._run_pipeline.assert_not_called()  # type: ignore[attr-defined]
+        interaction.response.defer.assert_not_called()

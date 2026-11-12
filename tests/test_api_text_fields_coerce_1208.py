@@ -29,6 +29,12 @@ from c_lord.ext.api_server import ApiServer
 WRONG = [["x"], {"a": 1}, 1, True]
 
 
+@pytest.fixture(autouse=True)
+def _lounge_channel_not_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A leaked ``COORDINATION_CHANNEL_ID`` must not turn on lounge forwarding here."""
+    monkeypatch.delenv("COORDINATION_CHANNEL_ID", raising=False)
+
+
 class Env:
     def __init__(
         self,
