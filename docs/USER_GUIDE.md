@@ -155,15 +155,15 @@ When Claude needs your input, Discord buttons or a select menu appear. Pick an o
 
 ### Plan Mode
 
-When Claude proposes a plan, an embed shows the full plan text with **Approve** / **Cancel** buttons. Claude only proceeds after you approve. Auto-cancels after 5 minutes.
+When Claude finishes a plan (`ExitPlanMode`), the approval menu Claude Code shows is bridged to Discord the same way as a question: its choices appear as buttons, and Claude proceeds with the one you pick (#251).
 
 ### Tool Permissions
 
-When Claude needs permission to run a tool, an embed shows the tool name and input with **Allow** / **Deny** buttons. Auto-denies after 2 minutes.
+Tool permission prompts are **not shown on Discord**. c-lord accepts Claude Code's permission prompt inside the pane so the turn keeps going; what Claude may do is decided by the permission mode and settings the session runs with, not by a per-tool button.
 
 ### @-mention when your input is needed
 
-All of the prompts above (**AskUserQuestion / plan approval / tool permission / MCP elicitation**) pause the turn mid-flight, blocking on your answer. When one appears, c-lord posts a message that `@`-mentions **the person who sent that turn**, so you get a push notification even if your thread notifications are set to "mentions only" (a Discord embed on its own never pushes).
+The prompts that wait for you (**AskUserQuestion / plan approval**) pause the turn mid-flight, blocking on your answer. When one appears, c-lord posts a message that `@`-mentions **the person who sent that turn**, so you get a push notification even if your thread notifications are set to "mentions only" (a Discord embed on its own never pushes).
 
 - The mention targets **whoever posted the turn** (the thread creator for the first prompt, or the replier for a follow-up).
 - For turns with no human poster (webhook / scheduled runs) or turns driven directly in the tmux pane, the mention falls back to `DISCORD_OWNER_ID` when set (no mention when it is unset).
@@ -191,29 +191,20 @@ It is never posted outside a turn: an idle thread stays silent no matter how
 long it idles. Opt out with `CLORD_TURN_PROGRESS=0`; change the threshold with
 `CLORD_TURN_PROGRESS_QUIET_SECONDS`. Full behaviour: `docs/specs/turn-progress.md`.
 
-### TodoWrite Progress
-
-When Claude tracks tasks with `TodoWrite`, a single embed is posted and updated in-place:
-- ✅ Completed
-- 🔄 In progress
-- ⬜ Pending
-
 ### Progress folding (`progress.txt`)
 
-The intermediate embeds a turn produces — session start, thinking, tool use and
-tool results, the todo list — are useful while the turn is in flight and noise
-once it is over. At the end of a turn they are folded into a single
-`progress.txt` transcript and the originals are deleted.
+What Claude did during a turn — each tool call and its result, including
+`TodoWrite` updates — is not posted message by message. c-lord reads it from
+Claude Code's own transcript and attaches it to the turn's answer as a single
+`progress.txt` (#723). While the turn is running, the
+[turn progress line](#turn-progress-line) is the live view.
 
-- A turn that produced **nothing worth reading** (no tool use, no thinking — the
-  session-start banner alone does not count) posts **no `progress.txt` at all**.
-  The intermediate embeds are still cleaned up, so the thread simply ends with
-  the answer (#542).
+- A turn that used **no tools** gets **no `progress.txt` at all** — the thread
+  simply ends with the answer (#542). The "session started" embed a new thread
+  shows is removed when the turn ends.
 - Claude's progress sentences (`💭 …`, #883) are listed in `progress.txt` in
   order with the tool calls and results, so the file reads like the pane did.
   A turn with no tool use gets no `progress.txt` for the sentences alone.
-- When `progress.txt` is posted on its own rather than attached to a message
-  that already has text, it carries a one-line caption saying what the file is.
 
 ---
 
@@ -372,12 +363,15 @@ process already handled is recognised by those marks, so it does not run again. 
 
 ## Observability
 
-The session-complete embed shows:
-
-- **Token usage** — Input, output, and cache tokens with hit rate
-- **Context usage** — Percentage of context window used; warning above 83.5%
-- **Compact detection** — Notification when context compaction occurs
-- **Hard stall** — Warning after 30 seconds of no activity (extended thinking or compression)
+- **Context usage** — Each turn ends with a one-line footer
+  (`📊 7% context (69k/1.0M) · model · …`): the share of the context window in
+  use, the model, versions and cost. Above 83.5% it becomes a ⚠️ warning that
+  auto-compact may run next turn. See `docs/specs/context-footer.md`.
+- **Compact notice** — When the context is compacted, the thread gets a
+  one-line `🗜️ コンテキストを圧縮しました` (#628).
+- **Hard stall** — After 30 seconds of no activity the reaction on your message
+  turns ⚠️ (extended thinking or compression can be this quiet too); nothing is
+  posted to the thread (#473).
 
 ---
 

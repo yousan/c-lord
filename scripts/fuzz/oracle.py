@@ -24,7 +24,6 @@ EMOJI_WAITING = "🟡"
 EMOJI_ERROR = "❌"
 EMOJI_STALL_SOFT = "⏳"
 EMOJI_STALL_HARD = "⚠️"
-EMOJI_COMPACT = "🗜️"
 
 # TUI chrome that earlier bugs (#23–#50) leaked into Discord. A reply must never
 # contain any of these.

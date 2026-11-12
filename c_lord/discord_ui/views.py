@@ -47,9 +47,6 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
 
     After the session ends — either via the button or naturally — call
     ``disable()`` to deactivate the button on the status message.
-
-    Call ``bump(thread)`` after each major Discord message to keep the Stop
-    button at the bottom of the thread (most recently visible position).
     """
 
     def __init__(
@@ -68,25 +65,6 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     def set_message(self, message: discord.Message) -> None:
         """Store the message this view is attached to."""
         self._message = message
-
-    async def bump(self, thread: discord.Thread) -> None:
-        """Re-post the Stop button as the latest message in the thread.
-
-        Deletes the old stop message and sends a new one at the bottom so the
-        button stays accessible as Claude sends new messages above it.
-        No-op if the session has already been stopped.
-        """
-        if self._stopped:
-            return
-
-        old_message = self._message
-        with contextlib.suppress(*DISCORD_CALL_FAILURES):
-            new_message = await thread.send(STOP_MESSAGE_PREFIX, view=self)
-            self._message = new_message
-
-        if old_message:
-            with contextlib.suppress(*DISCORD_CALL_FAILURES):
-                await old_message.delete()
 
     @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger)
     async def stop_button(

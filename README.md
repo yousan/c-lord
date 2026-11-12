@@ -151,21 +151,16 @@ If the bot restarts mid-session, interrupted Claude sessions are automatically r
 
 #### 📡 Real-time Feedback
 - **Real-time status** — Emoji reaction lamp on your message: 🟢 running while Claude works, 🟡 waiting when it's your turn (❌ on error, ⏳ / ⚠️ if it goes quiet for 10 s / 30 s). Reactions stay responsive under heavy use. A 🟢/🟡 lamp in the thread name is off by default (#329); set `CLORD_THREAD_LAMP=1` for that slower, eventually-consistent sidebar view (#246)
-- **Streaming text** — Intermediate assistant text appears as Claude works
-- **Tool result embeds** — Live tool call results with elapsed time ticking up every 10s
-- **Extended thinking** — Reasoning shown as spoiler-tagged embeds (click to reveal)
+- **Tool activity** — Read from Claude Code's own transcript, not posted tool by tool: a turn that goes quiet shows one progress line (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`, see *Turn progress line* below), and the turn's tool calls and progress sentences are attached to the answer as `progress.txt` (#723)
 - **Thread dashboard** — Live pinned embed showing which threads are active vs. waiting; owner @-mentioned when input is needed
 
 #### 🤝 Human-in-the-Loop
 - **Interactive questions** — `AskUserQuestion` renders as Discord Buttons or Select Menu; session resumes with your answer; buttons survive bot restarts
-- **Plan Mode** — When Claude calls `ExitPlanMode`, a Discord embed shows the full plan with Approve/Cancel buttons; Claude proceeds only after approval; auto-cancel on 5-minute timeout
-- **Tool permission requests** — When Claude needs permission to execute a tool, Discord shows Allow/Deny buttons with the tool name and input; auto-deny after 2 minutes
-- **MCP Elicitation** — MCP servers can request user input via Discord (form-mode: up to 5 Modal fields from JSON schema; url-mode: URL button + Done confirmation); 5-minute timeout
-- **Live TodoWrite progress** — When Claude calls `TodoWrite`, a single Discord embed is posted and edited in-place on each update; shows ✅ completed, 🔄 active (with `activeForm` label), ⬜ pending items
+- **Plan Mode** — When Claude calls `ExitPlanMode`, the approval menu Claude Code shows is bridged to Discord the same way as `AskUserQuestion`: the choices appear as buttons, and Claude proceeds with the one you pick (#251)
+- **Tool permission prompts** — Not shown on Discord: c-lord accepts Claude Code's permission prompt in the pane so the turn keeps going. What Claude may do is decided by the permission mode / settings the session runs with, not by a per-tool button
 
 #### 📊 Observability
-- **Token usage** — Cache hit rate and token counts shown in session-complete embed
-- **Context usage** — Context window percentage (input + cache tokens, excluding output) and remaining capacity until auto-compact shown in session-complete embed; ⚠️ warning when above 83.5%
+- **Context usage** — Each turn ends with a one-line footer (`📊 7% context (69k/1.0M) · …`): context window percentage (input + cache tokens, excluding output), model, versions and cost; it turns into a ⚠️ warning above 83.5%, when auto-compact may run next turn (`docs/specs/context-footer.md`)
 - **Compact notice** — When Claude Code compacts the context, the thread gets a one-line `🗜️ コンテキストを圧縮しました` instead of the raw continuation summary (#628)
 - **Hard stall lamp** — After 30 s of no activity the reaction on your message turns ⚠️ (extended thinking or context compression can be this quiet too); no message is posted to the thread (#473)
 - **Sub-agent log** — Work split across sub-agents inside one thread stays on Discord: a `🤖 サブエージェント「…」開始` / `終了 · 6:12 · ツール 48 件` line per run, the end line carrying `subagent-*.md` (full report, assignment, tool calls), the start line's copy refreshed while it runs. `CLORD_SUBAGENT_VOICES=1` adds each agent's messages and report under its own name (#971, `docs/specs/subagent-log.md`)
@@ -817,11 +812,7 @@ c_lord/
     embeds.py              # Discord embed builders
     ask_view.py            # Buttons/Select Menus for AskUserQuestion
     ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB lifecycle
-    tool_timer.py          # LiveToolTimer — elapsed time counter for long-running tools
     thread_dashboard.py    # Live pinned embed showing session states
-    plan_view.py           # Approve/Cancel buttons for Plan Mode (ExitPlanMode)
-    permission_view.py     # Allow/Deny buttons for tool permission requests
-    elicitation_view.py    # Discord UI for MCP elicitation (Modal form or URL button)
   session_dir.py           # One git clone per thread (never removes a dir with uncommitted changes)
   ext/
     api_server.py          # REST API (optional, requires aiohttp)
