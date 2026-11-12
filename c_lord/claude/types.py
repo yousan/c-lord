@@ -1,18 +1,23 @@
-"""Type definitions for Claude Code CLI stream-json output."""
+"""Value types for what a Claude Code session reports and asks.
+
+Nothing here talks to Discord or to the CLI: these are the shapes the runner,
+the event processor and the transcript mirror hand to one another.
+"""
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 if TYPE_CHECKING:
+    import asyncio
+
     import discord
 
 
 class MessageType(Enum):
-    """Top-level message types in stream-json output."""
+    """The kind of record a stream event was built from."""
 
     SYSTEM = "system"
     ASSISTANT = "assistant"
@@ -22,7 +27,7 @@ class MessageType(Enum):
 
 
 class ContentBlockType(Enum):
-    """Content block types within assistant messages."""
+    """The kind of block inside an assistant or user message."""
 
     TEXT = "text"
     TOOL_USE = "tool_use"
@@ -31,7 +36,7 @@ class ContentBlockType(Enum):
 
 
 class ToolCategory(Enum):
-    """Categories for tool use, used for status emoji selection."""
+    """What a tool call is for, as far as presentation cares."""
 
     READ = "read"
     EDIT = "edit"
@@ -44,22 +49,20 @@ class ToolCategory(Enum):
     OTHER = "other"
 
 
-# Map tool names to categories
+def _categorise(category: ToolCategory, *tool_names: str) -> dict[str, ToolCategory]:
+    return dict.fromkeys(tool_names, category)
+
+
+#: Tool name → category, for the tools c-lord knows by name.
 TOOL_CATEGORIES: dict[str, ToolCategory] = {
-    "Read": ToolCategory.READ,
-    "Glob": ToolCategory.READ,
-    "Grep": ToolCategory.READ,
-    "LS": ToolCategory.READ,
-    "Write": ToolCategory.EDIT,
-    "Edit": ToolCategory.EDIT,
-    "NotebookEdit": ToolCategory.EDIT,
-    "Bash": ToolCategory.COMMAND,
-    "WebFetch": ToolCategory.WEB,
-    "WebSearch": ToolCategory.WEB,
-    "Task": ToolCategory.OTHER,
-    "AskUserQuestion": ToolCategory.ASK,
-    "TodoWrite": ToolCategory.TASK,
-    "ExitPlanMode": ToolCategory.PLAN,
+    **_categorise(ToolCategory.READ, "Read", "Glob", "Grep", "LS"),
+    **_categorise(ToolCategory.EDIT, "Write", "Edit", "NotebookEdit"),
+    **_categorise(ToolCategory.COMMAND, "Bash"),
+    **_categorise(ToolCategory.WEB, "WebFetch", "WebSearch"),
+    **_categorise(ToolCategory.OTHER, "Task"),
+    **_categorise(ToolCategory.ASK, "AskUserQuestion"),
+    **_categorise(ToolCategory.TASK, "TodoWrite"),
+    **_categorise(ToolCategory.PLAN, "ExitPlanMode"),
 }
 
 
@@ -82,7 +85,7 @@ FreeTextMode = Literal["row", "notes", "none"]
 
 @dataclass
 class AskOption:
-    """A single selectable option in an AskUserQuestion prompt."""
+    """One choice on a question menu."""
 
     label: str
     description: str = ""
@@ -90,7 +93,7 @@ class AskOption:
 
 @dataclass
 class AskQuestion:
-    """A single question from an AskUserQuestion tool call."""
+    """A question Claude put to the user, with the choices it offered."""
 
     question: str
     header: str = ""
@@ -163,16 +166,16 @@ def ask_question_from_dict(raw: dict[str, Any]) -> AskQuestion:
 
 @dataclass
 class TodoItem:
-    """A single item in a TodoWrite task list."""
+    """One line of Claude's todo list."""
 
     content: str
-    status: str  # "pending", "in_progress", "completed"
-    active_form: str = ""  # Present-continuous label shown while in_progress
+    status: str  # "pending" | "in_progress" | "completed"
+    active_form: str = ""
 
 
 @dataclass
 class PermissionRequest:
-    """A permission request from Claude Code for a tool execution."""
+    """Claude asking whether it may run a tool."""
 
     request_id: str
     tool_name: str
@@ -181,19 +184,36 @@ class PermissionRequest:
 
 @dataclass
 class ElicitationRequest:
-    """An elicitation request from an MCP server."""
+    """An MCP server asking the user for input."""
 
     request_id: str
     server_name: str
-    mode: str  # "form-mode" or "url-mode"
+    mode: str  # "form-mode" | "url-mode"
     message: str = ""
-    url: str = ""  # url-mode only
-    schema: dict[str, Any] = field(default_factory=dict)  # form-mode only
+    url: str = ""
+    schema: dict[str, Any] = field(default_factory=dict)
+
+
+#: Bash commands longer than this are cut (with an ellipsis) in ``display_name``.
+_COMMAND_DISPLAY_WIDTH = 60
+
+#: ``display_name`` for the tools whose label is "<verb>: <one input value>".
+#: The keys are tried in order; the last element is used when none is present.
+_TOOL_LABELS: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "Read": ("Reading", ("file_path",), "unknown"),
+    "Write": ("Writing", ("file_path",), "unknown"),
+    "Edit": ("Editing", ("file_path",), "unknown"),
+    "Glob": ("Searching", ("pattern", "glob"), ""),
+    "Grep": ("Searching", ("pattern", "glob"), ""),
+    "WebSearch": ("Searching web", ("query",), ""),
+    "WebFetch": ("Fetching", ("url",), ""),
+    "Task": ("Spawning agent", ("description",), ""),
+}
 
 
 @dataclass
 class ToolUseEvent:
-    """Parsed tool use event from stream-json."""
+    """A tool call Claude made."""
 
     tool_id: str
     tool_name: str
@@ -202,32 +222,19 @@ class ToolUseEvent:
 
     @property
     def display_name(self) -> str:
-        """Human-readable description of what this tool is doing."""
-        name = self.tool_name
-        inp = self.tool_input
+        """One line saying what this call is doing."""
+        if self.tool_name == "Bash":
+            command = self.tool_input.get("command", "")
+            if len(command) > _COMMAND_DISPLAY_WIDTH:
+                command = command[: _COMMAND_DISPLAY_WIDTH - 3] + "..."
+            return f"Running: {command}"
 
-        if name == "Read":
-            return f"Reading: {inp.get('file_path', 'unknown')}"
-        if name == "Write":
-            return f"Writing: {inp.get('file_path', 'unknown')}"
-        if name == "Edit":
-            return f"Editing: {inp.get('file_path', 'unknown')}"
-        if name in ("Glob", "Grep"):
-            pattern = inp.get("pattern", inp.get("glob", ""))
-            return f"Searching: {pattern}"
-        if name == "Bash":
-            cmd = inp.get("command", "")
-            # Truncate long commands
-            if len(cmd) > 60:
-                cmd = cmd[:57] + "..."
-            return f"Running: {cmd}"
-        if name == "WebSearch":
-            return f"Searching web: {inp.get('query', '')}"
-        if name == "WebFetch":
-            return f"Fetching: {inp.get('url', '')}"
-        if name == "Task":
-            return f"Spawning agent: {inp.get('description', '')}"
-        return f"Using: {name}"
+        label = _TOOL_LABELS.get(self.tool_name)
+        if label is None:
+            return f"Using: {self.tool_name}"
+        verb, keys, fallback = label
+        subject = next((self.tool_input[k] for k in keys if k in self.tool_input), fallback)
+        return f"{verb}: {subject}"
 
 
 class UsageLimit(NamedTuple):
@@ -248,7 +255,7 @@ class UsageLimit(NamedTuple):
 
 @dataclass
 class StreamEvent:
-    """A parsed event from the Claude Code stream-json output."""
+    """One thing a running session reported, with only the relevant fields set."""
 
     message_type: MessageType
     raw: dict = field(default_factory=dict)
@@ -300,21 +307,17 @@ def _parse_ask_questions(tool_input: dict[str, Any]) -> list[AskQuestion]:
     answer keystrokes go to the wrong affordance and the user's typed sentence
     is answered as "(No answer provided)".
     """
-    questions_raw = tool_input.get("questions", [])
-    result: list[AskQuestion] = []
-    for q in questions_raw:
+    questions: list[AskQuestion] = []
+    for q in tool_input.get("questions", []):
         raw_options = q.get("options", [])
         options = [
-            AskOption(
-                label=o.get("label", ""),
-                description=o.get("description", ""),
-            )
+            AskOption(label=o.get("label", ""), description=o.get("description", ""))
             for o in raw_options
             if o.get("label")
         ]
         multi_select = bool(q.get("multiSelect", False))
         has_preview = any(o.get("preview") is not None for o in raw_options)
-        result.append(
+        questions.append(
             AskQuestion(
                 question=q.get("question", ""),
                 header=q.get("header", ""),
@@ -325,43 +328,20 @@ def _parse_ask_questions(tool_input: dict[str, Any]) -> list[AskQuestion]:
                 ),
             )
         )
-    return result
-
-
-def _parse_todo_items(tool_input: dict[str, Any]) -> list[TodoItem]:
-    """Parse TodoWrite tool input into a list of TodoItem objects."""
-    todos_raw = tool_input.get("todos", [])
-    result: list[TodoItem] = []
-    for t in todos_raw:
-        content = t.get("content", "")
-        if not content:
-            continue
-        result.append(
-            TodoItem(
-                content=content,
-                status=t.get("status", "pending"),
-                active_form=t.get("activeForm", ""),
-            )
-        )
-    return result
+    return questions
 
 
 @dataclass
 class SessionState:
-    """Tracks the state of a Claude Code session during a single run.
-
-    active_tools maps tool_use_id -> Discord Message, enabling live embed
-    updates when tool results arrive.
-
-    active_timers maps tool_use_id -> asyncio.Task that periodically edits
-    the in-progress embed to show elapsed execution time. Cancelled on result.
-    """
+    """What one run keeps track of while its events are being handled."""
 
     session_id: str | None = None
     thread_id: int = 0
     accumulated_text: str = ""
     partial_text: str = ""
+    # tool_use id → the Discord message showing that call
     active_tools: dict[str, discord.Message] = field(default_factory=dict)
+    # tool_use id → the task refreshing that call's elapsed time
     active_timers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
-    # TodoWrite: reference to the live todo embed message (edited in-place on each update)
+    # the message showing the todo list, once one has been posted
     todo_message: discord.Message | None = None

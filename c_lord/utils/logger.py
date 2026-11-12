@@ -1,28 +1,32 @@
-"""Logging configuration."""
+"""Logging for c-lord: the root handler and the ``[thread=…]`` context prefix."""
 
 from __future__ import annotations
 
 import logging
 import sys
 
+_LINE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+#: discord.py narrates every gateway event and HTTP call at INFO.
+_NOISY_LOGGERS = ("discord", "discord.http")
+
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """Configure logging for the application."""
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    """Send everything at *level* and above to stdout, one line per record.
 
+    A handler is added to the root logger on every call; handlers that are
+    already there are left alone.
+    """
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(formatter)
+    handler.setFormatter(logging.Formatter(_LINE_FORMAT, datefmt=_TIME_FORMAT))
 
     root = logging.getLogger()
     root.setLevel(level)
     root.addHandler(handler)
 
-    # Quiet down discord.py's verbose logging
-    logging.getLogger("discord").setLevel(logging.WARNING)
-    logging.getLogger("discord.http").setLevel(logging.WARNING)
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def log_ctx(
