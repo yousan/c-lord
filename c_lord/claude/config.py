@@ -4,11 +4,7 @@ Replaces the former ``ClaudeRunner`` class.  ``ClaudeRunner`` combined
 configuration (model, timeout, permission mode) with subprocess execution
 logic.  Now that tmux is the sole execution backend, this dataclass holds
 only the configuration; ``TmuxClaudeRunner`` handles execution.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
+# <<REDACTED 5 lines>>
 
 
 @dataclass
