@@ -14,12 +14,7 @@ to be a fact about the *menu*, not about the current process's memory.
 
 from __future__ import annotations
 
-import logging
-
-import aiosqlite
-
-logger = logging.getLogger(__name__)
-
+# <<REDACTED 6 lines>>
 
 class MenuBridgeRepository:
     """Async SQLite repository for ``menu_bridges`` rows.

@@ -1,22 +1,4 @@
-"""SQLite database schema and initialization."""
-
-from __future__ import annotations
-
-import contextlib
-import logging
-
-import aiosqlite
-
-logger = logging.getLogger(__name__)
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS sessions (
-    thread_id INTEGER PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    working_dir TEXT,
-    model TEXT,
-    origin TEXT NOT NULL DEFAULT 'discord',
-    summary TEXT,
+# <<REDACTED 19 lines>>
     topic TEXT,
     state TEXT DEFAULT 'alive',
     tmux_window_id TEXT,
@@ -26,65 +8,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     closed_at TEXT,
     closed_reason TEXT,
     slept_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    last_used_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id);
-
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS pending_asks (
-    thread_id INTEGER PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    questions_json TEXT NOT NULL,
-    question_idx INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    # <<REDACTED 18 lines>>
     -- #671: the Discord message this menu is drawn on, so startup can retire a
     -- menu the tmux pane has since closed.
     message_id INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS lounge_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    label TEXT NOT NULL DEFAULT 'AI',
-    message TEXT NOT NULL,
-    posted_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_lounge_posted_at ON lounge_messages(posted_at);
-
--- Sessions that should be resumed after a bot restart.
--- Rows expire automatically via TTL checks in PendingResumeRepository.
--- A Claude session that is about to restart the bot writes a row here first;
--- on_ready reads and deletes it to resume the session.
-CREATE TABLE IF NOT EXISTS pending_resumes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id INTEGER NOT NULL UNIQUE,
-    session_id TEXT,           -- optional: used for "claude --resume" continuity
-    reason TEXT NOT NULL DEFAULT 'self_restart',
-    resume_prompt TEXT,        -- message to post + send to Claude on resume
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-);
+# <<REDACTED 23 lines>>
 
 -- Per-channel repository bindings (1 channel = 1 repo)
 CREATE TABLE IF NOT EXISTS channel_repo_bindings (
     channel_id         INTEGER PRIMARY KEY,
     source_repo        TEXT    NOT NULL,
-    created_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    # <<REDACTED 1 lines>>
     updated_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 -- Per-thread repository bindings (overrides channel binding for that thread)
 CREATE TABLE IF NOT EXISTS thread_repo_bindings (
-    thread_id   INTEGER PRIMARY KEY,
+    # <<REDACTED 1 lines>>
     source_repo TEXT    NOT NULL,
     channel_id  INTEGER,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    # <<REDACTED 1 lines>>
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
@@ -105,7 +48,7 @@ CREATE TABLE IF NOT EXISTS menu_bridges (
 -- next sweep starts after this message instead of re-reading a fixed window,
 -- which is what let residue sink out of reach under later messages.
 CREATE TABLE IF NOT EXISTS ui_sweep_cursors (
-    thread_id       INTEGER PRIMARY KEY,
+    # <<REDACTED 1 lines>>
     last_message_id INTEGER NOT NULL,
     swept_at        TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -125,7 +68,7 @@ CREATE TABLE IF NOT EXISTS channel_model_settings (
 -- Claude process was last launched with, so a differing saved pair is "pending
 -- for the next turn" — all of it survives a restart.
 CREATE TABLE IF NOT EXISTS session_model_settings (
-    thread_id        INTEGER PRIMARY KEY,
+    # <<REDACTED 1 lines>>
     channel_id       INTEGER,
     explicit_model   TEXT,
     explicit_effort  TEXT,
@@ -139,10 +82,7 @@ CREATE TABLE IF NOT EXISTS session_model_settings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_model_channel ON session_model_settings(channel_id);
-"""
-
-# Migrations for existing databases that lack new columns.
-_MIGRATIONS = [
+# <<REDACTED 4 lines>>
     # #633: durable "already bridged" ledger for the menu watchdog.
     (
         "CREATE TABLE IF NOT EXISTS menu_bridges ("
@@ -165,28 +105,7 @@ _MIGRATIONS = [
     "ALTER TABLE ui_sweep_cursors ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
     # #671: the message a pending menu is drawn on (startup retires closed menus).
     "ALTER TABLE pending_asks ADD COLUMN message_id INTEGER",
-    "ALTER TABLE sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'discord'",
-    "ALTER TABLE sessions ADD COLUMN summary TEXT",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id)",
-    # Lounge table added in v1.x — safe to run on existing DBs
-    (
-        "CREATE TABLE IF NOT EXISTS lounge_messages ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "label TEXT NOT NULL DEFAULT 'AI', "
-        "message TEXT NOT NULL, "
-        "posted_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
-    ),
-    "CREATE INDEX IF NOT EXISTS idx_lounge_posted_at ON lounge_messages(posted_at)",
-    # pending_resumes added in v1.3 — safe to run on existing DBs
-    (
-        "CREATE TABLE IF NOT EXISTS pending_resumes ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "thread_id INTEGER NOT NULL UNIQUE, "
-        "session_id TEXT, "
-        "reason TEXT NOT NULL DEFAULT 'self_restart', "
-        "resume_prompt TEXT, "
-        "created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
-    ),
+    # <<REDACTED 22 lines>>
     # channel_repo_bindings added for /clord-init (per-channel repo binding)
     (
         "CREATE TABLE IF NOT EXISTS channel_repo_bindings ("
@@ -258,19 +177,4 @@ _MIGRATIONS = [
     # at all is still decided by "is the pane alive?" alone, so this column can
     # never contradict the thing it describes (the closed_reason rule).
     "ALTER TABLE sessions ADD COLUMN slept_at TEXT",
-]
-
-
-async def init_db(db_path: str) -> None:
-    """Initialize the database with the schema.
-
-    For fresh databases the full SCHEMA is applied. For existing databases
-    the migration statements add any missing columns idempotently.
-    """
-    async with aiosqlite.connect(db_path) as db:
-        await db.executescript(SCHEMA)
-        for stmt in _MIGRATIONS:
-            with contextlib.suppress(Exception):
-                await db.execute(stmt)
-        await db.commit()
-    logger.info("Database initialized at %s", db_path)
+# <<REDACTED 16 lines>>

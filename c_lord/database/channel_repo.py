@@ -2,22 +2,14 @@
 
 Maps Discord channel IDs to source repositories, enabling per-channel
 session directory management via /clord-init.
-"""
-
-from __future__ import annotations
-
-import logging
+# <<REDACTED 5 lines>>
 import re
-
-import aiosqlite
-
-logger = logging.getLogger(__name__)
-
+# <<REDACTED 5 lines>>
 CHANNEL_REPO_SCHEMA = """
 CREATE TABLE IF NOT EXISTS channel_repo_bindings (
     channel_id         INTEGER PRIMARY KEY,
     source_repo        TEXT    NOT NULL,
-    created_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    # <<REDACTED 1 lines>>
     updated_at         TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 """
