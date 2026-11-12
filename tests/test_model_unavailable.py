@@ -10,11 +10,7 @@ know — it starts, and answers every prompt with one line, then goes idle::
 
 Measured on staging: c-lord ended that turn as a normal answer ("🟡 Claude has
 finished"), with nothing saying the c-lord setting is what has to change.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -200,8 +196,7 @@ class TestEventProcessorOutcome:
         p = EventProcessor(config)
         await p.process(
             StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
+                # <<REDACTED 2 lines>>
                 error=(
                     f'{MODEL_UNAVAILABLE_ERROR_PREFIX} Claude Code cannot use the model "bogus" '
                     "and did not run this turn."

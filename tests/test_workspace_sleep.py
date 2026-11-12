@@ -18,9 +18,7 @@ docker が動いていたときは、ポートを掴んだままになること�
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
+# <<REDACTED 3 lines>>
 import pytest
 
 from c_lord.database.repository import SessionRecord
@@ -43,9 +41,7 @@ def _record(thread_id: int = 555) -> SessionRecord:
 
 
 def _thread(thread_id: int = 555) -> MagicMock:
-    thread = MagicMock(spec=discord.Thread)
-    thread.id = thread_id
-    thread.parent_id = 999
+    # <<REDACTED 3 lines>>
     thread.name = "W3 │ #404 認証リファクタ"
     thread.edit = AsyncMock()
     thread.send = AsyncMock()

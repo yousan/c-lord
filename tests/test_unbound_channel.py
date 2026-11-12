@@ -20,9 +20,7 @@ from c_lord.discord_ui.authorization import Authorizer
 
 
 def _make_cog(**overrides: object) -> ClaudeChatCog:
-    """Return a ClaudeChatCog with minimal mocked dependencies."""
-    bot = MagicMock()
-    bot.channel_id = 999
+    # <<REDACTED 3 lines>>
     # ChannelRepoCog returns None (no binding)
     channel_cog = MagicMock()
     channel_cog.resolve_manager = AsyncMock(return_value=None)
@@ -35,11 +33,7 @@ def _make_cog(**overrides: object) -> ClaudeChatCog:
     _default_ctx = MagicMock()
     _default_ctx.valid = False
     bot.get_context = AsyncMock(return_value=_default_ctx)
-    repo = MagicMock()
-    repo.get = AsyncMock(return_value=None)
-    repo.save = AsyncMock()
-    runner = MagicMock()
-    runner.clone = MagicMock(return_value=MagicMock())
+    # <<REDACTED 5 lines>>
     runner.working_dir = "/tmp/test"
     runner.model = "sonnet"
     runner.timeout_seconds = 300
@@ -119,11 +113,10 @@ class TestStartSessionUnboundChannel:
     async def test_start_session_unbound_channel_sends_error(self) -> None:
         cog = _make_cog()
 
-        interaction = MagicMock(spec=discord.Interaction)
+        # <<REDACTED 1 lines>>
         interaction.user = MagicMock()
         interaction.user.id = 1
-        interaction.response = MagicMock()
-        interaction.response.send_message = AsyncMock()
+        # <<REDACTED 2 lines>>
         interaction.response.defer = AsyncMock()
         interaction.followup = MagicMock()
         interaction.followup.send = AsyncMock()
@@ -136,7 +129,7 @@ class TestStartSessionUnboundChannel:
         await cog.start_session.callback(cog, interaction, prompt="hello")
 
         # Should have responded with error before creating a thread
-        interaction.response.send_message.assert_called_once()
+        # <<REDACTED 1 lines>>
         error_msg = interaction.response.send_message.call_args.args[0]
         assert "/clord-init" in error_msg
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True

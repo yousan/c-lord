@@ -1,12 +1,8 @@
 """A menu that parks the turn sends one ``blocked`` event (#917)."""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
+# <<REDACTED 2 lines>>
 import pytest
 
 from c_lord import turn_events

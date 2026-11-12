@@ -6,10 +6,7 @@ The shapes below are copied from real Claude Code transcripts: the launch is the
 ``system/turn_duration`` — written *before* the report when the agent is still
 running, after which Claude Code starts another turn by itself.
 """
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 import json
 import os
 from pathlib import Path

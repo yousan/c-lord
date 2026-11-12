@@ -1,8 +1,5 @@
 """Tests for TmuxClaudeRunner."""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 import contextlib
 import logging
 from pathlib import Path
@@ -5269,8 +5266,7 @@ class TestTrustStuckEmbed:
 
         await processor.process(
             StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
+                # <<REDACTED 2 lines>>
                 error=f"{TRUST_STUCK_ERROR_PREFIX} the folder-trust dialog did not close.",
             )
         )

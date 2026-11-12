@@ -15,11 +15,7 @@ different error in the same turn is still posted, and the next turn posts again.
 A line whose post failed does not count as posted, and a prompt typed straight into
 the pane after an interrupted turn (no ``turn_duration``) starts afresh. A notification
 or bare ``<system-reminder>`` row inside a turn does not (#1285).
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import json
 import os
 from pathlib import Path

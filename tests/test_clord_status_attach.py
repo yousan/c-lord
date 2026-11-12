@@ -11,9 +11,7 @@ tmux layout spread over three sessions.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
+# <<REDACTED 3 lines>>
 import pytest
 
 import c_lord.thread_state_sync as tss
@@ -22,8 +20,7 @@ import c_lord.thread_state_sync as tss
 def _make_cog(dirs, records, windows, monkeypatch):
     from c_lord.cogs import session_manage as sm
     from c_lord.cogs.session_manage import SessionManageCog
-
-    bot = MagicMock()
+# <<REDACTED 2 lines>>
     repo = MagicMock()
     repo.get = AsyncMock(side_effect=lambda tid: records.get(tid))
     repo.list_all = AsyncMock(return_value=list(records.values()))

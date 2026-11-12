@@ -141,10 +141,10 @@ def test_counts_in_the_same_file_accept_the_same_spaces(
 
 def _api(tmp_path):  # noqa: ANN001, ANN202
     from unittest.mock import MagicMock
-
+# <<REDACTED 1 lines>>
     from c_lord.database.notification_repo import NotificationRepository
     from c_lord.ext.api_server import ApiServer
-
+# <<REDACTED 1 lines>>
     return ApiServer(
         repo=NotificationRepository(str(tmp_path / "n.db")),
         bot=MagicMock(),

@@ -13,10 +13,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
+# <<REDACTED 4 lines>>
 from aiohttp.test_utils import TestClient, TestServer
 
 from c_lord.database.lounge_repo import LoungeRepository

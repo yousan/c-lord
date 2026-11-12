@@ -11,17 +11,9 @@ is a real TCP connection over loopback and the UID behind it is resolved the
 same way as in production (``/proc/net/tcp``), so the gate itself is exercised
 end to end — only the expectation is inverted.
 """
-
-from __future__ import annotations
-
-import os
-import tempfile
+# <<REDACTED 5 lines>>
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
-from aiohttp.test_utils import TestClient, TestServer
-
+# <<REDACTED 5 lines>>
 from c_lord.database.notification_repo import NotificationRepository
 from c_lord.database.task_repo import TaskRepository
 from c_lord.ext.api_server import ApiServer
@@ -30,41 +22,19 @@ pytestmark = pytest.mark.skipif(
     not hasattr(os, "getuid"), reason="POSIX-only: the API gate keys on Unix UIDs"
 )
 
-
-@pytest.fixture
-async def repo() -> NotificationRepository:
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    repo = NotificationRepository(path)
-    await repo.init_db()
-    yield repo
-    os.unlink(path)
-
-
+# <<REDACTED 11 lines>>
 @pytest.fixture
 async def task_repo() -> TaskRepository:
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     repo = TaskRepository(path)
-    await repo.init_db()
-    yield repo
-    os.unlink(path)
-
-
-@pytest.fixture
-def bot() -> MagicMock:
-    b = MagicMock()
-    channel = MagicMock()
-    channel.send = AsyncMock()
-    b.get_channel.return_value = channel
+    # <<REDACTED 11 lines>>
     b.cogs = {}
     return b
 
 
 async def _client(api: ApiServer) -> TestClient:
-    server = TestServer(api.app)
-    client = TestClient(server)
-    await client.start_server()
+    # <<REDACTED 3 lines>>
     return client
 
 
@@ -171,10 +141,7 @@ class TestOwnUidIsAllowed:
         client = await _client(ApiServer(repo=repo, bot=bot, default_channel_id=12345))
         try:
             resp = await client.post("/api/spawn", json={})
-            assert resp.status == 400
-        finally:
-            await client.close()
-
+            # <<REDACTED 4 lines>>
 
 class TestSecretOpensTheGate:
     """``CLORD_API_SECRET`` stays the explicit way to let other users in."""

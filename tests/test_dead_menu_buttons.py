@@ -12,11 +12,7 @@ reads — held **0** rows. Three holes, each pinned here:
    it however long it sat there.
 3. **The ⏹ Stop sweep saw 100 messages of 200 threads.** Production had 339
    threads, and a Stop from 2026-08-07 had 164 messages on top of it.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import datetime as dt
 import logging
 from unittest.mock import AsyncMock, MagicMock

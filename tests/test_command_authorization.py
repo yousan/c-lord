@@ -14,13 +14,9 @@ The gate is the shared rule, not a new one (#781 AC3): slash → the
 from __future__ import annotations
 
 import inspect
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
+# <<REDACTED 4 lines>>
 from discord import app_commands
-from discord.ext import commands
-
+# <<REDACTED 2 lines>>
 from c_lord.cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
 from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.cogs.session_manage import SETTING_CLAUDE_MODEL, SessionManageCog
@@ -48,12 +44,10 @@ def _thread() -> MagicMock:
 
 
 def _interaction(user_id: int) -> MagicMock:
-    interaction = MagicMock(spec=discord.Interaction)
+    # <<REDACTED 1 lines>>
     interaction.channel = _thread()
     interaction.user = _member(user_id)
-    interaction.response = MagicMock()
-    interaction.response.send_message = AsyncMock()
-    interaction.response.defer = AsyncMock()
+    # <<REDACTED 3 lines>>
     interaction.response.is_done = MagicMock(return_value=False)
     interaction.followup = MagicMock()
     interaction.followup.send = AsyncMock()
@@ -352,9 +346,7 @@ class TestUpgradeRefusesStrangers:
         interaction = _interaction(STRANGER)
         interaction.channel = MagicMock(spec=discord.TextChannel)
         interaction.channel.create_thread = AsyncMock()
-
-        await cog.upgrade_command.callback(cog, interaction)
-
+# <<REDACTED 3 lines>>
         _assert_refused_slash(interaction)
         interaction.channel.create_thread.assert_not_called()
         cog._run_pipeline.assert_not_called()  # type: ignore[attr-defined]
@@ -365,7 +357,5 @@ class TestUpgradeRefusesStrangers:
         interaction = _interaction(OWNER)
         interaction.channel = MagicMock(spec=discord.TextChannel)
         interaction.channel.create_thread = AsyncMock(return_value=MagicMock())
-
-        await cog.upgrade_command.callback(cog, interaction)
-
+# <<REDACTED 3 lines>>
         cog._run_pipeline.assert_awaited_once()  # type: ignore[attr-defined]

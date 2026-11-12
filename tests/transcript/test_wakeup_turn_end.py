@@ -12,10 +12,7 @@ by placeholders): wakeups at 17:23, 17:40, 17:44, 17:48 and 17:59 — the last
 two carry the extra "[N prior /loop wakeups …]" row — and one
 ``<task-notification>`` turn at 17:30, the only one that had an event.
 """
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 import json
 import os
 from pathlib import Path

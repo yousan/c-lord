@@ -2,11 +2,7 @@
 
 Baseline of every case (the Issue's): global opus/high (here: the start-up
 environment), channels A and B with no settings of their own.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import sqlite3
 
 import pytest

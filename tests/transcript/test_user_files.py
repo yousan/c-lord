@@ -5,11 +5,7 @@ user.`` and writes a ``tool_use`` into the transcript — but its delivery
 channel is the harness's, not Discord's.  The mirror is the only thing that
 writes to a thread (#71 single-writer), so it has to recognise that tool_use
 and attach the files itself.  29 calls were dropped in silence before this.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import json
 from pathlib import Path
 

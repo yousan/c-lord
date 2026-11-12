@@ -3,21 +3,14 @@
 The outlet tells whoever is outside Discord — a dispatching agent, CI, a
 dashboard — that a turn is over, from the server's own knowledge instead of a
 guess made by reading the thread.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import hashlib
 import hmac
 import json
 import socket
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
+# <<REDACTED 4 lines>>
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 

@@ -103,16 +103,13 @@ class TestSilentRestoreOnTheNextMessage:
         return cog
 
     def _message(self, thread: MagicMock) -> MagicMock:
-        msg = MagicMock(spec=discord.Message)
+        # <<REDACTED 1 lines>>
         msg.id = 1
         msg.channel = thread
         msg.content = "続きお願い"
         msg.attachments = []
         msg.reference = None
-        msg.author = MagicMock()
-        msg.author.bot = False
-        return msg
-
+        # <<REDACTED 4 lines>>
     @pytest.mark.asyncio
     async def test_a_slept_workspace_resumes_without_a_word(self) -> None:
         """#572 AC: ダイアログもボタンも出さずに会話の続きから再開する。"""

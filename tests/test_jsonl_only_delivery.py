@@ -15,11 +15,7 @@ from __future__ import annotations
 import logging
 import socket
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
-from aiohttp.test_utils import TestClient, TestServer
-
+# <<REDACTED 5 lines>>
 from c_lord.legacy_env import warn_removed_delivery_env
 from c_lord.main import build_api_server, start_api_server
 
@@ -29,17 +25,7 @@ def _clean_delivery_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start every test from the zero-config state (nothing set)."""
     for key in ("CLORD_BRIDGE_MODE", "USE_SKILL_REPLY", "CLORD_API_PORT", "CLORD_API_HOST"):
         monkeypatch.delenv(key, raising=False)
-
-
-@pytest.fixture
-def bot() -> MagicMock:
-    b = MagicMock()
-    channel = MagicMock()
-    channel.send = AsyncMock()
-    b.get_channel.return_value = channel
-    return b
-
-
+# <<REDACTED 11 lines>>
 class TestSkillBridgeIsGone:
     """AC1 / AC2 — the skill-push path is not reachable by any means."""
 
@@ -205,18 +191,10 @@ class TestControlPlaneEndpoints:
         cog = MagicMock()
         cog.spawn_session = AsyncMock(return_value=thread)
         bot.cogs = {"ClaudeChatCog": cog}
-        bot.get_channel.return_value = MagicMock(spec=discord.TextChannel)
-
-        server = TestServer(api.app)
-        client = TestClient(server)
-        await client.start_server()
-        yield client
-        await client.close()
-
+        # <<REDACTED 8 lines>>
     @pytest.mark.asyncio
     async def test_health(self, client: TestClient) -> None:
-        resp = await client.get("/api/health")
-        assert resp.status == 200
+        # <<REDACTED 2 lines>>
 
     @pytest.mark.asyncio
     async def test_spawn(self, client: TestClient) -> None:

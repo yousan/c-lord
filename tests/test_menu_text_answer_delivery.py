@@ -17,11 +17,7 @@ Discord には ``✏️ この文章を、開いていた質問への回答と�
 ここでの固定点は「**利用者の文章は必ずどこかに届く**」こと。メニューに届かなかった
 なら、新しい指示として届く（``_maybe_answer_open_menu`` が False を返し、呼び出し元
 が通常の指示として走らせる）。
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 

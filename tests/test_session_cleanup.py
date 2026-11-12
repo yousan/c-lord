@@ -17,16 +17,12 @@ half-written article still in it, transcript gone. Telling that thread "your wor
 is gone" would be false, and telling the other kind "just carry on" equally so,
 so the notice is composed from what is actually on disk.
 """
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
-import pytest
-
+# <<REDACTED 2 lines>>
 from c_lord.database.models import init_db
 from c_lord.database.repository import SessionRecord, SessionRepository
 from c_lord.session_cleanup import (

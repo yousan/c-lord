@@ -10,10 +10,7 @@ through the actual get_context / process_commands pipeline, and verifies:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import discord
-import pytest
+# <<REDACTED 4 lines>>
 from discord.ext import commands
 
 from c_lord.cogs.claude_chat import ClaudeChatCog
@@ -26,17 +23,13 @@ def _make_thread_message(
     author_id: int = 42,
 ) -> MagicMock:
     """Build a mock Message that discord.py's get_context can parse."""
-    thread = MagicMock(spec=discord.Thread)
-    thread.id = thread_id
+    # <<REDACTED 2 lines>>
     thread.parent_id = parent_id
     thread.send = AsyncMock()
 
-    msg = MagicMock(spec=discord.Message)
-    msg.content = content
+    # <<REDACTED 2 lines>>
     msg.channel = thread
-    msg.attachments = []
-    msg.author = MagicMock()
-    msg.author.bot = False
+    # <<REDACTED 3 lines>>
     msg.author.id = author_id
     msg.webhook_id = None
     # discord.py Context.__init__ accesses message._state
@@ -49,8 +42,7 @@ def _make_bot_and_cog() -> tuple[commands.Bot, ClaudeChatCog, MagicMock, MagicMo
 
     Returns (bot, cog, tmux_manager_mock, repo_mock).
     """
-    intents = discord.Intents.default()
-    intents.message_content = True
+    # <<REDACTED 2 lines>>
     bot = commands.Bot(command_prefix="!", intents=intents)
     # bot.user is a read-only property that reads from _connection.user
     mock_user = MagicMock()
@@ -60,12 +52,9 @@ def _make_bot_and_cog() -> tuple[commands.Bot, ClaudeChatCog, MagicMock, MagicMo
     # Bot attributes expected by ClaudeChatCog
     bot.channel_id = 999
 
-    repo = MagicMock()
-    repo.get = AsyncMock(return_value=None)
-    repo.save = AsyncMock()
+    # <<REDACTED 3 lines>>
 
-    runner = MagicMock()
-    runner.clone = MagicMock(return_value=MagicMock())
+    # <<REDACTED 2 lines>>
 
     tmux_mgr = MagicMock()
     tmux_mgr.remap_window.return_value = True

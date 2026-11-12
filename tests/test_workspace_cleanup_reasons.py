@@ -5,11 +5,7 @@ and orphan sweeps say so (``describe_changes()``), but the manual
 ``/workspace-cleanup`` listed such a directory under "⚠️ Dirty — not removed"
 with one fixed reason, "session directory has uncommitted changes" — and
 ``git status`` shows nothing, so the reader could not tell what to do.
-"""
-
-from __future__ import annotations
-
-import logging
+# <<REDACTED 5 lines>>
 import os
 import subprocess
 from pathlib import Path

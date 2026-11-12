@@ -13,11 +13,7 @@ the thread.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
-
+# <<REDACTED 5 lines>>
 from c_lord.cogs.claude_chat import ClaudeChatCog
 
 
@@ -26,21 +22,15 @@ def _make_cog() -> ClaudeChatCog:
     bot.channel_id = 999
     bot.settings_repo = None
     bot.get_cog = MagicMock(return_value=None)
-    repo = MagicMock()
-    repo.get = AsyncMock(return_value=None)
+    # <<REDACTED 2 lines>>
     runner = MagicMock()
-    return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
-
-
+    # <<REDACTED 3 lines>>
 def _attachment(
     filename: str = "notes.txt",
     content_type: str = "text/plain",
     content: bytes = b"hello",
     size: int | None = None,
-) -> MagicMock:
-    att = MagicMock(spec=discord.Attachment)
-    att.filename = filename
-    att.content_type = content_type
+# <<REDACTED 4 lines>>
     att.size = len(content) if size is None else size
     att.url = f"https://cdn.discordapp.com/attachments/1/2/{filename}?ex=a&is=b&hm=c"
     att.read = AsyncMock(return_value=content)

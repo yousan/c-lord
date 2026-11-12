@@ -11,9 +11,7 @@ though the bot cannot see (or post in) the channel.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
+# <<REDACTED 3 lines>>
 import pytest
 
 from c_lord.cogs.claude_chat import ClaudeChatCog
@@ -45,8 +43,7 @@ def _make_cog() -> ClaudeChatCog:
     bot.lounge_repo = None
     bot.resume_repo = None
 
-    repo = MagicMock()
-    repo.get = AsyncMock(return_value=None)
+    # <<REDACTED 2 lines>>
     repo.save = AsyncMock()
     runner = MagicMock()
     runner.working_dir = "/tmp/test"

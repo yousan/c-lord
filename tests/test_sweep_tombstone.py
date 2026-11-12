@@ -30,9 +30,7 @@ from c_lord.session_resume import swept_notice
 @pytest.fixture
 async def repo(tmp_path) -> SessionRepository:
     db_path = str(tmp_path / "s.db")
-    await init_db(db_path)
-    return SessionRepository(db_path)
-
+    # <<REDACTED 3 lines>>
 
 async def _sweep_one(repo: SessionRepository, thread_id: int = 400) -> None:
     await repo.save(thread_id=thread_id, session_id=f"sess-{thread_id}", working_dir="/w/a/b")

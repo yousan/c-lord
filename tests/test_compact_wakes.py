@@ -12,11 +12,7 @@ lost.  It now goes through the same "wake, then type the slash command" path as
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
-
+# <<REDACTED 5 lines>>
 from c_lord.cogs.claude_chat import ClaudeChatCog
 from c_lord.database.repository import SessionRecord
 from c_lord.discord_ui.authorization import Authorizer
@@ -68,8 +64,7 @@ def _cog(record: SessionRecord | None, *, running: bool) -> tuple[ClaudeChatCog,
 
 
 def _ctx(thread_id: int = 1) -> MagicMock:
-    thread = MagicMock(spec=discord.Thread)
-    thread.id = thread_id
+    # <<REDACTED 2 lines>>
     thread.parent_id = 999
     thread.send = AsyncMock()
     ctx = MagicMock()

@@ -6,11 +6,7 @@ differs from the previous turn's. The pane exit ("response stable 3 s, input
 box visible, no spinner") closed four production turns 14–19 s in on
 2026-10-29 — 📊, 🟡 and a ``completion`` with ``last_message_id: null`` — and
 the work then went on for up to 50 minutes.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 from unittest.mock import MagicMock, patch
 
 import pytest

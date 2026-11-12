@@ -13,10 +13,7 @@ explicitly — move up to it and confirm only once the cursor reads "Yes" — an
 leave #630's corpse alone: with claude gone, an Up typed into the shell recalls
 its last command, so keys are sent only to a pane positively running claude.
 """
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 

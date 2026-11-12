@@ -10,14 +10,9 @@ persisted state:
   「▶️ 再開する」button is posted instead
 * reopening clears the flag, restores the name, and runs the held message
 """
-
-from __future__ import annotations
-
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
+# <<REDACTED 6 lines>>
 import pytest
-
+# <<REDACTED 1 lines>>
 from c_lord.database.repository import SessionRecord
 from c_lord.thread_name import CLOSED_MARK
 
@@ -39,8 +34,7 @@ def _record(thread_id: int = 555, *, closed_at: str | None = None) -> SessionRec
 
 
 def _thread(thread_id: int = 555) -> MagicMock:
-    thread = MagicMock(spec=discord.Thread)
-    thread.id = thread_id
+    # <<REDACTED 2 lines>>
     thread.parent_id = 999
     thread.name = "W3 │ #404 認証リファクタ"
     thread.edit = AsyncMock()
@@ -54,9 +48,7 @@ def _thread(thread_id: int = 555) -> MagicMock:
 class TestCloseMarksThread:
     def _cog(self, record: SessionRecord | None):
         from c_lord.cogs.session_manage import SessionManageCog
-
-        bot = MagicMock()
-        bot.channel_id = 999
+# <<REDACTED 3 lines>>
         bot.get_cog = MagicMock(return_value=None)
         repo = MagicMock()
         repo.get = AsyncMock(return_value=record)
@@ -151,9 +143,7 @@ class TestCloseMarksThread:
 class TestReopenCommand:
     def _cog(self, record: SessionRecord | None):
         from c_lord.cogs.session_manage import SessionManageCog
-
-        bot = MagicMock()
-        bot.channel_id = 999
+# <<REDACTED 3 lines>>
         bot.get_cog = MagicMock(return_value=None)
         repo = MagicMock()
         repo.get = AsyncMock(return_value=record)
@@ -312,9 +302,7 @@ class TestStopEndsTheRunningTurn:
 
     def _cog(self, chat: object):
         from c_lord.cogs.session_manage import SessionManageCog
-
-        bot = MagicMock()
-        bot.channel_id = 999
+# <<REDACTED 3 lines>>
         bot.get_cog = MagicMock(side_effect=lambda name: chat if name == "ClaudeChatCog" else None)
         repo = MagicMock()
         repo.get = AsyncMock(return_value=_record())

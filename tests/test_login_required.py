@@ -4,11 +4,7 @@ Claude Code answers every prompt with ``Login expired · Please run /login``
 when its credentials are gone, then goes idle.  c-lord used to report that as
 "Claude never started this turn — send the message again": the wrong cause,
 and advice that cannot work until someone runs ``/login`` on the host.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -237,8 +233,7 @@ class TestEventProcessorOutcome:
         p = EventProcessor(config)
         await p.process(
             StreamEvent(
-                message_type=MessageType.RESULT,
-                is_complete=True,
+                # <<REDACTED 2 lines>>
                 error=f"{LOGIN_REQUIRED_ERROR_PREFIX} Claude Code needs /login.",
             )
         )

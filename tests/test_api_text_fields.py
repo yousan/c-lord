@@ -23,9 +23,7 @@ from c_lord.database.notification_repo import NotificationRepository
 from c_lord.database.resume_repo import PendingResumeRepository
 from c_lord.database.task_repo import TaskRepository
 from c_lord.ext.api_server import ApiServer
-
-
-@pytest.fixture
+# <<REDACTED 3 lines>>
 async def env(tmp_path: Path) -> AsyncIterator[tuple[TestClient, TaskRepository]]:
     repo = NotificationRepository(str(tmp_path / "n.db"))
     await repo.init_db()

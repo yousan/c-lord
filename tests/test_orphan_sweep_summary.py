@@ -13,12 +13,7 @@ commits that were never pushed:
 Nothing was lost — the keep decision was right — but the reason was misreported.
 Each kept directory is counted under one reason: uncommitted files win when both
 are present, the rest (unpushed commits, stashes) get their own count.
-"""
-
-from __future__ import annotations
-
-import logging
-import os
+# <<REDACTED 6 lines>>
 import re
 import subprocess
 import time

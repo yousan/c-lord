@@ -10,11 +10,7 @@ Nothing new is stored for this: the ⏳ menu message itself carries the question
 and the answer, the thread's session row carries the workspace, and the
 workspace's transcript carries the ask and its result. On startup the new
 process finds its ⏳ menus in Discord and picks the watch up again.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import datetime as dt
 import json
 from pathlib import Path

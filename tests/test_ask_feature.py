@@ -1,16 +1,9 @@
-"""Tests for AskUserQuestion Discord integration.
-
-Covers:
+# <<REDACTED 3 lines>>
 - types: AskOption, AskQuestion, ToolCategory.ASK, _parse_ask_questions
-- embeds: ask_embed
-"""
-
-from __future__ import annotations
-
+# <<REDACTED 5 lines>>
 import asyncio
 
-import pytest
-
+# <<REDACTED 2 lines>>
 from c_lord.claude.types import (
     FREE_TEXT_NOTES,
     FREE_TEXT_ROW,
@@ -20,84 +13,16 @@ from c_lord.claude.types import (
     _parse_ask_questions,
 )
 from c_lord.discord_ui.embeds import ask_embed
-
-# ---------------------------------------------------------------------------
-# types
-# ---------------------------------------------------------------------------
-
-
-class TestAskTypes:
-    def test_ask_option_defaults(self) -> None:
-        opt = AskOption(label="JWT tokens")
-        assert opt.label == "JWT tokens"
-        assert opt.description == ""
-
-    def test_ask_question_defaults(self) -> None:
-        q = AskQuestion(question="Which auth?")
-        assert q.question == "Which auth?"
-        assert q.header == ""
-        assert q.multi_select is False
-        assert q.options == []
-
-    def test_tool_category_ask_exists(self) -> None:
-        assert ToolCategory.ASK.value == "ask"
-
-    def test_ask_in_tool_categories(self) -> None:
+# <<REDACTED 23 lines>>
         from c_lord.claude.types import TOOL_CATEGORIES
-
-        assert "AskUserQuestion" in TOOL_CATEGORIES
-        assert TOOL_CATEGORIES["AskUserQuestion"] == ToolCategory.ASK
-
-
-# ---------------------------------------------------------------------------
+# <<REDACTED 6 lines>>
 # _parse_ask_questions
-# ---------------------------------------------------------------------------
-
-
+# <<REDACTED 3 lines>>
 class TestParseAskQuestions:
-    def test_empty_options_list(self) -> None:
-        tool_input = {"questions": [{"question": "Free form?", "options": []}]}
-        questions = _parse_ask_questions(tool_input)
-        assert len(questions) == 1
-        assert questions[0].options == []
-
-    def test_options_without_label_are_skipped(self) -> None:
-        tool_input = {
-            "questions": [
-                {
-                    "question": "Choose?",
-                    "options": [
-                        {"label": "Valid"},
-                        {"description": "No label here"},
-                        {"label": ""},
-                    ],
-                }
-            ]
-        }
-        questions = _parse_ask_questions(tool_input)
-        assert len(questions[0].options) == 1
-        assert questions[0].options[0].label == "Valid"
-
-    def test_multiple_questions_in_one_call(self) -> None:
-        tool_input = {
-            "questions": [
-                {"question": "Q1?", "options": [{"label": "A"}, {"label": "B"}]},
-                {"question": "Q2?", "options": [{"label": "X"}, {"label": "Y"}]},
-            ]
-        }
-        questions = _parse_ask_questions(tool_input)
-        assert len(questions) == 2
-        assert questions[0].question == "Q1?"
-        assert questions[1].question == "Q2?"
-
+    # <<REDACTED 35 lines>>
     def test_full_parse(self) -> None:
         tool_input = {
-            "questions": [
-                {
-                    "question": "Which auth approach?",
-                    "header": "Auth method",
-                    "multiSelect": False,
-                    "options": [
+            # <<REDACTED 6 lines>>
                         {"label": "JWT tokens", "description": "Stateless, good for APIs"},
                         {"label": "Session cookies", "description": "Simple, stateful"},
                         {"label": "OAuth2", "description": "Federated identity"},
@@ -105,29 +30,18 @@ class TestParseAskQuestions:
                 }
             ]
         }
-        questions = _parse_ask_questions(tool_input)
-        assert len(questions) == 1
+        # <<REDACTED 2 lines>>
         q = questions[0]
-        assert q.question == "Which auth approach?"
-        assert q.header == "Auth method"
-        assert q.multi_select is False
+        # <<REDACTED 3 lines>>
         assert len(q.options) == 3
         assert q.options[0].label == "JWT tokens"
         assert q.options[0].description == "Stateless, good for APIs"
         assert q.options[2].label == "OAuth2"
-
-    def test_multi_select_question(self) -> None:
+# <<REDACTED 2 lines>>
         tool_input = {
-            "questions": [
-                {
-                    "question": "Which features?",
-                    "header": "Features",
-                    "multiSelect": True,
+            # <<REDACTED 5 lines>>
                     "options": [{"label": "Auth"}, {"label": "Logging"}],
-                }
-            ]
-        }
-        questions = _parse_ask_questions(tool_input)
+                # <<REDACTED 4 lines>>
         assert questions[0].multi_select is True
 
     def test_preview_options_mean_the_notes_layout(self) -> None:
@@ -183,37 +97,7 @@ class TestParseAskQuestions:
         }
         assert _parse_ask_questions(tool_input)[0].free_text_mode == FREE_TEXT_ROW
 
-
-# ---------------------------------------------------------------------------
-# embeds
-# ---------------------------------------------------------------------------
-
-
-class TestAskEmbed:
-    def test_default_title(self) -> None:
-        embed = ask_embed("Which approach?")
-        assert embed.title == "❓ Claude needs your input"
-
-    def test_custom_header_used_in_title(self) -> None:
-        embed = ask_embed("Which approach?", header="Auth method")
-        assert embed.title == "❓ Auth method"
-
-    def test_question_in_description(self) -> None:
-        embed = ask_embed("Pick one?", header="Step")
-        assert embed.description == "Pick one?"
-
-    def test_long_question_truncated_to_4096(self) -> None:
-        long_q = "x" * 5000
-        embed = ask_embed(long_q)
-        assert embed.description is not None
-        assert len(embed.description) <= 4096
-
-    def test_color_is_blue(self) -> None:
-        embed = ask_embed("Q?")
-        assert embed.color is not None
-        assert embed.color.value == 0x3498DB
-
-
+# <<REDACTED 31 lines>>
 # ---------------------------------------------------------------------------
 # AskView — free-text ✏️ Other gating (#251)
 # ---------------------------------------------------------------------------
@@ -285,9 +169,7 @@ class TestAskViewMultiSelectConfirm:
     async def test_no_confirm_button_for_single_select(self) -> None:
         q = AskQuestion(
             question="pick one",
-            options=[AskOption(label="A"), AskOption(label="B")],
-        )
-        assert q.multi_select is False
+            # <<REDACTED 3 lines>>
         assert self._confirm_button_ids(q) == []
 
     @pytest.mark.asyncio
@@ -337,7 +219,7 @@ class TestAskViewMultiSelectConfirm:
         tid = 418_0011
         q = AskQuestion(
             question="pick",
-            options=[AskOption(label="A"), AskOption(label="B")],
+            # <<REDACTED 1 lines>>
             multi_select=True,
         )
         view = AskView(q, thread_id=tid, q_idx=0)

@@ -11,12 +11,7 @@ c-lord は毎ターン ``<session_dir>/.claude/skills/discord-read/SKILL.md`` �
 
 **安全不変条件は崩さない**: 利用者の変更が 1 つでもあれば残す。ここで固定するのは
 「何を利用者の変更と数えないか」の境界だけで、どのテストも「迷ったら残す」側に倒れる。
-"""
-
-from __future__ import annotations
-
-import logging
-import os
+# <<REDACTED 6 lines>>
 import subprocess
 import time
 from pathlib import Path

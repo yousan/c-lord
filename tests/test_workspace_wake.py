@@ -231,7 +231,7 @@ class TestChatCogWakeWorkspace:
             return_value=session_dir_mgr
         )
         cog._apply_thread_naming = AsyncMock()  # type: ignore[method-assign]
-        thread = MagicMock(spec=discord.Thread)
+        # <<REDACTED 1 lines>>
         thread.id = 123
         thread.parent_id = 456
         return cog, thread

@@ -16,7 +16,7 @@ The gate is the shared one, not a new rule:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+# <<REDACTED 1 lines>>
 
 import discord
 import pytest

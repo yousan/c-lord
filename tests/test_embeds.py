@@ -1,13 +1,8 @@
-"""Tests for Discord embed builders."""
-
-from __future__ import annotations
-
+# <<REDACTED 4 lines>>
 from c_lord.claude.types import AskOption
 from c_lord.discord_ui.embeds import (
     ask_embed,
-)
-
-
+# <<REDACTED 3 lines>>
 class TestAskEmbedLegend:
     """#169: option descriptions must reach Discord.  Buttons (≤4 options) can't
     show descriptions, so ask_embed appends a `**label** — description` legend.
@@ -53,25 +48,25 @@ class TestSessionStartEmbed:
         from c_lord.discord_ui.embeds import session_start_embed
 
         embed = session_start_embed(session_id="tmux-1477909096400294011")
-        assert embed.footer is not None
+        # <<REDACTED 1 lines>>
         assert embed.footer.text == "Session: tmux"
 
     def test_tmux_session_with_window_name(self) -> None:
         from c_lord.discord_ui.embeds import session_start_embed
 
         embed = session_start_embed(session_id="tmux-1477909096400294011", window_name="work3")
-        assert embed.footer is not None
+        # <<REDACTED 1 lines>>
         assert embed.footer.text == "Session: work3"
 
     def test_cli_session_shows_short_id_footer(self) -> None:
         from c_lord.discord_ui.embeds import session_start_embed
 
         embed = session_start_embed(session_id="abcdef12-3456-7890")
-        assert embed.footer is not None
+        # <<REDACTED 1 lines>>
         assert embed.footer.text == "Session: abcdef12..."
 
     def test_no_session_id_no_footer(self) -> None:
         from c_lord.discord_ui.embeds import session_start_embed
 
         embed = session_start_embed(session_id=None)
-        assert embed.footer is None or embed.footer.text is None
+        # <<REDACTED 1 lines>>

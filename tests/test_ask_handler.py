@@ -4,11 +4,7 @@
 attaches and types).  When that happens the bridge must stop waiting for a
 Discord click — otherwise the suspended ``run_claude`` holds the thread lock
 for up to 24h and the whole thread freezes.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import contextlib
 from unittest.mock import AsyncMock, MagicMock
 

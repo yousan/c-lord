@@ -13,11 +13,7 @@ Two halves:
   git said, what to check when tmux is the problem.
 * ``_run_claude`` posts it (❌ embed + the requester's mention, #681), turns
   the lamp to ❌ and ends the turn instead of dying mid-flight.
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 

@@ -1,8 +1,5 @@
 """Tests for c_lord.transcript.mirror — per-thread tail→Discord pipe."""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 import json
 from pathlib import Path
 

@@ -17,13 +17,7 @@ still named the wrong person:
   landed": after a restart the ❌ pinged A for a prompt the pane never got.
 
 Real SQLite throughout (``SessionRepository``), real ``ClaudeChatCog._run_claude``.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import contextlib
-import logging
+# <<REDACTED 7 lines>>
 import sqlite3
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch

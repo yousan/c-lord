@@ -6,11 +6,7 @@ withdrew it with ``silent=False`` regardless, so the replaced turn ended as
 ``outcome=stopped`` (with a turn-end event of its own) instead of
 ``outcome=cancelled`` — contradicting ``docs/specs/session-close.md``. The
 ledger side (``withdraw_in_flight``) already skipped pre-empted runs (#1019).
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import logging
 from unittest.mock import MagicMock
 

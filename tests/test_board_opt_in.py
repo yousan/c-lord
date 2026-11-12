@@ -16,11 +16,7 @@ Two things must stay true while the board is off:
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
-
+# <<REDACTED 5 lines>>
 from c_lord.discord_ui.thread_dashboard import (
     DASHBOARD_TITLE,
     ThreadState,
@@ -37,7 +33,7 @@ async def _aiter(items: list[MagicMock]) -> AsyncIterator[MagicMock]:
 
 
 def _board_message(msg_id: int) -> MagicMock:
-    msg = MagicMock(spec=discord.Message)
+    # <<REDACTED 1 lines>>
     msg.id = msg_id
     msg.author = MagicMock()
     msg.author.id = _BOT_ID

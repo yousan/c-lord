@@ -5,10 +5,7 @@ its StatusManager, and whatever it last painted stays on the message forever —
 all six "⚠️ only" lamps measured after #727 were exactly this: the thread's
 turn was still running when the bot restarted (usually its own deploy).
 """
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 

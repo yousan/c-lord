@@ -4,14 +4,7 @@ Before this the repo came from the channel binding only, so working on another
 repo meant: create a thread by hand → ``/clord-thread-init`` → ``/clord``. The
 option writes the thread binding *before* the session dir is cloned, which is
 the one thing the three-step dance was buying.
-"""
-
-from __future__ import annotations
-
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import discord
+# <<REDACTED 8 lines>>
 import pytest
 
 from c_lord.cogs.channel_repo import ChannelRepoCog
@@ -57,11 +50,7 @@ def _make_cog(channel_cog: ChannelRepoCog | None = None) -> ClaudeChatCog:
     bot.channel_id = 999
     bot.settings_repo = None
     bot.get_cog = MagicMock(return_value=channel_cog)
-    repo = MagicMock()
-    repo.get = AsyncMock(return_value=None)
-    repo.save = AsyncMock()
-    runner = MagicMock()
-    runner.clone = MagicMock(return_value=MagicMock())
+    # <<REDACTED 5 lines>>
     # #713: this file is not about *who* may drive c-lord. The shipped
     # default is owner-only, resolved from Discord at on_ready — which a
     # unit test never reaches — so the gate is opened explicitly here and
@@ -78,7 +67,7 @@ def _make_text_channel(channel_id: int = 500) -> MagicMock:
     thread.id = 501
     thread.parent_id = channel_id
     thread.send = AsyncMock(return_value=MagicMock())
-    channel.create_thread = AsyncMock(return_value=thread)
+    # <<REDACTED 1 lines>>
     return channel
 
 

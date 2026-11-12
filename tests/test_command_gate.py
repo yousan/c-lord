@@ -13,10 +13,7 @@ Same root — no shared gate for message-backed invocations — two axes.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
+# <<REDACTED 4 lines>>
 
 from c_lord.bot import ClaudeDiscordBot
 from c_lord.command_gate import is_message_authorized, owns, owns_channel

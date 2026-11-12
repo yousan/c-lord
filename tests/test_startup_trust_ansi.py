@@ -16,10 +16,7 @@ seen, the coloured cursor line was not, and a bare Enter answered "No, exit".
 The panes below stay coloured and only change once a key has been sent, as the
 real CLI does.
 """
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 

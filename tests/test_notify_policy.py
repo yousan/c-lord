@@ -154,9 +154,7 @@ def _make_cog() -> ClaudeChatCog:
     runner.model = None
     runner.timeout_seconds = 60
     runner.effort = None
-    return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
-
-
+    # <<REDACTED 3 lines>>
 async def _run_turn(cog: ClaudeChatCog, message: MagicMock) -> dict:
     """Drive ``_run_claude`` far enough to capture both mention decisions."""
     sdm = MagicMock()

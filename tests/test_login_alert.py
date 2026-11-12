@@ -5,11 +5,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
-
-import discord
-import pytest
-
+# <<REDACTED 5 lines>>
 from c_lord.claude.tmux_runner import LOGIN_REQUIRED_ERROR_PREFIX
 from c_lord.claude.types import MessageType, StreamEvent
 from c_lord.cogs.event_processor import EventProcessor
