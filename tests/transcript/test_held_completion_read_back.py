@@ -12,7 +12,10 @@ The restored mirror already reads the transcript back (#1011/#1012). When it
 finds no turn open, no agent out and every report answered by a turn end, the
 held completion goes out at once, with the request's ``started_by`` and reason.
 """
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import asyncio
 from pathlib import Path
 
 from c_lord import turn_events

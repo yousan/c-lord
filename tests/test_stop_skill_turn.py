@@ -8,7 +8,11 @@ runner was never withdrawn: parked on a question card it waited out the 24h
 ``/skill``), and #909's ``outcome=stopped`` never reached it either.
 
 Every run is in ``_run_helper``'s in-flight ledger, so the stop reads that.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 import logging
 from unittest.mock import MagicMock
 

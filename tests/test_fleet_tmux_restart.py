@@ -330,7 +330,9 @@ class TestWhatTheThreadSees:
         from c_lord.claude.types import MessageType, StreamEvent
 
         await processor.process(
-            # <<REDACTED 3 lines>>
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
                 error=f"{FLEET_TMUX_RESTART_ERROR_PREFIX} server 1 → 2",
             )
         )

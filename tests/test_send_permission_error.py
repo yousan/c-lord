@@ -97,7 +97,7 @@ class TestClordImplThreadSendForbidden:
         record = MagicMock()
         record.closed_at = None
         record.session_id = "sess-abc"
-        # <<REDACTED 1 lines>>
+        cog.repo.get = AsyncMock(return_value=record)
 
         # _run_claude must NOT be invoked once the seed send fails.
         cog._run_claude = AsyncMock()

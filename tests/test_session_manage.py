@@ -1,10 +1,69 @@
-# <<REDACTED 4 lines>>
+"""SessionManageCog: the workspace commands and their ``!text`` twins."""
+
+from __future__ import annotations
+
 from unittest.mock import AsyncMock, MagicMock, patch
-# <<REDACTED 3 lines>>
+
+import discord
+
 from c_lord.database.repository import SessionRecord
-# <<REDACTED 41 lines>>
+from c_lord.discord_ui.authorization import Authorizer
+
+
+def _make_record(
+    thread_id: int = 12345,
+    session_id: str = "tmux-12345",
+    summary: str | None = None,
+) -> SessionRecord:
+    """A ``sessions`` row as the repository hands it out (open, never closed)."""
+    return SessionRecord(
+        thread_id=thread_id,
+        session_id=session_id,
+        working_dir=f"/sessions/{thread_id}",
+        model="sonnet",
+        origin="discord",
+        summary=summary,
+        created_at="2026-08-01 09:00:00",
+        last_used_at="2026-08-01 09:30:00",
+    )
+
+
+def _make_cog():
+    """A cog on a bot with no ChannelRepoCog loaded, open to every caller.
+
+    ``bot.get_cog`` answers with a plain mock, which is not a ChannelRepoCog, so
+    the cog sees no channel bindings until a test wires its own managers in.
+    """
     from c_lord.cogs.session_manage import SessionManageCog
-# <<REDACTED 9 lines>>
+
+    bot = MagicMock()
+    runner = MagicMock()
+    runner.model = "sonnet"
+    repo = MagicMock()
+    repo.get = AsyncMock(return_value=None)
+    return SessionManageCog(
+        bot=bot,
+        repo=repo,
+        runner=runner,
+        authorizer=Authorizer(allow_anyone=True),
+    )
+
+
+def _make_interaction(channel: MagicMock | None = None) -> MagicMock:
+    """A slash interaction; in a plain text channel unless *channel* is given."""
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = channel if channel is not None else MagicMock(spec=discord.TextChannel)
+    interaction.user = MagicMock()
+    interaction.user.id = 1
+    interaction.extras = {}
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
 def _make_ctx(channel: MagicMock | None = None) -> MagicMock:
     """Return a mocked commands.Context for the !text twins."""
     ctx = MagicMock()
@@ -19,7 +78,8 @@ def _make_ctx(channel: MagicMock | None = None) -> MagicMock:
 
 
 def _make_thread_ctx(thread_id: int = 12345) -> MagicMock:
-    # <<REDACTED 2 lines>>
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
     return _make_ctx(channel=thread)
 
 
@@ -186,7 +246,7 @@ class TestOpsTextTwins:
     async def test_dry_run_arg_accepts_the_documented_spellings(self):
         """`dry` を渡したのに実際に消える、が起きないこと。"""
         from c_lord.cogs.session_manage import SessionManageCog
-# <<REDACTED 1 lines>>
+
         parse = SessionManageCog._dry_run_arg
         assert parse("dry") is True
         assert parse("dry-run") is True
@@ -206,7 +266,7 @@ class TestOpsTextTwins:
         cog = _make_cog()
         cog._resolve_tmux_manager = AsyncMock(return_value=None)
         cog._resolve_session_dir_manager = AsyncMock(return_value=None)
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 555
         thread.parent_id = 999
         ctx = _make_ctx(channel=thread)
@@ -239,7 +299,7 @@ class TestCloseWorkspace:
         sdm.cleanup_for_thread = MagicMock()
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
         cog._resolve_session_dir_manager = AsyncMock(return_value=sdm)
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 555
         thread.parent_id = 999
         thread.edit = AsyncMock()
@@ -257,7 +317,7 @@ class TestCloseWorkspace:
         tmux_mgr.kill_session = MagicMock(return_value=True)
         cog._resolve_tmux_manager = AsyncMock(return_value=tmux_mgr)
         cog._resolve_session_dir_manager = AsyncMock(return_value=None)
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 555
         thread.parent_id = 999
         thread.edit = AsyncMock()
@@ -287,7 +347,7 @@ class TestCloseWorkspace:
         mirror_cog.stop_for = AsyncMock()
         cog.bot.get_cog = MagicMock(return_value=mirror_cog)
 
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 555
         thread.parent_id = 999
         thread.edit = AsyncMock()
@@ -320,7 +380,7 @@ class TestCloseWorkspace:
         cog._resolve_session_dir_manager = AsyncMock(return_value=None)
         cog.bot.get_cog = MagicMock(return_value=None)  # cog not registered
 
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 555
         thread.parent_id = 999
         thread.edit = AsyncMock()
@@ -346,7 +406,7 @@ class TestCloseWorkspace:
         mirror_cog.stop_for = AsyncMock()
         cog.bot.get_cog = MagicMock(return_value=mirror_cog)
 
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 555
         thread.parent_id = 999
         ctx = _make_ctx(channel=thread)
@@ -364,7 +424,7 @@ class TestCloseWorkspace:
         cog._resolve_session_dir_manager = AsyncMock(return_value=None)
         cog.bot.get_cog = MagicMock(return_value=None)
 
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 555
         thread.parent_id = 999
         ctx = _make_ctx(channel=thread)
@@ -385,7 +445,7 @@ class TestThreadArchiveCommand:
         ctx = _make_ctx()
         await cog.thread_archive_show_text.callback(cog, ctx)
         embed = ctx.send.call_args.kwargs.get("embed")
-        # <<REDACTED 1 lines>>
+        assert embed is not None
         # Default is 3 days (4320 min) when nothing is stored.
         assert "4320" in embed.description or "3" in embed.description
 
@@ -438,14 +498,23 @@ def _capture_responder():
 
 
 class TestTmuxScreenshot:
-    # <<REDACTED 3 lines>>
+    """/tmux-screenshot — the pane as a PNG (#285)."""
+
+    async def test_slash_command_outside_a_thread_answers_privately(self):
+        cog = _make_cog()
+        interaction = _make_interaction()  # a text channel, not a thread
         await cog.tmux_screenshot.callback(cog, interaction)
-        # <<REDACTED 3 lines>>
+        interaction.response.send_message.assert_awaited_once()
+        reply = interaction.response.send_message.call_args
+        assert reply.kwargs.get("ephemeral") is True
+        assert reply.kwargs.get("file") is None
+        assert "thread" in reply.args[0].lower()
+
     async def test_impl_sends_png_file(self, monkeypatch):
         import c_lord.cogs.session_manage as sm
 
         cog = _make_cog()
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 123
         thread.parent_id = 456
 
@@ -479,7 +548,7 @@ class TestTmuxScreenshot:
 
     async def test_impl_no_window_sends_ephemeral(self, monkeypatch):
         cog = _make_cog()
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 123
         thread.parent_id = 456
 
@@ -498,7 +567,7 @@ class TestTmuxScreenshot:
         window found for this thread.' — tell the user that sending a message
         auto-restores it (the #270/#465 dead-pane recovery)."""
         cog = _make_cog()
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 123
         thread.parent_id = 456
 
@@ -517,7 +586,7 @@ class TestTmuxScreenshot:
         import c_lord.cogs.session_manage as sm
 
         cog = _make_cog()
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 123
         thread.parent_id = 456
 
@@ -548,7 +617,7 @@ class TestScreenshotWakesStoppedWorkspace:
 
     @staticmethod
     def _thread(thread_id: int = 123):
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = thread_id
         thread.parent_id = 456
         return thread
@@ -733,7 +802,7 @@ class TestWorkspaceCleanupFieldLimit:
         await cog._workspace_cleanup_impl(dry_run=True, respond=respond, ack=ack)
 
         embed = sent[-1]["embed"]
-        # <<REDACTED 1 lines>>
+        assert embed is not None
         assert len(embed.fields) == 2
         for field in embed.fields:
             assert len(field.value) <= 1024, f"{field.name}: {len(field.value)} chars"

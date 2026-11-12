@@ -11,9 +11,17 @@ is a real TCP connection over loopback and the UID behind it is resolved the
 same way as in production (``/proc/net/tcp``), so the gate itself is exercised
 end to end — only the expectation is inverted.
 """
-# <<REDACTED 5 lines>>
+
+from __future__ import annotations
+
+import os
+import tempfile
 from pathlib import Path
-# <<REDACTED 5 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from aiohttp.test_utils import TestClient, TestServer
+
 from c_lord.database.notification_repo import NotificationRepository
 from c_lord.database.task_repo import TaskRepository
 from c_lord.ext.api_server import ApiServer
@@ -22,19 +30,40 @@ pytestmark = pytest.mark.skipif(
     not hasattr(os, "getuid"), reason="POSIX-only: the API gate keys on Unix UIDs"
 )
 
-# <<REDACTED 11 lines>>
+
+@pytest.fixture
+async def repo() -> NotificationRepository:
+    """A real notification store in a throwaway file, removed afterwards."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    notifications = NotificationRepository(path)
+    await notifications.init_db()
+    yield notifications
+    os.unlink(path)
+
+
 @pytest.fixture
 async def task_repo() -> TaskRepository:
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     repo = TaskRepository(path)
-    # <<REDACTED 11 lines>>
+    await repo.init_db()
+    yield repo
+    os.unlink(path)
+
+
+@pytest.fixture
+def bot() -> MagicMock:
+    """A bot whose every channel lookup lands on one channel with a recordable ``send``."""
+    b = MagicMock()
+    b.get_channel.return_value.send = AsyncMock()
     b.cogs = {}
     return b
 
 
 async def _client(api: ApiServer) -> TestClient:
-    # <<REDACTED 3 lines>>
+    client = TestClient(TestServer(api.app))
+    await client.start_server()
     return client
 
 
@@ -141,7 +170,11 @@ class TestOwnUidIsAllowed:
         client = await _client(ApiServer(repo=repo, bot=bot, default_channel_id=12345))
         try:
             resp = await client.post("/api/spawn", json={})
-            # <<REDACTED 4 lines>>
+            assert resp.status == 400
+            assert (await resp.json()) == {"error": "prompt is required"}
+        finally:
+            await client.close()
+
 
 class TestSecretOpensTheGate:
     """``CLORD_API_SECRET`` stays the explicit way to let other users in."""

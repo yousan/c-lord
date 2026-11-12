@@ -129,7 +129,10 @@ def _make_cog() -> ClaudeChatCog:
     runner.model = None
     runner.timeout_seconds = 60
     runner.effort = None
-    # <<REDACTED 3 lines>>
+    runner.clone = MagicMock(return_value=runner)
+    return ClaudeChatCog(bot=bot, repo=repo, runner=runner)
+
+
 async def _run_turn(cog: ClaudeChatCog, message: MagicMock, **kwargs: object) -> dict:
     """Drive ``_run_claude`` up to (and including) the RunConfig it builds."""
     sdm = MagicMock()
@@ -234,7 +237,7 @@ class TestClordPassesTheInvoker:
         record = MagicMock()
         record.closed_at = None
         record.session_id = "sess-abc"
-        # <<REDACTED 1 lines>>
+        cog.repo.get = AsyncMock(return_value=record)
         thread = MagicMock(spec=discord.Thread)
         thread.id = 601
         thread.parent_id = 500
@@ -288,7 +291,7 @@ class TestClordPassesTheInvoker:
         thread.send = AsyncMock(return_value=MagicMock())
         channel = MagicMock(spec=discord.TextChannel)
         channel.id = 500
-        # <<REDACTED 1 lines>>
+        channel.create_thread = AsyncMock(return_value=thread)
         invoker = _human()
 
         await cog.spawn_session(channel, "やること", requester=invoker)

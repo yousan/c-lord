@@ -7,7 +7,10 @@ port crashed the start with a traceback that named no setting. Like the other
 IDs (#1084 / #1194), only ASCII digits count; anything else is ignored with a
 WARNING that names the setting — never an exception.
 """
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 

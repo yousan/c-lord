@@ -1,14 +1,35 @@
 """Shared pytest fixtures for c_lord tests.
-# <<REDACTED 7 lines>>
+
+What lives here applies to every test file without an import:
+
+* ``thread`` / ``runner`` — the two doubles a ``RunConfig`` needs.
+* the autouse fixtures below — each one keeps a piece of process-global or
+  host-global state (home directory, tmux socket, authorization, …) from
+  leaking between tests or out of the test run.
+"""
+
+from __future__ import annotations
+
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-# <<REDACTED 5 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
 from c_lord.claude.types import MessageType, StreamEvent
-# <<REDACTED 2 lines>>
+
+#: The id every ``thread`` double answers to, so a test can name it without the fixture.
+THREAD_ID = 12345
+#: The session id the default scripted turn of ``runner`` reports.
+SESSION_ID = "0a1b2c3d-0000-4000-8000-000000000001"
+
+
 @pytest.fixture(autouse=True)
 def _isolated_claude_home(tmp_path_factory, monkeypatch) -> None:
     """Keep ``~/.claude`` out of the test run (#773).
@@ -37,9 +58,55 @@ def _isolated_claude_home(tmp_path_factory, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", classmethod(_home))
 
 
-# <<REDACTED 13 lines>>
+def scripted_turn(*events: StreamEvent) -> Callable[..., AsyncIterator[StreamEvent]]:
+    """Build a stand-in for ``runner.run`` that yields *events* and then ends.
+
+    The real runner is an async generator, so a plain ``AsyncMock`` cannot play
+    it; this keeps each test's "what the pane reported" a flat list of events.
+    """
+
+    async def _run(*_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
+        for event in events:
+            yield event
+
+    return _run
+
+
+def shortest_turn(session_id: str = SESSION_ID) -> list[StreamEvent]:
+    """The events of the shortest clean turn: the session is named, then it completes."""
+    return [
+        StreamEvent(message_type=MessageType.SYSTEM, session_id=session_id),
+        StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id=session_id),
+    ]
+
+
+@pytest.fixture
+def thread() -> MagicMock:
+    """A ``discord.Thread`` double: every send succeeds and returns a message."""
+    double = MagicMock(spec=discord.Thread)
+    double.id = THREAD_ID
+    double.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+    return double
+
+
+@pytest.fixture
+def repo() -> MagicMock:
+    """A SessionRepository double: writes succeed, and nothing is on record yet."""
+    double = MagicMock()
+    double.save = AsyncMock()
+    double.get = AsyncMock(return_value=None)
+    return double
+
+
+@pytest.fixture
+def runner() -> MagicMock:
     """A MagicMock runner (TmuxClaudeRunner) with interrupt() wired up."""
-    # <<REDACTED 44 lines>>
+    double = MagicMock()
+    double.interrupt = AsyncMock()
+    # Left unscripted, a turn is the shortest clean one: the session is named,
+    # then the turn completes.
+    double.run = scripted_turn(*shortest_turn())
+    return double
 
 
 @pytest.fixture(autouse=True)
@@ -146,7 +213,7 @@ def _reset_fallback_owner_ids():
         authorization.set_fallback_owner_ids(None)
         authorization.set_default_authorizer(None)
 
-# <<REDACTED 1 lines>>
+
 @pytest.fixture(autouse=True)
 def _fresh_login_alert(tmp_path):
     """Give every test its own login outage (#1309).

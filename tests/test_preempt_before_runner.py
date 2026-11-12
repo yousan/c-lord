@@ -6,7 +6,12 @@ runner registered yet. The interrupt then had nothing to stop, and the prior
 turn could reach ``runner.run()`` within the 5 s drain grace and type the
 request the user had just cancelled. The preempted task is remembered, and the
 runner it registers later starts out stopped.
-# <<REDACTED 6 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
 import weakref
 from unittest.mock import AsyncMock, MagicMock
 

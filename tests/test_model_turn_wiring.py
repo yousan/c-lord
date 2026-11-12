@@ -4,7 +4,10 @@ Drives the real ``ClaudeChatCog._run_claude`` up to the moment it builds the
 runner and checks what the Claude process would be launched with — and whether a
 Claude already running with a different pair is restarted (with ``--resume``)
 rather than being sent ``/model`` (which would rewrite the host's user settings).
-# <<REDACTED 4 lines>>
+"""
+
+from __future__ import annotations
+
 import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 

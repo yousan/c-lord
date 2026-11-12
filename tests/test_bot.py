@@ -1,5 +1,12 @@
 """Tests for ClaudeDiscordBot."""
-# <<REDACTED 8 lines>>
+
+from __future__ import annotations
+
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
 from discord import app_commands
 
 from c_lord.bot import ClaudeDiscordBot
@@ -57,7 +64,8 @@ class TestProcessCommands:
         bot.invoke = AsyncMock()
 
         msg = MagicMock(spec=discord.Message)
-        # <<REDACTED 2 lines>>
+        msg.author = MagicMock()
+        msg.author.bot = False
         msg.webhook_id = None
         msg.channel = MagicMock(spec=discord.TextChannel)
         msg.channel.id = 123  # this bot's channel

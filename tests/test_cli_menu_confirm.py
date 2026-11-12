@@ -11,7 +11,11 @@ on the thread for days, over an answer the CLI had taken at once.
 When the transcript has nothing to say, the pane does: the menu closed and
 stayed closed, and no ask was written for it. That is the evidence these menus
 have (the same evidence plan approval and transcript-less runners already use).
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock

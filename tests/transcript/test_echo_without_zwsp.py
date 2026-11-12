@@ -10,7 +10,11 @@ thread. This is the other half: *whose input* an event is must not depend on
 what the CLI does to the input either. c-lord records what it typed (the #682
 ``pane_echo`` registry) on every path that types a prompt, and the mirror asks
 that record — the ZWSP is kept only as an additional, backward-compatible sign.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import os
 from pathlib import Path

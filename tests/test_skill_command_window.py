@@ -9,7 +9,11 @@ third path with the #621 (scheduler) / #629 (webhook) hole, fixed the same way:
   in the thread's own checkout,
 * a window that could not be created stops the run loudly — ERROR in the log
   and a message in the thread.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord

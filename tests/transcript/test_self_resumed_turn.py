@@ -20,7 +20,10 @@ replaced by placeholders):
 * ``i961_c_ci_wait`` — thread 1564916505735340182: runner turn ends 14:38:36
   ("#959 の CI 待ち"); the self-started turn ends 14:53:04.
 """
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import asyncio
 import json
 import os
 from pathlib import Path

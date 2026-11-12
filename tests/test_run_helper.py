@@ -1,10 +1,70 @@
-# <<REDACTED 10 lines>>
+"""Running one turn: ``run_claude_with_config`` and the helpers around it.
+
+What a cog gets back from a turn, what the thread is told when it fails, what
+the log says about how it ended, and the context-usage footer that closes it.
+The runner is a mock that yields scripted events; Discord is a mocked thread.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from c_lord.claude.tmux_runner import STOPPED_BY_USER_ERROR
 from c_lord.claude.types import (
-    # <<REDACTED 3 lines>>
+    MessageType,
+    StreamEvent,
+)
 from c_lord.cogs._run_helper import (
-    # <<REDACTED 3 lines>>
+    _make_error_embed,
+    run_claude_in_thread,
+    run_claude_with_config,
+)
 from c_lord.concurrency import SessionRegistry
-# <<REDACTED 2 lines>>
+from c_lord.discord_ui import embeds as ui_embeds
+from tests.conftest import scripted_turn, shortest_turn
+
+_LOGGER = "c_lord.cogs._run_helper"
+
+
+def simple_events(session_id: str = "sess-1") -> list[StreamEvent]:
+    """The shortest clean turn, under the session id these tests assert on."""
+    return shortest_turn(session_id)
+
+
+def make_async_gen(events: list[StreamEvent]):
+    """``runner.run`` stand-in that plays *events* (list form of ``scripted_turn``)."""
+    return scripted_turn(*events)
+
+
+def _result(error: str | None = None, session_id: str | None = "sess-1") -> StreamEvent:
+    return StreamEvent(
+        message_type=MessageType.RESULT, is_complete=True, session_id=session_id, error=error
+    )
+
+
+def _embeds_sent(thread: MagicMock) -> list[discord.Embed]:
+    return [c.kwargs["embed"] for c in thread.send.call_args_list if "embed" in c.kwargs]
+
+
+def _exit_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "run_claude: exit" in r.getMessage()]
+
+
+@pytest.fixture(autouse=True)
+def _no_runs_left_in_flight():
+    """The in-flight ledger is process-wide; no test may leave a run behind in it."""
+    from c_lord.cogs import _run_helper
+
+    _run_helper._IN_FLIGHT.clear()
+    yield
+    assert _run_helper._IN_FLIGHT == {}, "a run was left in the in-flight ledger"
+
+
 class TestPersistedContextWindow:
     """#370: the window total is persisted per-model in the settings KV store.
 
@@ -316,18 +376,457 @@ class TestPostContextUsage:
         cfg.thread.send.assert_not_called()
 
 
-# <<REDACTED 174 lines>>
+class TestRunClaudeInThread:
+    """One turn through the positional entry point, start to finish."""
+
+    @pytest.mark.asyncio
+    async def test_a_clean_turn_returns_the_session_it_ended_on(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        runner.run = make_async_gen(simple_events("sess-42"))
+
+        result = await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        assert result == "sess-42"
+        repo.save.assert_any_call(thread.id, "sess-42", working_dir=None)
+
+    @pytest.mark.asyncio
+    async def test_the_runner_gets_the_prompt_and_the_session_to_resume(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        calls: list[tuple[tuple, dict]] = []
+
+        async def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            yield _result(session_id="sess-7")
+
+        runner.run = run
+
+        await run_claude_in_thread(thread, runner, repo, "continue please", "sess-7")
+
+        assert calls == [(("continue please",), {"session_id": "sess-7"})]
+
+    @pytest.mark.asyncio
+    async def test_a_runner_that_raises_is_reported_in_the_thread(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        """The exception never reaches the cog: the thread gets a generic ❌ instead."""
+        runner = MagicMock()
+
+        async def exploding(*args, **kwargs):
+            raise RuntimeError("tmux went away")
+            yield  # pragma: no cover - makes this an async generator
+
+        runner.run = exploding
+        status = MagicMock()
+        status.set_error = AsyncMock()
+
+        result = await run_claude_in_thread(thread, runner, repo, "hello", None, status=status)
+
+        assert result is None
+        [embed] = _embeds_sent(thread)
+        assert embed.to_dict() == ui_embeds.error_embed("An unexpected error occurred.").to_dict()
+        # The internal error text stays in the log, not in Discord.
+        assert "tmux went away" not in str(embed.to_dict())
+        status.set_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_runner_that_raises_after_reporting_a_session_still_returns_it(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        runner = MagicMock()
+
+        async def dies_midway(*args, **kwargs):
+            yield StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-half")
+            raise RuntimeError("boom")
+
+        runner.run = dies_midway
+
+        assert await run_claude_in_thread(thread, runner, repo, "hello", None) == "sess-half"
+
+    @pytest.mark.asyncio
+    async def test_error_embed_send_failure_does_not_raise(
+        self, thread: MagicMock, repo: MagicMock
+    ) -> None:
+        """Reporting the failure can fail too (bot shutting down) — still no exception."""
+        runner = MagicMock()
+
+        async def exploding(*args, **kwargs):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        runner.run = exploding
+        thread.send = AsyncMock(side_effect=RuntimeError("Session is closed"))
+        status = MagicMock()
+        status.set_error = AsyncMock(side_effect=RuntimeError("Session is closed"))
+
+        result = await run_claude_in_thread(thread, runner, repo, "hello", None, status=status)
+
+        assert result is None
+        # The lamp was still attempted although the embed could not be sent.
+        status.set_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_without_a_repo_the_turn_runs_and_saves_nothing(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        runner.run = make_async_gen(simple_events("sess-1"))
+
+        result = await run_claude_in_thread(thread, runner, None, "hello", None)
+
+        assert result == "sess-1"
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_is_reported_as_a_timeout(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        runner.run = make_async_gen([_result(error="Timed out after 300 seconds")])
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        [embed] = _embeds_sent(thread)
+        assert embed.to_dict() == ui_embeds.timeout_embed(300).to_dict()
+
+    @pytest.mark.asyncio
+    async def test_any_other_error_is_reported_with_its_own_text(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        runner.run = make_async_gen([_result(error="Process exited with code 1")])
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        [embed] = _embeds_sent(thread)
+        assert embed.to_dict() == ui_embeds.error_embed("Process exited with code 1").to_dict()
+
+    @pytest.mark.asyncio
+    async def test_the_session_is_announced_once_however_often_it_is_reported(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        runner.run = make_async_gen(
+            [
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+                _result(),
+            ]
+        )
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        started = [e for e in _embeds_sent(thread) if "session started" in (e.title or "")]
+        assert len(started) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_error_is_handed_back_on_the_outcome(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """#621: a scheduled or webhook turn has nobody reading the thread."""
+        from c_lord.cogs.run_config import RunConfig
+
+        runner.run = make_async_gen([_result(error="Process exited with code 1")])
+        config = RunConfig(thread=thread, runner=runner, prompt="hello")
+
+        await run_claude_with_config(config)
+
+        assert config.outcome.error == "Process exited with code 1"
+
+    @pytest.mark.asyncio
+    async def test_a_crash_is_handed_back_on_the_outcome_too(self, thread: MagicMock) -> None:
+        from c_lord.cogs.run_config import RunConfig
+
+        runner = MagicMock()
+
+        async def exploding(*args, **kwargs):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        runner.run = exploding
+        config = RunConfig(thread=thread, runner=runner, prompt="hello")
+
+        await run_claude_with_config(config)
+
+        assert config.outcome.error == "An unexpected error occurred."
+
+    @pytest.mark.asyncio
+    async def test_the_prompt_hooks_are_handed_to_the_runner(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        """#1262: only the runner knows the moment the prompt is really in the pane."""
+        from c_lord.cogs.run_config import RunConfig
+
+        runner.run = make_async_gen(simple_events())
+        sent, started = AsyncMock(), MagicMock()
+        config = RunConfig(
+            thread=thread, runner=runner, prompt="hello", on_prompt_sent=sent,
+            on_send_started=started,
+        )  # fmt: skip
+
+        await run_claude_with_config(config)
+
+        assert runner.on_prompt_sent is sent
+        assert runner.on_send_started is started
+
+
+class TestTurnClosing:
+    """After the stream ends: the footer, and what must *not* follow a turn that did not finish."""
+
+    @pytest.fixture
+    def footer(self, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        from c_lord.cogs import _run_helper
+
+        mock = AsyncMock()
+        monkeypatch.setattr(_run_helper, "_post_context_usage", mock)
+        return mock
+
+    @pytest.mark.asyncio
+    async def test_a_finished_turn_gets_its_footer(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock, footer: AsyncMock
+    ) -> None:
+        runner.preempted = False
+        runner.run = make_async_gen(simple_events("sess-9"))
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        footer.assert_awaited_once()
+        assert footer.call_args.args[1] == "sess-9"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_turn_gets_no_footer(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock, footer: AsyncMock
+    ) -> None:
+        runner.preempted = False
+        runner.run = make_async_gen([_result(error="Process exited with code 1")])
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        footer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_turn_the_next_message_displaced_gets_no_footer(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock, footer: AsyncMock
+    ) -> None:
+        """#583: it would land on top of the message that replaced the turn."""
+        runner.preempted = True
+        runner.run = make_async_gen(simple_events())
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        footer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_processor_is_finalized_even_when_the_runner_raises(
+        self, thread: MagicMock, repo: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from c_lord.cogs import _run_helper
+
+        finalized: list[bool] = []
+
+        class Recording(_run_helper.EventProcessor):
+            async def finalize(self) -> None:
+                finalized.append(True)
+
+        monkeypatch.setattr(_run_helper, "EventProcessor", Recording)
+        runner = MagicMock()
+
+        async def exploding(*args, **kwargs):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        runner.run = exploding
+
+        await run_claude_in_thread(thread, runner, repo, "hello", None)
+
+        assert finalized == [True]
+
+
+class TestEnterExitLog:
+    """#293: every ``run_claude: enter`` gets its ``run_claude: exit`` — whatever happens.
+
+    ``exit`` is written in a ``finally``; an ``enter`` with no ``exit`` in the
+    log therefore means exactly one thing: the turn is still running.
+    """
+
+    async def _run(self, thread: MagicMock, runner: MagicMock, caplog) -> list[str]:
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            await run_claude_in_thread(thread, runner, None, "hello", None)
+        return _exit_lines(caplog)
+
+    @pytest.mark.asyncio
+    async def test_enter_comes_first_and_names_the_thread(
+        self, thread: MagicMock, runner: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        runner.preempted = False
+        runner.run = make_async_gen(simple_events())
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            await run_claude_in_thread(thread, runner, None, "hello", None)
+
+        messages = [r.getMessage() for r in caplog.records if "run_claude:" in r.getMessage()]
+        assert "run_claude: enter (prompt=5 chars)" in messages[0]
+        assert f"thread={thread.id}" in messages[0]
+        assert "run_claude: exit" in messages[-1]
+        assert f"thread={thread.id}" in messages[-1]
+
+    @pytest.mark.asyncio
+    async def test_a_clean_turn_exits_ok(
+        self, thread: MagicMock, runner: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        runner.preempted = False
+        runner.run = make_async_gen(simple_events())
+        [line] = await self._run(thread, runner, caplog)
+        assert "outcome=ok" in line
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_ended_in_an_error_exits_error(
+        self, thread: MagicMock, runner: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        runner.run = make_async_gen([_result(error="Process exited with code 1")])
+        [line] = await self._run(thread, runner, caplog)
+        assert "outcome=error" in line
+
+    @pytest.mark.asyncio
+    async def test_a_runner_that_raised_exits_error_too(
+        self, thread: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The exception was caught and reported, so the run itself did not crash."""
+        runner = MagicMock()
+
+        async def exploding(*args, **kwargs):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        runner.run = exploding
+        [line] = await self._run(thread, runner, caplog)
+        assert "outcome=error" in line
+
+    @pytest.mark.asyncio
+    async def test_a_turn_the_user_stopped_exits_stopped(
+        self, thread: MagicMock, runner: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#909: a stop is not a failure, and the log must not call it one."""
+        runner.run = make_async_gen([_result(error=STOPPED_BY_USER_ERROR)])
+        [line] = await self._run(thread, runner, caplog)
+        assert "outcome=stopped" in line
+
+    @pytest.mark.asyncio
+    async def test_a_turn_displaced_by_the_next_message_exits_preempted(
+        self, thread: MagicMock, runner: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        runner.preempted = True
+        runner.run = make_async_gen(simple_events())
+        [line] = await self._run(thread, runner, caplog)
+        assert "outcome=preempted" in line
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_turn_still_logs_its_exit(
+        self, thread: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The case ``finally`` exists for: a cancel used to skip the exit line."""
+        entered = asyncio.Event()
+        runner = MagicMock()
+        runner.stopped = False
+        runner.preempted = False
+
+        async def never_ends(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+            yield  # pragma: no cover
+
+        runner.run = never_ends
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
+            task = asyncio.create_task(run_claude_in_thread(thread, runner, None, "hello", None))
+            await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        [line] = _exit_lines(caplog)
+        assert "outcome=cancelled" in line
+
+    @pytest.mark.asyncio
+    async def test_an_exception_outside_the_runner_exits_crashed_and_propagates(
+        self,
+        thread: MagicMock,
+        runner: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from c_lord.cogs import _run_helper
+
+        async def broken_turn(_config, _ctx):
+            raise RuntimeError("bug in the turn body")
+
+        monkeypatch.setattr(_run_helper, "_run_turn", broken_turn)
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER), pytest.raises(RuntimeError):
+            await run_claude_in_thread(thread, runner, None, "hello", None)
+
+        [line] = _exit_lines(caplog)
+        assert "outcome=crashed" in line
+
+    @pytest.mark.asyncio
+    async def test_the_exit_line_says_how_long_the_turn_ran(
+        self, thread: MagicMock, runner: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import re
+
+        runner.preempted = False
+        runner.run = make_async_gen(simple_events())
+        [line] = await self._run(thread, runner, caplog)
+        assert re.search(r"exit \(outcome=ok, \d+\.\ds\)", line), line
+
+    @pytest.mark.asyncio
+    async def test_a_run_is_in_flight_only_between_enter_and_exit(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        from c_lord.cogs import _run_helper
+
+        seen_during: list[list[asyncio.Task]] = []
+
+        async def run(*args, **kwargs):
+            seen_during.append(_run_helper.in_flight_tasks(thread.id))
+            yield _result()
+
+        runner.preempted = False
+        runner.run = run
+
+        task = asyncio.create_task(run_claude_in_thread(thread, runner, None, "hello", None))
+        await task
+
+        assert seen_during == [[task]]
+        assert _run_helper.in_flight_tasks(thread.id) == []
+        assert _run_helper.has_other_run_in_flight(thread.id) is False
+
+
 class TestNoSkillFallbackNotice:
     """#712: the skill-push path is gone, so the "Claude never called
     discord-reply" notice (#67) must never appear — under the JSONL mirror the
     tracker it consulted was always empty, so it would fire on every turn."""
-# <<REDACTED 4 lines>>
+
+    @pytest.fixture
+    def thread(self) -> MagicMock:
+        t = MagicMock(spec=discord.Thread)
         t.id = 67670001
-        # <<REDACTED 5 lines>>
+        t.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        return t
+
+    @pytest.fixture
+    def runner(self) -> MagicMock:
         return MagicMock()
-# <<REDACTED 7 lines>>
+
+    @pytest.fixture
+    def repo(self) -> MagicMock:
+        r = MagicMock()
+        r.save = AsyncMock()
+        return r
+
     def _make_async_gen(self, events):
-        # <<REDACTED 6 lines>>
+        async def gen(*args, **kwargs):
+            for event in events:
+                yield event
+
+        return gen
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("legacy_env", [{}, {"CLORD_BRIDGE_MODE": "skill"}])
     async def test_no_fallback_notice_on_a_normal_turn(
@@ -341,9 +840,16 @@ class TestNoSkillFallbackNotice:
         for key, value in legacy_env.items():
             monkeypatch.setenv(key, value)
 
-        # <<REDACTED 5 lines>>
+        events = [
+            StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
+            StreamEvent(
+                message_type=MessageType.RESULT,
+                is_complete=True,
                 session_id="sess-1",
-            # <<REDACTED 4 lines>>
+            ),
+        ]
+        runner.run = self._make_async_gen(events)
+
         await run_claude_in_thread(thread, runner, repo, "hello", None)
 
         for call in thread.send.call_args_list:
@@ -361,11 +867,27 @@ class TestRecoverMissedPaneAsk:
     never bridged to Discord buttons (the user sees no choices).  Before posting
     the #67 'no discord-reply' fallback, run_claude_with_config must re-check the
     pane and bridge an open menu instead of posting the misleading notice."""
-# <<REDACTED 4 lines>>
+
+    @pytest.fixture
+    def thread(self) -> MagicMock:
+        t = MagicMock(spec=discord.Thread)
         t.id = 219219219
-        # <<REDACTED 9 lines>>
+        t.send = AsyncMock(return_value=MagicMock(spec=discord.Message))
+        return t
+
+    @pytest.fixture
+    def repo(self) -> MagicMock:
+        r = MagicMock()
+        r.save = AsyncMock()
+        return r
+
     def _make_async_gen(self, events):
-        # <<REDACTED 6 lines>>
+        async def gen(*args, **kwargs):
+            for event in events:
+                yield event
+
+        return gen
+
     @pytest.mark.asyncio
     async def test_open_menu_is_bridged_and_no_fallback(
         self, thread: MagicMock, repo: MagicMock
@@ -382,7 +904,7 @@ class TestRecoverMissedPaneAsk:
         runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
-                # <<REDACTED 1 lines>>
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
                 StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
             ]
         )
@@ -429,7 +951,7 @@ class TestRecoverMissedPaneAsk:
         runner.stopped = False  # a live (non-pre-empted) run still re-bridges post-turn (#315)
         runner.run = self._make_async_gen(
             [
-                # <<REDACTED 1 lines>>
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
                 StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
             ]
         )
@@ -505,7 +1027,7 @@ class TestRecoverMissedPaneAsk:
         runner.stopped = True  # deliberately pre-empted by a follow-up message
         runner.run = self._make_async_gen(
             [
-                # <<REDACTED 1 lines>>
+                StreamEvent(message_type=MessageType.SYSTEM, session_id="sess-1"),
                 StreamEvent(message_type=MessageType.RESULT, is_complete=True, session_id="sess-1"),
             ]
         )
@@ -524,42 +1046,223 @@ class TestRecoverMissedPaneAsk:
         runner.peek_pending_ask.assert_not_called()
 
 
-# <<REDACTED 67 lines>>
+class TestMakeErrorEmbed:
+    """``_make_error_embed`` picks the embed that fits what went wrong."""
+
+    def test_the_runners_timeout_message_becomes_the_timeout_embed(self) -> None:
+        embed = _make_error_embed("Timed out after 300 seconds")
+        assert embed.to_dict() == ui_embeds.timeout_embed(300).to_dict()
+
+    def test_the_timeout_embed_names_the_seconds_from_the_message(self) -> None:
+        embed = _make_error_embed("Timed out after 1800 seconds")
+        assert "1800" in (embed.description or "")
+        assert "300" not in (embed.description or "")
+
+    def test_text_after_the_timeout_message_does_not_matter(self) -> None:
+        embed = _make_error_embed("Timed out after 45 seconds while waiting for the pane")
+        assert embed.to_dict() == ui_embeds.timeout_embed(45).to_dict()
+
+    def test_any_other_error_keeps_its_own_text(self) -> None:
+        embed = _make_error_embed("Process exited with code 1")
+        assert embed.to_dict() == ui_embeds.error_embed("Process exited with code 1").to_dict()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "Timed out",
+            "Timed out after many seconds",
+            "Request Timed out after 30 seconds",
+            "timed out after 30 seconds",
+        ],
+        ids=["no-seconds", "seconds-not-a-number", "not-at-the-start", "lower-case"],
+    )
+    def test_only_the_runners_exact_timeout_wording_counts(self, error: str) -> None:
+        """A message that merely talks about timing out is an ordinary error."""
+        assert _make_error_embed(error).to_dict() == ui_embeds.error_embed(error).to_dict()
+
+    @pytest.mark.parametrize(
+        ("prefix_name", "builder_name"),
+        [
+            ("FLEET_TMUX_RESTART_ERROR_PREFIX", "fleet_tmux_restart_embed"),
+            ("TRUST_STUCK_ERROR_PREFIX", "trust_stuck_embed"),
+            ("TRUST_START_FAILED_ERROR_PREFIX", "trust_start_failed_embed"),
+            ("CLAUDE_VANISHED_ERROR_PREFIX", "claude_vanished_embed"),
+            ("LOGIN_REQUIRED_ERROR_PREFIX", "login_required_embed"),
+            ("MODEL_UNAVAILABLE_ERROR_PREFIX", "model_unavailable_embed"),
+            ("NO_RESPONSE_ERROR_PREFIX", "no_response_embed"),
+        ],
+    )
+    def test_a_known_cause_gets_the_embed_written_for_it(
+        self, prefix_name: str, builder_name: str
+    ) -> None:
+        """Each of these has advice the generic ❌ would get wrong."""
+        from c_lord.claude import tmux_runner
+
+        error = f"{getattr(tmux_runner, prefix_name)} some detail"
+        expected = getattr(ui_embeds, builder_name)(error)
+        assert _make_error_embed(error).to_dict() == expected.to_dict()
+        assert expected.to_dict() != ui_embeds.error_embed(error).to_dict()
+
+    def test_an_api_error_shows_the_detail_and_what_to_do_about_it(self) -> None:
+        from c_lord.api_error import API_ERROR_PREFIX, advice_for_error
+
+        error = f"{API_ERROR_PREFIX} 529 Overloaded"
+        expected = ui_embeds.api_error_embed("529 Overloaded", advice_for_error(error))
+        assert _make_error_embed(error).to_dict() == expected.to_dict()
+
+    def test_a_usage_limit_wins_over_whatever_the_text_says(self) -> None:
+        """#631: the limit is the one cause that is known for certain."""
+        from c_lord.claude.types import UsageLimit
+
+        limit = UsageLimit("weekly limit", "Aug 29, 4pm (Asia/Tokyo)", "")
+        embed = _make_error_embed("Timed out after 300 seconds", usage_limit=limit)
+        assert embed.to_dict() == ui_embeds.usage_limit_embed(limit).to_dict()
+
+
+class TestConcurrencyIntegration:
+    """The session registry: a run is listed while it runs, and Claude is told nothing.
+
+    The registry used to feed a "these other sessions are running" notice into
+    the prompt. The tmux TUI has no per-turn system prompt, so it never arrived
+    (#758) and is no longer built (#766) — what is left is the bookkeeping that
+    ``/workspace-cleanup`` reads.
+    """
+
+    @pytest.fixture
+    def runner(self) -> MagicMock:
+        r = MagicMock()
+        r.working_dir = "/srv/checkout"
+        r.preempted = False
+        r.run = make_async_gen(simple_events())
+        return r
+
+    @staticmethod
+    def _recording_run(runner: MagicMock) -> list[tuple[tuple, dict]]:
+        """Make *runner* record how ``run`` is called; return the record."""
+        calls: list[tuple[tuple, dict]] = []
+
+        async def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            for event in simple_events():
+                yield event
+
+        runner.run = run
+        return calls
+
+    @pytest.mark.asyncio
     async def test_concurrency_notice_not_injected_into_prompt(
-        # <<REDACTED 2 lines>>
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
         """When registry is provided, the session is registered but the concurrency
         notice is NOT injected into the CLI (tmux TUI mode doesn't support
         --append-system-prompt). The user prompt must be passed unchanged.
-        # <<REDACTED 13 lines>>
+        """
+        registry = SessionRegistry()
+        calls = self._recording_run(runner)
+
+        await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
+
         # Prompt is unchanged — no concurrency notice injected.
-        # <<REDACTED 3 lines>>
+        assert calls == [(("fix the bug",), {"session_id": None})]
         # clone() is NOT called — tmux TUI mode doesn't support --append-system-prompt.
-        # <<REDACTED 55 lines>>
+        runner.clone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_session_is_listed_while_its_turn_runs(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        registry = SessionRegistry()
+        listed_during: list = []
+
+        async def run(*args, **kwargs):
+            listed_during.extend(registry.list_active())
+            for event in simple_events():
+                yield event
+
+        runner.run = run
+
+        await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
+
+        [session] = listed_during
+        assert session.thread_id == thread.id
+        assert session.description == "fix the bug"
+        assert session.working_dir == "/srv/checkout"
+
+    @pytest.mark.asyncio
+    async def test_a_long_prompt_is_listed_by_its_first_100_characters(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        registry = MagicMock(spec=SessionRegistry)
+
+        await run_claude_in_thread(thread, runner, repo, "p" * 250, None, registry=registry)
+
+        registry.register.assert_called_once_with(thread.id, "p" * 100, "/srv/checkout")
+
+    @pytest.mark.asyncio
+    async def test_the_session_is_delisted_when_its_turn_ends(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        registry = SessionRegistry()
+
+        await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
+
+        assert registry.list_active() == []
+
+    @pytest.mark.asyncio
+    async def test_the_session_is_delisted_when_the_runner_raises(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        """Or ``/workspace-cleanup`` would skip that workspace as "running" forever."""
+        registry = SessionRegistry()
+
+        async def exploding(*args, **kwargs):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        runner.run = exploding
+
+        await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
+
+        assert registry.list_active() == []
+
+    @pytest.mark.asyncio
     async def test_other_sessions_registered_but_not_injected(
-        # <<REDACTED 2 lines>>
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
         """When other sessions exist, the registry side effect still happens
         but the concurrency notice is NOT injected into the CLI.
         """
-        # <<REDACTED 14 lines>>
+        registry = SessionRegistry()
+        registry.register(99999, "refactoring the auth module", "/srv/other")
+        calls = self._recording_run(runner)
+
+        await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
+
         # User prompt is unchanged — no concurrency notice injected.
-        # <<REDACTED 3 lines>>
+        assert calls == [(("fix the bug",), {"session_id": None})]
+        assert "refactoring" not in str(calls)
         # clone() is NOT called — tmux TUI mode doesn't support --append-system-prompt.
-        # <<REDACTED 2 lines>>
+        runner.clone.assert_not_called()
+        # The other session is nobody's to remove but its own run's.
+        assert [s.thread_id for s in registry.list_active()] == [99999]
+
     @pytest.mark.asyncio
     async def test_lounge_repo_is_not_read_per_turn(
-        # <<REDACTED 2 lines>>
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
         """#766: the lounge text went nowhere, so a turn no longer reads the lounge DB.
 
         ``lounge_repo`` is still accepted (backward compatible) but ignored.
         """
         lounge_repo = MagicMock()
         lounge_repo.get_recent = AsyncMock(return_value=[])
-        # <<REDACTED 2 lines>>
+
         await run_claude_in_thread(
             thread, runner, repo, "fix the bug", None, lounge_repo=lounge_repo
         )
 
         lounge_repo.get_recent.assert_not_called()
+        assert lounge_repo.mock_calls == []
 
     @pytest.mark.asyncio
     async def test_no_concurrency_notice_built_log(
@@ -570,12 +1273,24 @@ class TestRecoverMissedPaneAsk:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """#766: the log must not say a notice was "built" — nothing is built any more."""
-        # <<REDACTED 3 lines>>
+        registry = SessionRegistry()
+        registry.register(99999, "refactoring the auth module", "/srv/other")
+
         with caplog.at_level("DEBUG"):
-            # <<REDACTED 2 lines>>
+            await run_claude_in_thread(thread, runner, repo, "fix the bug", None, registry=registry)
         assert "Concurrency notice built" not in caplog.text
 
-    # <<REDACTED 22 lines>>
+    @pytest.mark.asyncio
+    async def test_without_a_registry_the_turn_runs_just_the_same(
+        self, thread: MagicMock, runner: MagicMock, repo: MagicMock
+    ) -> None:
+        calls = self._recording_run(runner)
+
+        result = await run_claude_in_thread(thread, runner, repo, "fix the bug", None)
+
+        assert result == "sess-1"
+        assert calls == [(("fix the bug",), {"session_id": None})]
+        runner.clone.assert_not_called()
 
 
 class TestFooterCliVersion:

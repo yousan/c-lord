@@ -9,7 +9,11 @@ Two holes, both closed here:
 * **Stale rows were only pruned on a state change.** ``_prune_stale`` ran inside
   ``_refresh_dashboard``, which only a state change called — so a quiet day
   left 47-hour-old rows on the board reading "0s ago".
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 

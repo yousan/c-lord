@@ -14,7 +14,11 @@
 * 要約後も ``W<番号> │`` / ``<session>:W<番号> │`` / ``#<番号>`` / ``[停止]`` /
   ``→#<番号>`` の装飾は保たれる (#618, #593, #512)
 * ``auto_topic_locked`` (#95) は自動経路を止めるだけ — コマンドは効く
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -63,12 +67,12 @@ class TestNamingPassDoesNotSummarizeByDefault:
         record.tmux_window_id = "@1"
         record.issue_ref = None
         record.origin_issue_ref = None
-        # <<REDACTED 1 lines>>
+        cog.repo.get = AsyncMock(return_value=record)
         cog.repo.set_topic = AsyncMock()
         cog.repo.set_tmux_window_id = AsyncMock()
         cog.repo.set_issue_ref = AsyncMock()
 
-        # <<REDACTED 1 lines>>
+        thread = MagicMock(spec=discord.Thread)
         thread.id = 55555
         thread.name = thread_name
         thread.edit = AsyncMock()

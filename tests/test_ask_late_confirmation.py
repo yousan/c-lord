@@ -20,7 +20,11 @@ arrive, and correcting the menu. These tests pin that:
 * a result that lands later turns the menu ✅ (or ⚠️ for "no answer");
 * ``ask answer outcome=unknown`` is logged only when the answer really could not
   be confirmed.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
 from pathlib import Path

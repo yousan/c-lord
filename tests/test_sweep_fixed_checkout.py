@@ -8,7 +8,11 @@
 固定 checkout は利用者が用意したもので、c-lord が作ったものではない (#687)。
 消してよいのは ``<base>/<channel_id>/<thread_id>`` — c-lord がそのスレッドのために
 clone したディレクトリだけ。
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import logging
 import subprocess
 from pathlib import Path
 

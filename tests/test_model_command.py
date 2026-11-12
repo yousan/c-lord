@@ -1,14 +1,23 @@
 """``/model`` and its text twins on SessionManageCog (#164, #478, #918).
-# <<REDACTED 1 lines>>
+
 ``/model`` is one command: no arguments displays, arguments change one scope
 (session / channel / global).  The old ``/model show`` and ``/model set``
 subcommands are gone (a Discord command cannot be both a group and a command);
 ``!model-show`` and ``!model-set`` stay as the text-twin spellings.
-# <<REDACTED 8 lines>>
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
 from discord import app_commands
-# <<REDACTED 1 lines>>
+
 from c_lord.cogs.session_manage import (
-    # <<REDACTED 3 lines>>
+    SETTING_CLAUDE_MODEL,
+    SessionManageCog,
+)
 from c_lord.database.models import init_db
 from c_lord.database.settings_repo import SettingsRepository
 from c_lord.discord_ui.authorization import Authorizer
@@ -22,99 +31,137 @@ def _member() -> MagicMock:
     member.bot = False
     member.roles = []
     return member
-# <<REDACTED 2 lines>>
+
+
+def _slash(channel: MagicMock) -> MagicMock:
+    """A slash interaction in *channel* whose first reply can be read back with ``_text``."""
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = channel
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
+    return interaction
+
+
 def _make_thread_interaction(thread_id: int = 12345, parent_id: int = 999) -> MagicMock:
-    # <<REDACTED 3 lines>>
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
     thread.parent_id = parent_id
-    # <<REDACTED 1 lines>>
+    interaction = _slash(thread)
     interaction.user = _member()
-    # <<REDACTED 2 lines>>
     interaction.response.is_done = MagicMock(return_value=False)
-    # <<REDACTED 3 lines>>
+    return interaction
+
+
 def _make_channel_interaction(channel_id: int = 999) -> MagicMock:
-    # <<REDACTED 1 lines>>
+    interaction = _slash(MagicMock())
     channel = MagicMock(spec=discord.TextChannel)
     channel.id = channel_id
     interaction.channel = channel
     interaction.user = _member()
-    # <<REDACTED 2 lines>>
     interaction.response.is_done = MagicMock(return_value=False)
-    # <<REDACTED 3 lines>>
+    return interaction
+
+
 @pytest.fixture
 async def cog(tmp_path) -> SessionManageCog:
     db = str(tmp_path / "s.db")
     await init_db(db)
-    # <<REDACTED 4 lines>>
+    # The startup configuration every layer falls back to.
+    runner = MagicMock()
     runner.model = "sonnet"
     runner.effort = None
     runner.model_source = "組み込み既定"
     runner.effort_source = "未設定"
-    # <<REDACTED 3 lines>>
+    return SessionManageCog(
+        bot=MagicMock(),
+        repo=MagicMock(),
         settings_repo=SettingsRepository(db),
-        # <<REDACTED 1 lines>>
+        runner=runner,
         authorizer=Authorizer(allowed_user_ids={OWNER}),
-    # <<REDACTED 3 lines>>
+    )
+
+
 def _text(interaction: MagicMock) -> str:
     args, kwargs = interaction.response.send_message.call_args
     return args[0] if args else kwargs.get("content", "")
 
 
-# <<REDACTED 1 lines>>
+class TestShowingTheModel:
+    """``/model`` with no arguments only reads."""
+
     async def test_bare_model_displays_the_layers(self, cog):
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction)
         text = _text(interaction)
         assert "sonnet" in text and "グローバル" in text and "新規に適用" in text
         assert "組み込み既定" not in text or "出所" in text  # source is named, not faked
-# <<REDACTED 1 lines>>
+
     async def test_global_override_is_shown(self, cog):
         await cog.settings_repo.set(SETTING_CLAUDE_MODEL, "opus")
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction)
         assert "新規に適用 → opus" in _text(interaction)
-# <<REDACTED 1 lines>>
+
     async def test_display_changes_nothing(self, cog):
         interaction = _make_thread_interaction()
         await cog.model_command.callback(cog, interaction)
         assert await cog.settings_repo.get_all() == {}
-# <<REDACTED 1 lines>>
+
     async def test_show_without_settings_repo_degrades(self):
-        # <<REDACTED 6 lines>>
+        """Without a settings store there is nothing to read: say so privately, don't crash."""
+        cog = SessionManageCog(
+            bot=MagicMock(),
+            repo=MagicMock(),
+            authorizer=Authorizer(allowed_user_ids={OWNER}),
+        )
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction)
-        # <<REDACTED 4 lines>>
+        interaction.response.send_message.assert_awaited_once()
+        assert _text(interaction).startswith("❌")
+        assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
+
+
+class TestChangingTheGlobalModel:
+    """``/model <name> scope:global`` — what is accepted, and where it is stored."""
+
     async def test_global_scope_stores_in_the_legacy_key(self, cog):
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction, model="opus", scope="global")
         assert await cog.settings_repo.get(SETTING_CLAUDE_MODEL) == "opus"
         assert "opus" in _text(interaction)
-# <<REDACTED 1 lines>>
+
     async def test_freeform_model_id_accepted(self, cog):
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction, model="claude-fable-5", scope="global")
         assert await cog.settings_repo.get(SETTING_CLAUDE_MODEL) == "claude-fable-5"
-# <<REDACTED 1 lines>>
+
     @pytest.mark.parametrize("bad", ["bad model", "-flag", "a;b", "a$(x)", "a/b", "x" * 65])
     async def test_unsafe_model_strings_are_rejected(self, cog, bad):
         """Model strings reach a tmux/shell context via ``--model {model}`` (#478)."""
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction, model=bad, scope="global")
         assert await cog.settings_repo.get(SETTING_CLAUDE_MODEL) is None
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
-# <<REDACTED 1 lines>>
+
     async def test_without_settings_repo_replies_with_an_error(self):
-        # <<REDACTED 3 lines>>
+        bot = MagicMock()
+        runner = MagicMock()
+        runner.model = "sonnet"
         cog = SessionManageCog(
             bot=bot,
             repo=MagicMock(),
             runner=runner,
             authorizer=Authorizer(allowed_user_ids={OWNER}),
         )
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction, model="opus")
         assert interaction.response.send_message.call_args.kwargs.get("ephemeral") is True
-# <<REDACTED 2 lines>>
+
+    @pytest.mark.parametrize("model", ["haiku", "sonnet", "opus"])
     async def test_all_aliases_accepted(self, cog, model):
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         await cog.model_command.callback(cog, interaction, model=model, scope="global")
         assert await cog.settings_repo.get(SETTING_CLAUDE_MODEL) == model
 
@@ -177,7 +224,7 @@ class TestPermissionBoundary:
     """Reading is open; every change goes through the allowlist (#781)."""
 
     async def _stranger(self, cog) -> MagicMock:
-        # <<REDACTED 1 lines>>
+        interaction = _make_channel_interaction()
         stranger = MagicMock(spec=discord.Member)
         stranger.id = 12345
         stranger.bot = False

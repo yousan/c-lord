@@ -1,5 +1,12 @@
 """Tests for SessionDirManager and related helpers."""
-# <<REDACTED 8 lines>>
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 from c_lord.session_dir import (
     SessionDirInfo,
     SessionDirManager,
@@ -38,7 +45,7 @@ class TestSessionDirInfo:
             commit="aaa",
             is_clean=True,
         )
-        # <<REDACTED 1 lines>>
+        with pytest.raises(dataclasses.FrozenInstanceError):
             info.path = "/other"  # type: ignore[misc]
 
 
@@ -67,14 +74,50 @@ class TestIsLocalRepo:
 
 class TestIsClean:
     def test_clean_directory(self) -> None:
-        # <<REDACTED 3 lines>>
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
         with patch("c_lord.session_dir._run", return_value=mock_result):
             assert _is_clean("/some/path") is True
 
     def test_dirty_directory(self) -> None:
-        # <<REDACTED 3 lines>>
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = " M tracked.py\0"
         with patch("c_lord.session_dir._run", return_value=mock_result):
-            # <<REDACTED 6 lines>>
+            assert _is_clean("/some/path") is False
+
+    @staticmethod
+    def _git_reporting(status_output: str):
+        """A ``_run`` whose ``git status`` prints *status_output*; other git calls are silent."""
+
+        def run(cmd: list[str], **_kwargs: object) -> MagicMock:
+            is_status = cmd[:2] == ["git", "status"]
+            return MagicMock(returncode=0, stdout=status_output if is_status else "", stderr="")
+
+        return run
+
+    def test_entries_are_read_one_by_one_between_nul_bytes(self) -> None:
+        """``git status -z`` ends each entry with NUL, not a newline.
+
+        The user's change sits behind a file c-lord saved itself here: read as
+        a single entry, the pair would pass for c-lord's write and the
+        directory — with someone's work in it — would count as clean.
+        """
+        output = "?? .clord/attachments/shot.png\0 M tracked.py\0"
+        with patch("c_lord.session_dir._run", side_effect=self._git_reporting(output)):
+            assert _is_clean("/some/path") is False
+
+    def test_only_c_lords_own_file_is_still_clean(self) -> None:
+        """The other half of the pair above: that first entry alone is not work."""
+        output = "?? .claude/skills/discord-read/SKILL.md\0"
+        with patch("c_lord.session_dir._run", side_effect=self._git_reporting(output)):
+            assert _is_clean("/some/path") is True
+
+    def test_a_failing_git_status_is_never_clean(self) -> None:
+        mock_result = MagicMock()
+        mock_result.returncode = 128
+        mock_result.stdout = ""
         with patch("c_lord.session_dir._run", return_value=mock_result):
             assert _is_clean("/some/path") is False
 
@@ -268,7 +311,9 @@ class TestCleanupForThread:
         with patch("c_lord.session_dir.worktree_status", return_value=WorktreeStatus(is_repo=True)):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             result = mgr.cleanup_for_thread(999)
-# <<REDACTED 3 lines>>
+
+        assert result.removed is True
+        assert result.thread_id == 999
         assert not session.exists()
 
     def test_skips_dirty_directory(self, tmp_path: Path) -> None:
@@ -291,11 +336,18 @@ class TestCleanupForThread:
     def test_noop_when_dir_missing(self, tmp_path: Path) -> None:
         mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
         result = mgr.cleanup_for_thread(42)
-        # <<REDACTED 3 lines>>
+        assert result.removed is False
+        assert result.kept_work is False
+        assert "does not exist" in result.reason
+
 
 # ---------------------------------------------------------------------------
 # SessionDirManager.cleanup_orphaned
-# <<REDACTED 5 lines>>
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupOrphaned:
+    def test_a_running_threads_directory_is_left_alone(self, tmp_path: Path) -> None:
         session = tmp_path / "555"
         session.mkdir()
         (session / ".git").mkdir()
@@ -306,7 +358,11 @@ class TestCleanupForThread:
         ):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             results = mgr.cleanup_orphaned(active_thread_ids={555})
-# <<REDACTED 5 lines>>
+
+        assert [(r.thread_id, r.removed) for r in results] == [(555, False)]
+        assert "active" in results[0].reason
+        assert session.exists()
+
     def test_removes_orphaned_clean_directory(self, tmp_path: Path) -> None:
         session = tmp_path / "777"
         session.mkdir()
@@ -318,4 +374,6 @@ class TestCleanupForThread:
         ):
             mgr = SessionDirManager(base_dir=str(tmp_path), source_repo="/repo")
             results = mgr.cleanup_orphaned(active_thread_ids=set())
-# <<REDACTED 3 lines>>
+
+        assert [(r.thread_id, r.removed) for r in results] == [(777, True)]
+        assert not session.exists()

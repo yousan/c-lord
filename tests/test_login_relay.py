@@ -3,7 +3,11 @@
 ``docs/specs/login-alert.md`` (「DM からログインし直す」) is the "should" here.
 The fixtures under ``tests/fixtures/login/`` are real ``claude auth login``
 captures (CLI 2.1.319) with the one-time values replaced.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 

@@ -15,7 +15,11 @@ from __future__ import annotations
 import logging
 import socket
 from pathlib import Path
-# <<REDACTED 5 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from aiohttp.test_utils import TestClient, TestServer
+
 from c_lord.legacy_env import warn_removed_delivery_env
 from c_lord.main import build_api_server, start_api_server
 
@@ -25,7 +29,17 @@ def _clean_delivery_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start every test from the zero-config state (nothing set)."""
     for key in ("CLORD_BRIDGE_MODE", "USE_SKILL_REPLY", "CLORD_API_PORT", "CLORD_API_HOST"):
         monkeypatch.delenv(key, raising=False)
-# <<REDACTED 11 lines>>
+
+
+@pytest.fixture
+def bot() -> MagicMock:
+    """The bot the control plane acts through; it knows no cogs and no channels yet."""
+    double = MagicMock()
+    double.cogs = {}
+    double.get_channel = MagicMock(return_value=None)
+    return double
+
+
 class TestSkillBridgeIsGone:
     """AC1 / AC2 — the skill-push path is not reachable by any means."""
 
@@ -191,10 +205,17 @@ class TestControlPlaneEndpoints:
         cog = MagicMock()
         cog.spawn_session = AsyncMock(return_value=thread)
         bot.cogs = {"ClaudeChatCog": cog}
-        # <<REDACTED 8 lines>>
+        # /api/spawn only opens threads under a real text channel.
+        bot.get_channel = MagicMock(return_value=MagicMock(spec=discord.TextChannel))
+
+        async with TestClient(TestServer(api.app)) as http:
+            yield http
+
     @pytest.mark.asyncio
     async def test_health(self, client: TestClient) -> None:
-        # <<REDACTED 2 lines>>
+        resp = await client.get("/api/health")
+        assert resp.status == 200
+        assert (await resp.json())["status"] == "ok"
 
     @pytest.mark.asyncio
     async def test_spawn(self, client: TestClient) -> None:

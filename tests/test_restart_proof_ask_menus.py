@@ -31,10 +31,15 @@ These tests pin the three halves of the fix:
 AC4 is pinned negatively throughout: recovery must **never post a menu**. Posting
 one is what #633 fixed (188 re-bridges, the same ❓ six times over three days),
 and the production bot restarts up to six times a day.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
-# <<REDACTED 2 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from c_lord.claude.types import FREE_TEXT_NOTES, AskOption, AskQuestion

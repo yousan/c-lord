@@ -12,7 +12,11 @@ after a bot restart, ping the author of the recorded trigger message
   exists (held until ``save`` makes the row). When that turn failed before its
   row existed, the held trigger was written onto the row the *next* turn made
   (another person's ``/skill``). It is now dropped when its own turn ends.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch

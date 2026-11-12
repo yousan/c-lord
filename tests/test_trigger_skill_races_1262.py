@@ -21,7 +21,10 @@ Real SQLite, real ``SkillCommandCog._run_skill_impl``, real
 ``ClaudeChatCog._run_claude``, real ``TranscriptMirrorCog``. The fake runs call
 ``RunConfig.on_prompt_sent`` where the real runner does: after the SYSTEM save,
 when the prompt is in the pane.
-# <<REDACTED 4 lines>>
+"""
+
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import sqlite3

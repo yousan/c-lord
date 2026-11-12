@@ -12,7 +12,10 @@ went wrong from there:
 
 The restored mirror now reads back where the transcript stands.
 """
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import asyncio
 import json
 import os
 from pathlib import Path

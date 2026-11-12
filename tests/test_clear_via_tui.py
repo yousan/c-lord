@@ -21,7 +21,9 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-# <<REDACTED 3 lines>>
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
 import pytest
 
 from c_lord.cogs import claude_chat as claude_chat_module
@@ -161,7 +163,8 @@ def _tmux(project_dir: Path, *, running: bool = True) -> MagicMock:
 
 
 def _thread(thread_id: int) -> MagicMock:
-    # <<REDACTED 2 lines>>
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = thread_id
     thread.parent_id = PARENT_ID
     thread.send = AsyncMock()
     return thread
@@ -347,7 +350,7 @@ class TestSlashClearAcksBeforeSlowWork:
         tmux_manager = _tmux(tmp_path, running=False)
         cog = _cog(tmux_manager)
         cog.wake_workspace = AsyncMock(return_value=True)
-        # <<REDACTED 1 lines>>
+        interaction = MagicMock(spec=discord.Interaction)
         interaction.channel = _thread(1)
         interaction.user = MagicMock()
         interaction.response = MagicMock()

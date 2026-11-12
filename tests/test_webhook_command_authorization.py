@@ -14,7 +14,10 @@ webhook-driven.
 from __future__ import annotations
 
 from typing import Any
-# <<REDACTED 4 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
 
 from c_lord.cogs.channel_repo import ChannelRepoCog
 from c_lord.cogs.skill_command import SkillCommandCog

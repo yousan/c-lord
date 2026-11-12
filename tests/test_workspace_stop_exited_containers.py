@@ -9,7 +9,8 @@ a failed cleanup.
 
 from __future__ import annotations
 
-# <<REDACTED 2 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from c_lord.cogs import session_manage as sm

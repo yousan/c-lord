@@ -91,7 +91,8 @@ def _cog(tmp_path: Path, *, tomb: SessionRecord | None, bound: bool = True):
     repo.get = AsyncMock(return_value=None)
     repo.get_swept = AsyncMock(return_value=tomb)
     repo.save = AsyncMock()
-    # <<REDACTED 2 lines>>
+    runner = MagicMock()
+    runner.working_dir = "/tmp/work"
     cog = ClaudeChatCog(bot=bot, repo=repo, runner=runner)
 
     sdm = MagicMock()

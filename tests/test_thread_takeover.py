@@ -102,10 +102,11 @@ def _make_cog(channel_cog, *, record=None, tmp_path=None):
     bot.user = MagicMock()
     bot.user.id = BOT_ID
     bot.get_cog = MagicMock(return_value=channel_cog)
-    # <<REDACTED 1 lines>>
+    repo = MagicMock()
     repo.get = AsyncMock(return_value=record)
     repo.save = AsyncMock()
-    # <<REDACTED 2 lines>>
+    runner = MagicMock()
+    runner.working_dir = "/tmp/work"
     # #713: this file is not about *who* may drive c-lord. The shipped
     # default is owner-only, resolved from Discord at on_ready — which a
     # unit test never reaches — so the gate is opened explicitly here and

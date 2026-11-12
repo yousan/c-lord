@@ -241,12 +241,12 @@ async def test_branch_switch_keeps_the_origin_in_the_rendered_name() -> None:
 
     cog = _make_cog()
     cog._thread_lamp = False
-    # <<REDACTED 1 lines>>
+    cog.repo.get = AsyncMock(return_value=record)
     cog.repo.set_topic = AsyncMock()
     cog.repo.set_tmux_window_id = AsyncMock()
     cog.repo.set_issue_ref = AsyncMock()
 
-    # <<REDACTED 1 lines>>
+    thread = MagicMock(spec=discord.Thread)
     thread.id = 55555
     thread.name = "W131 │ #540 メモリ"
     thread.edit = AsyncMock()

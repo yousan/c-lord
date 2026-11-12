@@ -16,7 +16,12 @@ needed, four seconds after replying, and one second before the new turn starts.
 
 So: a turn that ended because a new instruction displaced it has no completion
 ceremony.  The person is already here — there is nothing to summon them to.
-# <<REDACTED 6 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord

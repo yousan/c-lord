@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
-# <<REDACTED 4 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from c_lord.database.lounge_repo import LoungeRepository
@@ -24,6 +27,12 @@ from c_lord.database.task_repo import TaskRepository
 from c_lord.ext.api_server import ApiServer
 
 WRONG = [["x"], {"a": 1}, 1, True]
+
+
+@pytest.fixture(autouse=True)
+def _lounge_channel_not_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A leaked ``COORDINATION_CHANNEL_ID`` must not turn on lounge forwarding here."""
+    monkeypatch.delenv("COORDINATION_CHANNEL_ID", raising=False)
 
 
 class Env:

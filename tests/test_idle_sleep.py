@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import replace
-# <<REDACTED 2 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from c_lord.database.repository import SessionRecord

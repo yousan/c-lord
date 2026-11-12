@@ -8,7 +8,10 @@ memory — until a human spoke in the thread again. ``False`` is now treated lik
 the busy skip of #922 / #991: the next tick looks again. ``None`` is still
 "visited".
 """
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord

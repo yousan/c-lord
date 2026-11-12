@@ -13,7 +13,12 @@
 ただし ``node_modules/`` や ``.venv/`` のような**再生成できる**無視ディレクトリまで
 「作業」と数えると、スイープがほぼ効かなくなる（#749 の 118 GB の再来）。c-lord が
 自分で書いたファイル（#749/#779 の SKILL.md、#882 の履歴、#528 の添付）も同様に数えない。
-# <<REDACTED 6 lines>>
+"""
+
+from __future__ import annotations
+
+import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path

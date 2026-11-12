@@ -1,6 +1,9 @@
 """Tests for c_lord.skills — the ``discord-read`` skill (#259) and the scrub of
 the retired skill-push bundle (#712)."""
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+from pathlib import Path
 
 from c_lord.skills import (
     inject_read_skill,

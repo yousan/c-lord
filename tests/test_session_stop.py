@@ -1,5 +1,9 @@
 """Tests for c_lord/session_stop.py — the one stop path behind ⏹ / /stop / !stop (#878)."""
-# <<REDACTED 5 lines>>
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from c_lord.session_stop import (

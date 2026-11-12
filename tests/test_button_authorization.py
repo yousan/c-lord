@@ -14,7 +14,11 @@ These tests pin down:
   reject others with an ephemeral notice, and (since #713) treat a View with no
   authorizer as "no allowlist configured", i.e. owner-only rather than open.
 * Every real interactive View enforces the authorizer it is given.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import discord

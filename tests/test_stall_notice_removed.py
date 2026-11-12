@@ -7,17 +7,29 @@ The prose duplicated information the lamp already carries, dressed a normal
 situation (extended thinking / compaction) up as a warning, and could interrupt
 the conversation several times in one turn. Only the reaction survives.
 """
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import asyncio
 import inspect
 from pathlib import Path
-# <<REDACTED 4 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
 from c_lord.discord_ui.status import EMOJI_STALL_HARD, STALL_HARD_SECONDS, StatusManager
 
 _PACKAGE = Path(__file__).resolve().parent.parent / "c_lord"
 
 
 def _make_message() -> MagicMock:
-    # <<REDACTED 8 lines>>
+    """The trigger message the lamp is painted on; every reaction call succeeds."""
+    message = MagicMock()
+    message.add_reaction = AsyncMock()
+    message.remove_reaction = AsyncMock()
+    return message
+
+
 class TestNoStallProse:
     """AC1 / AC3 — the thread never gets the "No activity for 30s" line again."""
 
@@ -40,7 +52,8 @@ class TestHardStallStillLamps:
 
     @pytest.mark.asyncio
     async def test_thirty_seconds_of_silence_paints_the_warning_reaction(self) -> None:
-        # <<REDACTED 2 lines>>
+        msg = _make_message()
+        sm = StatusManager(msg)
         await sm.set_running()
         sm._last_activity = asyncio.get_running_loop().time() - STALL_HARD_SECONDS - 1
 

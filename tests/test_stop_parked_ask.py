@@ -6,7 +6,11 @@ click (or the pane) for up to ``ASK_ANSWER_TIMEOUT`` (24h) — after the window
 had been killed, a pane capture fails, which the bridge counts as "unknown,
 keep waiting". The run then logged ``run_claude: enter`` with no ``exit`` and
 the card stayed clickable in the archived thread.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

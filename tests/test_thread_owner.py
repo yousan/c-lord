@@ -10,7 +10,11 @@ very moment. These tests pin that the non-owning bot names the owner instead.
 
 from __future__ import annotations
 
-# <<REDACTED 5 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
 from c_lord.database.repository import SessionRecord
 from c_lord.session_resume import ThreadResume, stopped_hint
 from c_lord.thread_owner import foreign_owner_id, foreign_owner_notice
@@ -60,7 +64,8 @@ def _repo(record: SessionRecord | None = None) -> MagicMock:
 
 
 def _thread(owner_id: object = OTHER_CLORD) -> MagicMock:
-    # <<REDACTED 2 lines>>
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = 4242
     thread.parent_id = 999
     thread.owner_id = owner_id
     thread.name = "機能実装について"
@@ -284,10 +289,11 @@ class TestChatCommandsKeepOffOtherClordsThread:
     async def test_reattach(self) -> None:
         cog, _ = _chat_cog()
         cog._reattach_thread = AsyncMock()
-        # <<REDACTED 1 lines>>
+        interaction = MagicMock(spec=discord.Interaction)
         interaction.channel = _thread()
         interaction.user = MagicMock()
-        # <<REDACTED 2 lines>>
+        interaction.response = MagicMock()
+        interaction.response.send_message = AsyncMock()
         interaction.response.defer = AsyncMock()
 
         await cog.clord_reattach.callback(cog, interaction)

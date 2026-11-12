@@ -7,7 +7,11 @@ told "already owned" so it returns instead of posting a second copy.
 Before #535 ``register()`` silently overwrote the existing waiter, so the first
 bridge was left awaiting a queue nobody would ever post to — a 24h hang holding
 the thread — while two identical menus sat in Discord.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 
 import pytest
 

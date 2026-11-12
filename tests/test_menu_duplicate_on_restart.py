@@ -22,7 +22,11 @@ through — writes the menu down as it posts it, in the same ledger the watchdog
 reads. These tests pin that, and the two things it must not break: a question
 the user has *not* seen is still bridged, and a post that never reached Discord
 is still retried (#579).
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 

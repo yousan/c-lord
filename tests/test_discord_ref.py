@@ -8,7 +8,8 @@ never handled here — discord.py carries auth internally.
 
 from __future__ import annotations
 
-# <<REDACTED 2 lines>>
+from unittest.mock import AsyncMock, MagicMock
+
 from c_lord.discord_ref import enrich_discord_references
 
 GUILD = 111

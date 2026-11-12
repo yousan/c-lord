@@ -9,7 +9,11 @@ which is what the rescue picks too, so it takes the answer's place live.
 ``i1125_text_then_final_tool.jsonl`` is the staging-1 transcript of thread
 1514085380666691664 (2026-10-29 21:16Z, #1093 検証), unchanged but for the
 session ids.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import os
 from pathlib import Path

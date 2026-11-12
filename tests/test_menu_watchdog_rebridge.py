@@ -14,7 +14,11 @@ The three tests below pin the three halves of that: the ledger must survive a
 restart, a menu that was already bridged must not be posted again, and the
 prose carried as 経緯 must be the block that is actually contiguous with the
 menu — not one the transcript mirror already delivered.
-# <<REDACTED 5 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 

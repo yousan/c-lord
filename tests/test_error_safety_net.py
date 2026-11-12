@@ -6,7 +6,14 @@ showed "アプリが応答しませんでした", text commands failed silently,
 showed "インタラクションに失敗しました". These tests assert each path now logs AND
 replies to the user with a sanitized, actionable message.
 """
-# <<REDACTED 8 lines>>
+
+from __future__ import annotations
+
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
 from discord import app_commands
 from discord.ext import commands
 
