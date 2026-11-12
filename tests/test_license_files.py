@@ -8,11 +8,15 @@ package. These tests are what stops a later tidy-up from dropping either half.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 UPSTREAM_NOTICE = "Copyright (c) 2026 Masahiko Ebisuda"
 UPSTREAM_URL = "https://github.com/ebibibi/claude-code-discord-bridge"
+# sha256 of the permission notice as it stood in the code c-lord started from
+# (commit 88a05f73). Pinned here, so the check does not lean on LICENSE staying intact.
+UPSTREAM_PERMISSION_SHA256 = "21a2121221d2a35df2d8d333d00a61ed240446b6107092741ff996941acdc919"
 
 
 def _permission_text(mit_license: str) -> str:
@@ -31,8 +35,15 @@ def test_notice_keeps_the_upstream_copyright_and_the_whole_permission_notice() -
 
     assert UPSTREAM_NOTICE in notice
     assert UPSTREAM_URL in notice
-    # Same wording as the license c-lord itself ships under, start to finish.
-    assert _permission_text((ROOT / "LICENSE").read_text()) in notice
+    # The upstream notice sits at the end of NOTICE, word for word.
+    reproduced = _permission_text(notice[notice.index(UPSTREAM_NOTICE) :])
+    assert hashlib.sha256(reproduced.encode()).hexdigest() == UPSTREAM_PERMISSION_SHA256
+
+
+def test_license_carries_the_same_permission_notice() -> None:
+    ours = _permission_text((ROOT / "LICENSE").read_text())
+
+    assert hashlib.sha256(ours.encode()).hexdigest() == UPSTREAM_PERMISSION_SHA256
 
 
 def test_both_files_are_declared_as_license_files_of_the_package() -> None:

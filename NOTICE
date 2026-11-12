@@ -12,11 +12,15 @@ claude-code-discord-bridge, written by Masahiko Ebisuda (@ebibibi) and
 published under the MIT License:
 
     https://github.com/ebibibi/claude-code-discord-bridge
+    (since renamed: https://github.com/ebibibi/ebi-agent-chat-relay)
 
 c-lord has been developed separately since then and most of it has been
 rewritten, but portions of that original code remain in this repository and in
 the packages built from it. The copyright notice and permission notice of the
-original work are reproduced in full below, as its license requires.
+original work are reproduced in full below, as its license requires. That
+notice covers only the portions that come from claude-code-discord-bridge;
+everything else in c-lord is Copyright (c) 2026 yousan, under the MIT License
+in LICENSE.
 
 Thank you, Masahiko Ebisuda, for the code this project started from.
 
