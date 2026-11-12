@@ -1,15 +1,23 @@
-"""SQLite database schema and initialization."""
+"""The session database: its schema, and how an older file is brought up to it.
+
+``SCHEMA`` is what a new database gets. ``_MIGRATIONS`` is what an existing one
+is missing, one statement per step, in the order the steps were introduced.
+:func:`init_db` runs both on every start and is safe to repeat.
+
+Timestamps are local-time text (``YYYY-MM-DD HH:MM:SS``) written by SQLite.
+"""
 
 from __future__ import annotations
 
 import contextlib
 import logging
 
-import aiosqlite
+from . import _sqlite
 
 logger = logging.getLogger(__name__)
 
 SCHEMA = """
+-- One row per Discord thread: the Claude Code session it continues.
 CREATE TABLE IF NOT EXISTS sessions (
     thread_id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -33,11 +41,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id);
 
+-- Plain key/value settings.
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
+-- The question each thread is waiting on (one at most).
 CREATE TABLE IF NOT EXISTS pending_asks (
     thread_id INTEGER PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -49,6 +59,7 @@ CREATE TABLE IF NOT EXISTS pending_asks (
     message_id INTEGER
 );
 
+-- AI Lounge: one-line notes sessions leave for each other.
 CREATE TABLE IF NOT EXISTS lounge_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     label TEXT NOT NULL DEFAULT 'AI',
@@ -58,16 +69,13 @@ CREATE TABLE IF NOT EXISTS lounge_messages (
 
 CREATE INDEX IF NOT EXISTS idx_lounge_posted_at ON lounge_messages(posted_at);
 
--- Sessions that should be resumed after a bot restart.
--- Rows expire automatically via TTL checks in PendingResumeRepository.
--- A Claude session that is about to restart the bot writes a row here first;
--- on_ready reads and deletes it to resume the session.
+-- Threads to pick up again after a restart (at most one mark per thread).
 CREATE TABLE IF NOT EXISTS pending_resumes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id INTEGER NOT NULL UNIQUE,
-    session_id TEXT,           -- optional: used for "claude --resume" continuity
+    session_id TEXT,
     reason TEXT NOT NULL DEFAULT 'self_restart',
-    resume_prompt TEXT,        -- message to post + send to Claude on resume
+    resume_prompt TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
@@ -141,8 +149,9 @@ CREATE TABLE IF NOT EXISTS session_model_settings (
 CREATE INDEX IF NOT EXISTS idx_session_model_channel ON session_model_settings(channel_id);
 """
 
-# Migrations for existing databases that lack new columns.
-_MIGRATIONS = [
+# What a database created by an older c-lord lacks. Every step is attempted on
+# every start; one that has already been applied fails and is skipped.
+_MIGRATIONS: list[str] = [
     # #633: durable "already bridged" ledger for the menu watchdog.
     (
         "CREATE TABLE IF NOT EXISTS menu_bridges ("
@@ -165,10 +174,12 @@ _MIGRATIONS = [
     "ALTER TABLE ui_sweep_cursors ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
     # #671: the message a pending menu is drawn on (startup retires closed menus).
     "ALTER TABLE pending_asks ADD COLUMN message_id INTEGER",
+    # Where a session came from, and a one-line summary of it.
     "ALTER TABLE sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'discord'",
     "ALTER TABLE sessions ADD COLUMN summary TEXT",
+    # A Claude session belongs to one thread only.
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id)",
-    # Lounge table added in v1.x — safe to run on existing DBs
+    # AI Lounge.
     (
         "CREATE TABLE IF NOT EXISTS lounge_messages ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -177,7 +188,7 @@ _MIGRATIONS = [
         "posted_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))"
     ),
     "CREATE INDEX IF NOT EXISTS idx_lounge_posted_at ON lounge_messages(posted_at)",
-    # pending_resumes added in v1.3 — safe to run on existing DBs
+    # Resume marks that survive a restart.
     (
         "CREATE TABLE IF NOT EXISTS pending_resumes ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -262,15 +273,16 @@ _MIGRATIONS = [
 
 
 async def init_db(db_path: str) -> None:
-    """Initialize the database with the schema.
+    """Create the database at *db_path*, or bring an existing one up to date.
 
-    For fresh databases the full SCHEMA is applied. For existing databases
-    the migration statements add any missing columns idempotently.
+    Repeatable: the schema only creates what is missing, and a migration step
+    that does not apply any more — the column is already there, this SQLite
+    cannot drop a column — is skipped without a word.
     """
-    async with aiosqlite.connect(db_path) as db:
+    async with _sqlite.connection(db_path) as db:
         await db.executescript(SCHEMA)
-        for stmt in _MIGRATIONS:
+        for step in _MIGRATIONS:
             with contextlib.suppress(Exception):
-                await db.execute(stmt)
+                await db.execute(step)
         await db.commit()
     logger.info("Database initialized at %s", db_path)
