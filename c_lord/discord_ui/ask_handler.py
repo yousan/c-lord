@@ -1,32 +1,19 @@
-"""AskUserQuestion interaction handler.
-
-Handles the full lifecycle of AskUserQuestion tool calls from Claude Code:
-- Saving question state to DB for restart recovery
-- Showing Discord buttons via AskView
-- Waiting for user answers (up to 24 hours)
-- Returning the formatted answer prompt for Claude to resume
+# <<REDACTED 7 lines>>
 
 It also bridges the *in-pane* AskUserQuestion menu in jsonl/tmux mode
 (``bridge_pane_ask``): there Claude is blocked on a TUI menu, so the answer is
 delivered by sending menu keystrokes back to the pane rather than resuming with
 a new prompt (#166).
-"""
-
-from __future__ import annotations
-
-import asyncio
-import contextlib
+# <<REDACTED 6 lines>>
 import inspect
-import logging
+# <<REDACTED 1 lines>>
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-import discord
-
+# <<REDACTED 3 lines>>
 from .. import turn_events
 from ..claude.types import AskQuestion, ask_question_to_dict
-from ..database.ask_repo import PendingAskRepository
+# <<REDACTED 1 lines>>
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..menu_ledger import menu_fingerprint, shared_ledger
 from ..transcript.ask_result import (
@@ -53,9 +40,9 @@ from .ask_bus import (
     DELIVERY_UNDELIVERED,
     ChosenOption,
 )
-from .ask_bus import ask_bus as _ask_bus
+# <<REDACTED 1 lines>>
 from .ask_menus import ask_menus as _ask_menus
-from .ask_view import AskView
+# <<REDACTED 1 lines>>
 from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
 from .embeds import (
@@ -66,16 +53,11 @@ from .embeds import (
     ask_undelivered_embed,
 )
 from .pane_context import box_char_count, fold_pane_context, should_fold_pane_context
-
+# <<REDACTED 1 lines>>
 if TYPE_CHECKING:
     from ..claude.tmux_runner import TmuxClaudeRunner
 
-logger = logging.getLogger(__name__)
-
-# How long to wait for the user to answer (seconds).  24 hours lets users
-# step away for the day and come back without "Interaction Failed" errors.
-ASK_ANSWER_TIMEOUT = 86_400  # 24 h
-
+# <<REDACTED 6 lines>>
 # #359: while waiting for a Discord click, also watch the tmux pane.  The human
 # can answer/cancel the menu directly in the pane (tmux attach); without this
 # watch the bridge would wait for a click for ``ASK_ANSWER_TIMEOUT`` while the
@@ -148,12 +130,12 @@ def _context_chunks(text: str) -> tuple[list[str], bool]:
         chunks[0] = "…" + chunks[0]
     return chunks, truncated
 
-
+# <<REDACTED 1 lines>>
 async def _close(
     thread_id: int,
     reason: str,
     message: object | None = None,
-    ask_repo: PendingAskRepository | None = None,
+    # <<REDACTED 1 lines>>
 ) -> None:
     """Mark this thread's menu closed for *reason* and stop tracking *message* (#536).
 
@@ -737,7 +719,7 @@ async def bridge_pane_ask(
     thread: discord.Thread,
     question: AskQuestion,
     runner: TmuxClaudeRunner,
-    ask_repo: PendingAskRepository | None = None,
+    # <<REDACTED 1 lines>>
     authorizer: Authorizer | None = None,
     notify_user_id: int | None = None,
 ) -> None:
@@ -785,9 +767,7 @@ async def bridge_pane_ask(
             authorizer=authorizer,
             notify_user_id=notify_user_id,
         )
-    finally:
-        _ask_bus.unregister(thread.id)
-
+    # <<REDACTED 3 lines>>
 
 def _preempted(runner: object) -> bool:
     """Was *runner* stopped by the next message rather than by a stop (#1007)?"""
@@ -841,7 +821,7 @@ async def _bridge_claimed_menu(
     question: AskQuestion,
     runner: TmuxClaudeRunner,
     answer_queue: asyncio.Queue[list[str]],
-    ask_repo: PendingAskRepository | None = None,
+    # <<REDACTED 1 lines>>
     authorizer: Authorizer | None = None,
     notify_user_id: int | None = None,
 ) -> None:
@@ -976,8 +956,7 @@ async def _bridge_claimed_menu(
             previous = await ask_repo.get(thread.id)
             superseded_id = getattr(previous, "message_id", None)
         with contextlib.suppress(Exception):
-            await ask_repo.save(
-                thread_id=thread.id,
+            # <<REDACTED 2 lines>>
                 # The recovery path re-reads the pane rather than resuming a CLI
                 # session, so no session id is needed — the column is NOT NULL.
                 session_id="",
@@ -1154,54 +1133,15 @@ async def _bridge_claimed_menu(
     _ask_bus.note_delivery(thread.id, _delivery_verdict(outcome))
 
 
-async def collect_ask_answers(
-    thread: discord.Thread,
-    questions: list[AskQuestion],
-    session_id: str,
-    ask_repo: PendingAskRepository | None = None,
+# <<REDACTED 5 lines>>
     authorizer: Authorizer | None = None,
     notify_user_id: int | None = None,
-) -> str | None:
-    """Show Discord UI for each question and return the formatted answer string.
-
-    Processes questions sequentially (one at a time).  For each question:
-    1. Saves it to the DB (for bot-restart recovery).
-    2. Registers a Queue with ask_bus and shows the AskView.
-    3. Awaits the answer for up to 24 hours via asyncio.wait_for.
-    4. Cleans up the DB entry once answered or timed out.
-
-    Returns a human-readable string to inject as the next human turn, or None
-    if no question received an answer.
-    """
-    # Serialise questions once for DB storage.
-    questions_dicts = [
-        {
-            "question": q.question,
-            "header": q.header,
-            "multi_select": q.multi_select,
-            "options": [{"label": o.label, "description": o.description} for o in q.options],
-        }
-        for q in questions
-    ]
-
-    parts: list[str] = []
-    for q_idx, q in enumerate(questions):
-        # Persist so on_ready can re-register the view after a bot restart.
-        if ask_repo is not None:
-            await ask_repo.save(
-                thread_id=thread.id,
-                session_id=session_id,
-                questions=questions_dicts,
-                question_idx=q_idx,
-            )
-
-        # Register a waiter in the bus before showing the view so there is no
-        # race between the user clicking and the queue being registered.
+# <<REDACTED 36 lines>>
         # #535: a None means another bridge already has this thread's menu on
         # screen. Posting a second copy is the bug we are fixing, and its
         # answers would go to the owner's queue anyway — so skip this question
         # and let the owner's menu collect the answer.
-        answer_queue = _ask_bus.register(thread.id)
+        # <<REDACTED 1 lines>>
         if answer_queue is None:
             logger.warning(
                 "collect_ask_answers: thread %d already has an active menu bridge — "
@@ -1210,7 +1150,7 @@ async def collect_ask_answers(
                 q_idx,
             )
             continue
-
+# <<REDACTED 1 lines>>
         view = AskView(
             q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo, authorizer=authorizer
         )
@@ -1222,38 +1162,13 @@ async def collect_ask_answers(
         _ask_menus.register(thread.id, msg)  # #536: keep stale copies addressable
         if q_idx == 0:  # #917: one event per ask, however many questions it carries
             turn_events.emit_blocked(thread, message_id=getattr(msg, "id", None))
-
-        try:
-            selected = await asyncio.wait_for(answer_queue.get(), timeout=ASK_ANSWER_TIMEOUT)
-        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
+# <<REDACTED 4 lines>>
             await _close(thread.id, CLOSE_TIMEOUT, msg, ask_repo)
-            _ask_bus.unregister(thread.id)
-            if ask_repo is not None:
-                await ask_repo.delete(thread.id)
-            # Remove buttons from the timed-out message so they stay inert.
+            # <<REDACTED 4 lines>>
             with contextlib.suppress(*DISCORD_CALL_FAILURES):
-                await msg.edit(
-                    content="-# ⏰ Question timed out — please send a new message to continue.",
-                    embed=None,
-                    view=None,
-                )
-            logger.info(
-                "AskUserQuestion timed out after %ds for thread %d: %r",
-                ASK_ANSWER_TIMEOUT,
-                thread.id,
-                q.question,
-            )
-            continue
-        finally:
-            _ask_bus.unregister(thread.id)
-
-        if ask_repo is not None:
-            await ask_repo.delete(thread.id)
-
-        if not selected:
+                # <<REDACTED 19 lines>>
             await _close(thread.id, CLOSE_INTERRUPTED, msg, ask_repo)
-            continue
-
+            # <<REDACTED 2 lines>>
         await _close(thread.id, CLOSE_ANSWERED, msg, ask_repo)
         # #651: on this path the answer needs no verification — it is returned
         # from here and injected as Claude's next prompt, so it cannot be lost
@@ -1263,14 +1178,4 @@ async def collect_ask_answers(
         _ask_bus.note_delivery(thread.id, DELIVERY_DELIVERED)
         await _finalize_menu_message(msg, q, selected, ASK_ANSWERED)
 
-        answer_text = ", ".join(selected)
-        parts.append(f"**{q.question}**\nAnswer: {answer_text}")
-
-    if not parts:
-        return None
-
-    return (
-        "[Response to AskUserQuestion]\n\n"
-        + "\n\n".join(parts)
-        + "\n\nPlease continue based on these answers."
-    )
+        # <<REDACTED 11 lines>>

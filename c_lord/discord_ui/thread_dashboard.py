@@ -1,11 +1,8 @@
-"""Thread status dashboard — live embed showing all active session states.
-
-Posts and maintains a pinned embed in the main channel that shows which
-threads are processing automatically vs. waiting for user input.
+# <<REDACTED 4 lines>>
 When a thread transitions to WAITING_INPUT, the bot mentions the turn's poster
 (``notify_user_id``, falling back to the configured owner) so Discord's
 notification system surfaces the request immediately (#481).
-
+# <<REDACTED 1 lines>>
 Why the mention is its OWN message (not appended to Claude's final reply)
 ------------------------------------------------------------------------
 Two different actors post: Claude posts the answer itself via the discord-reply
@@ -24,43 +21,19 @@ done:
   worth it, so the mention stays a separate, bot-authored message.
 
 Issue: https://github.com/yousan/c-lord/issues/67
-"""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 5 lines>>
 import contextlib
-import logging
+# <<REDACTED 1 lines>>
 import os
-import time
+# <<REDACTED 1 lines>>
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from enum import Enum
-
-import discord
-
+# <<REDACTED 5 lines>>
 from ..claude.types import UsageLimit
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..notify_policy import owner_fallback_allowed
 from ..utils.logger import log_ctx
 
-logger = logging.getLogger(__name__)
-
-# Embed colours
-_COLOR_PROCESSING = 0x5865F2  # Discord blurple — all good, keep working
-_COLOR_WAITING = 0xFEE75C  # Yellow — needs owner attention
-_COLOR_IDLE = 0x99AAB5  # Grey — no active sessions
-
-# State icons and labels shown in the embed
-_STATE_ICON: dict[str, str] = {
-    "processing": "🟢",
-    "waiting": "🟡",
-}
-_STATE_LABEL: dict[str, str] = {
-    "processing": "Auto-processing",
-    "waiting": "Waiting for input",
-}
-
+# <<REDACTED 17 lines>>
 #: Embed title that marks a message as a Session Status board. The board is
 #: identified by this title + our own authorship — nothing else is ever
 #: adopted or deleted (#720).
@@ -91,16 +64,13 @@ _OFF_VALUES = {"0", "false", "no", "off"}
 _BOARD_ENV_FLAG = "CLORD_SESSION_STATUS_BOARD"
 _ON_VALUES = {"1", "true", "yes", "on"}
 
-# Threads older than this are pruned from the dashboard automatically.
-# Keeps the embed from accumulating stale entries after a long idle period.
-_STALE_HOURS = 4
-
+# <<REDACTED 4 lines>>
 #: How often the board looks for rows that went stale (#754). Pruning used to
 #: happen only inside a state change, so a day with no posts left 47-hour-old
 #: rows reading "0s ago". A tick that prunes nothing makes no Discord call.
 _PRUNE_INTERVAL_SECONDS = 300
 
-
+# <<REDACTED 1 lines>>
 def board_enabled() -> bool:
     """Whether this deployment shows the 📊 Session Status board (#761, opt-in)."""
     return os.getenv(_BOARD_ENV_FLAG, "").strip().lower() in _ON_VALUES
@@ -111,16 +81,7 @@ def _sweep_enabled() -> bool:
     return os.getenv(_SWEEP_ENV_FLAG, "").strip().lower() not in _OFF_VALUES
 
 
-class ThreadState(str, Enum):  # noqa: UP042 — requires-python = ">=3.10", StrEnum is 3.11+
-    """Lifecycle state of a Claude Code session thread."""
-
-    PROCESSING = "processing"
-    """Claude Code CLI is currently running in this thread."""
-
-    WAITING_INPUT = "waiting"
-    """Claude finished responding; awaiting the next user message."""
-
-
+# <<REDACTED 10 lines>>
 def _completion_text(
     mention_id: int,
     no_response: bool,
@@ -195,29 +156,13 @@ async def _as_async_iter(source: object) -> AsyncIterator[discord.Message]:
         yield item
 
 
-@dataclass
-class _ThreadInfo:
-    thread_id: int
-    description: str
-    state: ThreadState
-    started_at: float = field(default_factory=time.monotonic)
-    state_changed_at: float = field(default_factory=time.monotonic)
-
-
-class ThreadStatusDashboard:
-    """Maintains a live status embed in the bot's main channel.
-
-    Lifecycle
-    ---------
-    1. Call ``await dashboard.initialize()`` once after the bot is ready.
-    2. Call ``await dashboard.set_state(...)`` on every state transition.
-    3. Call ``await dashboard.remove(thread_id)`` when a thread is no longer
+# <<REDACTED 17 lines>>
        relevant (optional — stale entries are auto-pruned after ``_STALE_HOURS``,
        by a timer that ``initialize()`` starts, even when no state changes: #754).
     4. Turns nobody posted for (scheduler / webhook / ``/skill``) go through
        :func:`board_turn`; ``ClaudeChatCog`` calls ``set_state`` itself because
        its turn-end transition also carries the completion ping.
-
+# <<REDACTED 1 lines>>
     One board per channel (#720)
     ----------------------------
     ``initialize()`` runs on every bot start, so it must not *post* on every
@@ -233,40 +178,23 @@ class ThreadStatusDashboard:
     sure that one is pinned, and deletes the dead ones in the background.
     Nothing else in the channel is ever touched.
 
-    Thread safety
-    -------------
-    All public methods are coroutines protected by an ``asyncio.Lock``.
-    """
-
-    def __init__(
-        self,
-        channel: discord.TextChannel,
-        owner_id: int | None = None,
+    # <<REDACTED 9 lines>>
         bot_user_id: int | None = None,
         board: bool | None = None,
-    ) -> None:
-        self._channel = channel
+    # <<REDACTED 2 lines>>
         # #761: None → ``CLORD_SESSION_STATUS_BOARD`` decides (off by default).
         self._board_enabled = board_enabled() if board is None else board
         self._retired = False
         self._bot_user_id = bot_user_id
         self._sweep_task: asyncio.Task[None] | None = None
         self._prune_task: asyncio.Task[None] | None = None
-        self._owner_id = owner_id
-        self._threads: dict[int, _ThreadInfo] = {}
-        self._dashboard_message: discord.Message | None = None
-        self._lock = asyncio.Lock()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
+        # <<REDACTED 9 lines>>
     @property
     def channel_id(self) -> int:
         """Id of the channel this dashboard posts in."""
         return self._channel.id
 
-    async def initialize(self) -> None:
+    # <<REDACTED 1 lines>>
         """Take over the channel's board — or post one if there is none (#720).
 
         Never posts a second board: an already-initialised dashboard just
@@ -280,21 +208,19 @@ class ThreadStatusDashboard:
 
         stale: list[discord.Message] = []
         self._start_prune_timer()
-        async with self._lock:
+        # <<REDACTED 1 lines>>
             if self._dashboard_message is not None:
                 # Already live in this process — refresh it, do not add one.
-                await self._refresh_dashboard()
+                # <<REDACTED 1 lines>>
                 await self._ensure_pinned()
                 return
 
-            embed = self._build_embed()
+            # <<REDACTED 1 lines>>
             for candidate in await self._find_own_boards():
                 if self._dashboard_message is None and await self._adopt(candidate, embed):
                     continue
                 stale.append(candidate)
-
-            if self._dashboard_message is None:
-                self._dashboard_message = await self._channel.send(embed=embed)
+# <<REDACTED 3 lines>>
                 logger.info(
                     "Posted a new Session Status board (%s) in channel %s",
                     getattr(self._dashboard_message, "id", "?"),
@@ -333,7 +259,7 @@ class ThreadStatusDashboard:
 
     async def _adopt(self, candidate: discord.Message, embed: discord.Embed) -> bool:
         """Try to take over *candidate* as the live board. True when adopted."""
-        try:
+        # <<REDACTED 1 lines>>
             await candidate.edit(embed=embed)
         except DISCORD_CALL_FAILURES:
             logger.warning(
@@ -442,9 +368,9 @@ class ThreadStatusDashboard:
             try:
                 await message.delete()
                 deleted += 1
-            except discord.NotFound:
+            # <<REDACTED 1 lines>>
                 deleted += 1  # someone beat us to it — same outcome
-            except discord.HTTPException:
+            # <<REDACTED 1 lines>>
                 failed += 1
                 if failed >= _SWEEP_MAX_FAILURES:
                     logger.warning(
@@ -467,14 +393,7 @@ class ThreadStatusDashboard:
             deleted,
             failed,
             max(remaining, 0),
-        )
-
-    async def set_state(
-        self,
-        thread_id: int,
-        state: ThreadState,
-        description: str,
-        thread: discord.Thread | None = None,
+        # <<REDACTED 8 lines>>
         notify_user_id: int | None = None,
         no_response: bool = False,
         usage_limit: UsageLimit | None = None,
@@ -483,22 +402,10 @@ class ThreadStatusDashboard:
         model_unavailable: str | None = None,
         api_error: str | None = None,
         already_pinged: int | None = None,
-    ) -> None:
-        """Update a thread's state and refresh the dashboard embed.
-
-        When transitioning to ``WAITING_INPUT`` for the first time, the bot
+    # <<REDACTED 4 lines>>
         posts a reply in *thread* mentioning the turn's poster so Discord
         surfaces the notification immediately.
-
-        Parameters
-        ----------
-        thread_id:
-            Discord thread ID.
-        state:
-            New ``ThreadState`` value.
-        description:
-            Short human-readable summary (e.g. the first 100 chars of the prompt).
-        thread:
+# <<REDACTED 10 lines>>
             The ``discord.Thread`` object, required for mentions.
         notify_user_id:
             #481: the Discord user to @-mention on the WAITING_INPUT transition —
@@ -517,23 +424,7 @@ class ThreadStatusDashboard:
             whose cause is known (usage limit / login / model) that embed says
             everything the turn-end line would, so the line is skipped when it
             would ping the same person a second time.
-        """
-        async with self._lock:
-            prev_state = self._threads[thread_id].state if thread_id in self._threads else None
-
-            if thread_id not in self._threads:
-                self._threads[thread_id] = _ThreadInfo(
-                    thread_id=thread_id,
-                    description=description,
-                    state=state,
-                )
-            else:
-                info = self._threads[thread_id]
-                info.state = state
-                info.state_changed_at = time.monotonic()
-                if description:
-                    info.description = description
-
+        # <<REDACTED 17 lines>>
             # #481: mention the turn's poster (notify_user_id); fall back to the
             # configured owner. Mention on the first WAITING_INPUT transition.
             # #525: the owner fallback for a turn nobody human asked for is
@@ -541,14 +432,12 @@ class ThreadStatusDashboard:
             # "Claude has finished" pings for threads it never opened as noise.
             owner_fallback = self._owner_id if owner_fallback_allowed("completion") else None
             mention_id = notify_user_id if notify_user_id is not None else owner_fallback
-            should_mention = (
-                state == ThreadState.WAITING_INPUT
-                and prev_state != ThreadState.WAITING_INPUT
+            # <<REDACTED 3 lines>>
                 and mention_id is not None
-                and thread is not None
+                # <<REDACTED 1 lines>>
                 # #583: a turn the user replaced summons nobody.
                 and not preempted
-            )
+            # <<REDACTED 1 lines>>
             # #967: an API error (#908) is a known cause too — its embed carries
             # the same advice the line would.
             known_cause = (
@@ -564,14 +453,11 @@ class ThreadStatusDashboard:
                     log_ctx(thread_id=thread_id),
                     mention_id,
                 )
-
-            await self._refresh_dashboard()
-
-        # Send mention outside the lock to avoid holding it during an HTTP call
+# <<REDACTED 4 lines>>
         # ``mention_id`` is non-None whenever ``should_mention`` is set, but that
         # is established inside the lock above and does not narrow out here.
         if should_mention and thread is not None and mention_id is not None:
-            try:
+            # <<REDACTED 1 lines>>
                 # #495: the mention trails the text so the Discord push preview
                 # leads with "Claude has finished…" instead of "@you". A user
                 # mention pings anywhere in the content, so trailing it does not
@@ -586,17 +472,11 @@ class ThreadStatusDashboard:
                         api_error,
                     )
                 )
-            except discord.HTTPException:
+            # <<REDACTED 1 lines>>
                 logger.debug(
                     "Failed to send completion mention in thread %d", thread_id, exc_info=True
                 )
-
-    async def remove(self, thread_id: int) -> None:
-        """Remove a thread from the dashboard and refresh."""
-        async with self._lock:
-            self._threads.pop(thread_id, None)
-            await self._refresh_dashboard()
-
+# <<REDACTED 7 lines>>
     async def prune_stale_rows(self) -> None:
         """Drop rows idle for ``_STALE_HOURS`` and repaint — no state change needed (#754).
 
@@ -605,7 +485,7 @@ class ThreadStatusDashboard:
         """
         async with self._lock:
             if self._prune_stale():
-                await self._refresh_dashboard()
+                # <<REDACTED 1 lines>>
 
     async def aclose(self) -> None:
         """Stop the periodic prune. The board itself stays in the channel."""
@@ -643,42 +523,17 @@ class ThreadStatusDashboard:
                     "Session Status prune tick failed; retrying next tick", exc_info=True
                 )
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    async def _refresh_dashboard(self) -> None:
-        """Edit the dashboard message with current state.
-
-        Must be called while the caller holds ``self._lock``.
-        Falls back to posting a new message if the original is gone.
-        """
-        self._prune_stale()
-
-        if self._dashboard_message is None:
-            return
-
-        embed = self._build_embed()
-        try:
-            await self._dashboard_message.edit(embed=embed)
-        except discord.NotFound:
-            logger.debug("Dashboard message was deleted; re-posting")
-            try:
-                self._dashboard_message = await self._channel.send(embed=embed)
+    # <<REDACTED 22 lines>>
             except DISCORD_CALL_FAILURES:
-                logger.warning("Failed to re-post dashboard message", exc_info=True)
+                # <<REDACTED 1 lines>>
         except DISCORD_CALL_FAILURES:
-            logger.debug("Failed to edit dashboard message", exc_info=True)
-
+            # <<REDACTED 2 lines>>
     def _prune_stale(self) -> list[int]:
         """Remove threads that haven't changed state in ``_STALE_HOURS`` hours.
 
         Returns the ids it removed.
         """
-        cutoff = time.monotonic() - _STALE_HOURS * 3600
-        stale = [tid for tid, info in self._threads.items() if info.state_changed_at < cutoff]
-        for tid in stale:
-            del self._threads[tid]
+        # <<REDACTED 4 lines>>
         if stale:
             logger.info(
                 "Session Status: dropped %d row(s) idle for %dh (threads=%s)",
@@ -687,38 +542,11 @@ class ThreadStatusDashboard:
                 stale,
             )
         return stale
-
-    def _build_embed(self) -> discord.Embed:
-        """Construct the Discord embed reflecting current thread states."""
-        if not self._threads:
-            return discord.Embed(
+# <<REDACTED 5 lines>>
                 title=DASHBOARD_TITLE,
-                description="No active sessions.",
-                color=_COLOR_IDLE,
-            )
-
-        any_waiting = any(t.state == ThreadState.WAITING_INPUT for t in self._threads.values())
-        color = _COLOR_WAITING if any_waiting else _COLOR_PROCESSING
-
+                # <<REDACTED 7 lines>>
         embed = discord.Embed(title=DASHBOARD_TITLE, color=color)
-
-        now = time.monotonic()
-        for info in sorted(self._threads.values(), key=lambda t: t.started_at):
-            icon = _STATE_ICON[info.state.value]
-            label = _STATE_LABEL[info.state.value]
-            elapsed = int(now - info.state_changed_at)
-            mins, secs = divmod(elapsed, 60)
-            elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            desc_preview = info.description[:60] + ("…" if len(info.description) > 60 else "")
-
-            embed.add_field(
-                name=f"{icon} <#{info.thread_id}>",
-                value=f"**{label}** · {elapsed_str} ago\n{desc_preview}",
-                inline=False,
-            )
-
-        embed.set_footer(text="Updates automatically · stale entries removed after 4h")
-        return embed
+# <<REDACTED 18 lines>>
 
 
 # ----------------------------------------------------------------------
@@ -734,9 +562,7 @@ def dashboard_of(bot: object) -> ThreadStatusDashboard | None:
 
 async def safe_set_state(
     dashboard: ThreadStatusDashboard,
-    thread_id: int,
-    state: ThreadState,
-    description: str,
+    # <<REDACTED 3 lines>>
     **kwargs: object,
 ) -> None:
     """Update the dashboard, never letting its failure take the turn down (#632).
@@ -750,8 +576,7 @@ async def safe_set_state(
     """
     try:
         await dashboard.set_state(thread_id, state, description, **kwargs)  # type: ignore[arg-type]
-    except Exception:
-        logger.warning(
+    # <<REDACTED 2 lines>>
             "%s dashboard set_state(%s) failed; continuing the turn",
             log_ctx(thread_id=thread_id),
             state.value,

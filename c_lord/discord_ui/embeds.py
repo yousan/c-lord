@@ -1,43 +1,20 @@
-"""Discord embed builders for Claude Code events."""
-
-from __future__ import annotations
-
+# <<REDACTED 4 lines>>
 from dataclasses import dataclass
 
-import discord
-
+# <<REDACTED 2 lines>>
 from ..claude.types import AskOption, UsageLimit
-
-# Colors
-COLOR_INFO = 0x5865F2  # Discord blurple
-COLOR_SUCCESS = 0x57F287  # Green
-COLOR_ERROR = 0xED4245  # Red
-COLOR_TOOL = 0xFEE75C  # Yellow
-COLOR_ASK = 0x3498DB  # Blue — question-like
-COLOR_TODO = 0xE67E22  # Orange — task list
-
-AUTOCOMPACT_THRESHOLD = 83.5
-
-
+# <<REDACTED 12 lines>>
 def session_start_embed(
     session_id: str | None = None,
     *,
     window_name: str | None = None,
 ) -> discord.Embed:
-    """Create an embed for session start."""
-    embed = discord.Embed(
-        title="\U0001f916 Claude Code session started",
-        color=COLOR_INFO,
-    )
-    if session_id:
+    # <<REDACTED 6 lines>>
         if session_id.startswith("tmux-"):
             label = window_name or "tmux"
             embed.set_footer(text=f"Session: {label}")
         else:
-            embed.set_footer(text=f"Session: {session_id[:8]}...")
-    return embed
-
-
+            # <<REDACTED 4 lines>>
 def unknown_tui_prompt_embed(pane_snapshot: str) -> discord.Embed:
     """Create a warning embed for an unknown TUI interactive prompt.
 
@@ -59,15 +36,7 @@ def unknown_tui_prompt_embed(pane_snapshot: str) -> discord.Embed:
     )
 
 
-def error_embed(error: str) -> discord.Embed:
-    """Create an embed for errors."""
-    return discord.Embed(
-        title="\u274c Error",
-        description=error[:4000],
-        color=COLOR_ERROR,
-    )
-
-
+# <<REDACTED 9 lines>>
 def api_error_embed(detail: str, advice: str) -> discord.Embed:
     """Embed for a turn Claude Code ended on an API error (#908).
 
@@ -304,20 +273,7 @@ def usage_limit_embed(limit: UsageLimit) -> discord.Embed:
     )
 
 
-def timeout_embed(seconds: int) -> discord.Embed:
-    """Create an embed for session timeout with actionable guidance."""
-    return discord.Embed(
-        title="\u23f1\ufe0f Session timed out",
-        description=(
-            f"No response received for {seconds} seconds.\n\n"
-            "**What to do:**\n"
-            "\u2022 Send a message to resume the session\n"
-            "\u2022 Use `/clear` to start fresh"
-        ),
-        color=COLOR_ERROR,
-    )
-
-
+# <<REDACTED 14 lines>>
 def ask_embed(
     question: str,
     header: str = "",
@@ -332,19 +288,15 @@ def ask_embed(
     labels (#169).  The Select-menu case (≥5 options) shows descriptions in the
     dropdown itself, so no legend is added there.
     """
-    title = f"❓ {header}" if header else "❓ Claude needs your input"
+    # <<REDACTED 1 lines>>
     body = question
     if options and not multi_select and len(options) <= 4:
         legend = "\n".join(f"**{o.label}** — {o.description}" for o in options if o.description)
         if legend:
             body = f"{question}\n\n{legend}"
-    return discord.Embed(
-        title=title[:256],
+    # <<REDACTED 2 lines>>
         description=body[:4096],
-        color=COLOR_ASK,
-    )
-
-
+        # <<REDACTED 4 lines>>
 def ask_answered_embed(
     question: str,
     header: str = "",
@@ -358,8 +310,7 @@ def ask_answered_embed(
     """
     answer = ", ".join(selected or []) or "（未選択）"
     title = f"✅ {header}" if header else "✅ 回答しました"
-    return discord.Embed(
-        title=title[:256],
+    # <<REDACTED 2 lines>>
         description=f"{question}\n\n**あなたの回答:** {answer}"[:4096],
         color=COLOR_SUCCESS,
     )
@@ -527,13 +478,6 @@ def stopped_embed(*, shells_stopped: int = 0) -> discord.Embed:
         if shells_stopped
         else ""
     )
-    return discord.Embed(
-        title="\u23f9\ufe0f Session stopped",
-        description=(
-            "The session was stopped.\n\n"
+    # <<REDACTED 4 lines>>
             f"{background}"
-            "The session is preserved \u2014 send a message to resume, "
-            "or use `/clear` to start fresh."
-        ),
-        color=0xFFA500,  # Orange — not an error, just interrupted
-    )
+            # <<REDACTED 5 lines>>

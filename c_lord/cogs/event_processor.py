@@ -11,14 +11,9 @@ transcript mirror reads them from Claude Code's jsonl (#712, #723).  The
 embeds, views and timer that once rendered tool use, thinking, todo lists,
 permission / plan / elicitation prompts and compaction from runner events were
 removed in #1316: nothing constructed those events any more.
-"""
-
-from __future__ import annotations
-
-import contextlib
-import logging
+# <<REDACTED 6 lines>>
 from typing import TYPE_CHECKING
-
+# <<REDACTED 1 lines>>
 from ..api_error import API_ERROR_PREFIX, advice_for_error
 from ..claude.tmux_runner import (
     FLEET_TMUX_RESTART_ERROR_PREFIX,
@@ -29,90 +24,30 @@ from ..claude.tmux_runner import (
     TRUST_STUCK_ERROR_PREFIX,
     unavailable_model,
 )
-from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
+# <<REDACTED 1 lines>>
 from ..discord_ui.embeds import session_start_embed, unknown_tui_prompt_embed
 from ..login_alert import login_alert
 from ..usage_limit import usage_limit_notices
 from ..utils.logger import log_ctx
-from .run_config import RunConfig
-
+# <<REDACTED 2 lines>>
 if TYPE_CHECKING:
     import discord
-
-logger = logging.getLogger(__name__)
-
-
-class EventProcessor:
+# <<REDACTED 5 lines>>
     """Handles one turn's runner events and the Discord posts they call for.
-
+# <<REDACTED 1 lines>>
     One instance per turn. Call process(event) for each event from the runner;
     call finalize() in a finally block.
-
+# <<REDACTED 1 lines>>
     State:
-    - session_start_sent: prevents duplicate session start embeds
-    - pending_ask: set when AskUserQuestion detected; caller should drain runner
-
-    Example usage (see _run_helper.run_claude_with_config for the full flow)::
-
-        processor = EventProcessor(config)
-        try:
-            async for event in config.runner.run(prompt):
-                if processor.should_drain:
-                    continue
-                await processor.process(event)
-        finally:
-            await processor.finalize()
-
-        if processor.pending_ask and processor.session_id:
-            # Handle AskUserQuestion (see run_helper)
-            ...
-
-        return processor.session_id
-    """
-
-    def __init__(self, config: RunConfig) -> None:
-        self._config = config
-        self._state = SessionState(
-            session_id=config.session_id,
-            thread_id=config.thread.id,
-        )
-
-        # Guards against duplicate embeds/messages in the same run.
-        self._session_start_sent: bool = False
+    # <<REDACTED 30 lines>>
         # #856: ``RunConfig.on_session_saved`` fires once per turn.
         self._session_saved_notified: bool = False
-
-        # Set when AskUserQuestion is detected. Caller should drain the runner
-        # (skip events) then handle the ask after the stream ends.
-        self._pending_ask: list[AskQuestion] | None = None
-
+# <<REDACTED 5 lines>>
         # The session-start embed this turn posted, if any. It is bookkeeping,
         # so it is taken away again when the turn ends.
         self._session_start_msg: discord.Message | None = None
 
-    # ------------------------------------------------------------------
-    # Public properties
-    # ------------------------------------------------------------------
-
-    @property
-    def session_id(self) -> str | None:
-        """The current session ID, updated as SYSTEM events arrive."""
-        return self._state.session_id
-
-    @property
-    def pending_ask(self) -> list[AskQuestion] | None:
-        """Set when AskUserQuestion was detected. None otherwise."""
-        return self._pending_ask
-
-    @property
-    def should_drain(self) -> bool:
-        """True while the runner should be drained (AskUserQuestion detected)."""
-        return self._pending_ask is not None
-
-    # ------------------------------------------------------------------
-    # Public methods
-    # ------------------------------------------------------------------
-
+    # <<REDACTED 23 lines>>
     @property
     def _failure_mention(self) -> str | None:
         """Message content that pings whoever is waiting on a broken turn (#681).
@@ -135,28 +70,13 @@ class EventProcessor:
             uid = self._config.notify_user_id
         return uid
 
-    async def process(self, event: StreamEvent) -> None:
-        """Dispatch a single stream event to the appropriate handler."""
-        if event.message_type == MessageType.SYSTEM:
-            await self._on_system(event)
-        elif event.message_type == MessageType.ASSISTANT:
-            await self._on_assistant(event)
-
-        if event.is_complete:
-            await self._on_complete(event)
-
-    async def finalize(self) -> None:
+    # <<REDACTED 11 lines>>
         """End-of-turn hook. Call in a finally block.
 
         Holds nothing to release since #1316 (it used to cancel the per-tool
         timers); kept so callers have one place to end a turn.
         """
-
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
-
-    async def _on_system(self, event: StreamEvent) -> None:
+# <<REDACTED 6 lines>>
         """Handle SYSTEM events — a TUI menu, an unknown prompt, or the session id."""
         # In-pane AskUserQuestion (jsonl/tmux mode) — show Discord buttons and
         # answer the open TUI menu by sending keystrokes back to the pane (#166).
@@ -166,17 +86,13 @@ class EventProcessor:
 
         # Unknown TUI interactive prompt — warn Discord so the session doesn't stall silently
         if event.unknown_tui_prompt is not None:
-            with contextlib.suppress(Exception):
+            # <<REDACTED 1 lines>>
                 await self._config.thread.send(
                     embed=unknown_tui_prompt_embed(event.unknown_tui_prompt)
                 )
             return
 
-        if not event.session_id:
-            return
-
-        self._state.session_id = event.session_id
-        if self._config.repo:
+        # <<REDACTED 5 lines>>
             await self._config.repo.save(
                 self._config.thread.id,
                 self._state.session_id,
@@ -187,39 +103,28 @@ class EventProcessor:
             hook = self._config.on_session_saved
             if hook is not None and not self._session_saved_notified:
                 self._session_saved_notified = True
-                with contextlib.suppress(Exception):
+                # <<REDACTED 1 lines>>
                     await hook(self._config.thread.id)
-
-        # Guard: post session_start_embed only once (Claude can emit multiple SYSTEM events).
-        if not self._config.session_id and not self._session_start_sent:
+# <<REDACTED 3 lines>>
             self._session_start_msg = await self._config.thread.send(
                 embed=session_start_embed(self._state.session_id)
             )
-            self._session_start_sent = True
-
-    async def _on_assistant(self, event: StreamEvent) -> None:
+            # <<REDACTED 3 lines>>
         """Handle ASSISTANT events — an AskUserQuestion carried on the event itself."""
-        # AskUserQuestion — set pending and signal caller to interrupt runner.
-        if event.ask_questions:
-            self._pending_ask = event.ask_questions
-            await self._config.runner.interrupt()
-
-    async def _on_complete(self, event: StreamEvent) -> None:
+        # <<REDACTED 6 lines>>
         """Handle RESULT events — the turn is over.
-
+# <<REDACTED 1 lines>>
         Sets the lamp (🟡 / ❌), posts the error embed when the turn failed and
         records why on ``RunConfig.outcome``, removes the session-start embed,
         and saves the session id. Claude's answer is not posted here: the
         transcript mirror delivers it from the jsonl (#712).
         """
-        from ._run_helper import _make_error_embed
-
+        # <<REDACTED 2 lines>>
         if event.error == STOPPED_BY_USER_ERROR:
             # #878: the user asked for this. The stop reply (⏹️ Session stopped)
             # already says so — an ❌ and an error embed with a failure ping
             # would report a requested stop as a breakdown. 🟡: their turn now.
-            if self._config.status:
-                await self._config.status.set_done()
+            # <<REDACTED 2 lines>>
         elif event.error:
             # #562: tell the caller this turn produced nothing, so the turn-end
             # ping says "応答がありませんでした" instead of "Claude has finished".
@@ -281,8 +186,7 @@ class EventProcessor:
             if err_msg is not None:
                 # #915: the turn-end line must not ping the same person again.
                 self._config.outcome.pinged_user_id = self._failure_notify_uid
-            if self._config.status:
-                await self._config.status.set_error()
+            # <<REDACTED 2 lines>>
             # #1309: the embed reaches whoever opens the thread; the cure is on
             # the host, so the owner is told by DM — once per outage.
             if self._config.outcome.login_required:
@@ -291,23 +195,19 @@ class EventProcessor:
                 await login_alert.report(
                     self._config.thread, session=session if isinstance(session, str) else None
                 )
-        else:
-            if self._config.status:
-                await self._config.status.set_done()
+        # <<REDACTED 3 lines>>
             # #1309: a turn that ran was logged in — the outage, if any, is over.
             await login_alert.recovered()
-
+# <<REDACTED 1 lines>>
         await self._remove_session_start_embed()
 
-        if event.session_id:
-            if self._config.repo:
+        # <<REDACTED 2 lines>>
                 await self._config.repo.save(
                     self._config.thread.id,
                     event.session_id,
                     working_dir=self._config.working_dir,
                 )
-            self._state.session_id = event.session_id
-
+            # <<REDACTED 2 lines>>
     async def _handle_pane_ask(self, event: StreamEvent) -> None:
         """Bridge an in-pane AskUserQuestion menu to Discord buttons (#166).
 
@@ -363,5 +263,5 @@ class EventProcessor:
         """
         msg, self._session_start_msg = self._session_start_msg, None
         if msg is not None:
-            with contextlib.suppress(Exception):
+            # <<REDACTED 1 lines>>
                 await msg.delete()

@@ -1,105 +1,26 @@
-"""SchedulerCog — SQLite-backed periodic Claude Code task executor.
-
-Design:
-- Tasks are stored in ``scheduled_tasks`` DB table and registered via REST API
-  (Claude Code calls POST /api/tasks from within a chat session).
-- A single 30-second master loop checks for due tasks and spawns them.
-- ``discord.ext.tasks`` is used only for the master loop — individual tasks
-  are not @tasks.loop decorated (they are runtime-dynamic).
-- Claude handles all domain logic (what to check, how to deduplicate).
+# <<REDACTED 9 lines>>
   c-lord only manages scheduling.
-
-See: Issue #90, CLAUDE.md §Key Design Decisions #7-9.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import logging
-from typing import TYPE_CHECKING
-
-import discord
-from discord.ext import commands, tasks
-
+# <<REDACTED 13 lines>>
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..model_scopes import begin_turn_for, effort_for_launch
 from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..turn_events import StartedBy
 from ..utils.logger import log_ctx
-from ._run_helper import run_claude_with_config
-from .run_config import RunConfig
-
-if TYPE_CHECKING:
+# <<REDACTED 4 lines>>
     from ..claude.config import ClaudeConfig
-    from ..database.task_repo import TaskRepository
-
-logger = logging.getLogger(__name__)
-
-# How often the master loop wakes up to check for due tasks.
-MASTER_LOOP_INTERVAL_SECONDS = 30
-
-
-class SchedulerCog(commands.Cog):
-    """Cog that periodically runs Claude Code tasks stored in SQLite.
-
-    Args:
-        bot: The Discord bot instance.
+    # <<REDACTED 13 lines>>
         runner: ClaudeConfig with CLI settings.
-        repo: TaskRepository for reading/updating scheduled tasks.
-    """
-
-    def __init__(
-        self,
-        bot: commands.Bot,
+        # <<REDACTED 6 lines>>
         runner: ClaudeConfig,
-        *,
-        repo: TaskRepository,
-    ) -> None:
-        self.bot = bot
-        self.runner = runner
-        self.repo = repo
-        # Track in-flight tasks to avoid double-running the same task_id.
-        self._running: set[int] = set()
-
-    async def cog_load(self) -> None:
-        """Start the master loop when the Cog is loaded."""
-        self._master_loop.start()
-        logger.info("SchedulerCog loaded — master loop started")
-
-    def cog_unload(self) -> None:
-        """Cancel the master loop when the Cog is unloaded."""
-        self._master_loop.cancel()
-        logger.info("SchedulerCog unloaded — master loop stopped")
-
-    @tasks.loop(seconds=MASTER_LOOP_INTERVAL_SECONDS)
-    async def _master_loop(self) -> None:
-        """Wake up every 30 s, find due tasks, and spawn them concurrently."""
-        due = await self.repo.get_due()
-        if not due:
-            return
-
+        # <<REDACTED 26 lines>>
         due_ids = [t["id"] for t in due]
         logger.info("SchedulerCog: %d task(s) due (ids=%s)", len(due), due_ids)
-        for task in due:
-            task_id: int = task["id"]
-            if task_id in self._running:
+        # <<REDACTED 3 lines>>
                 logger.debug("%s still running — skipping", log_ctx(task_id=task_id))
-                continue
-
-            # Advance next_run_at *before* spawning to prevent duplicate runs
-            # if the loop fires again before the task finishes.
-            await self.repo.update_next_run(task_id, interval_seconds=task["interval_seconds"])
-
-            asyncio.create_task(
-                self._run_task(task),
+                # <<REDACTED 8 lines>>
                 name=f"clord-scheduler-{task_id}",
-            )
-
-    @_master_loop.before_loop
-    async def _before_master_loop(self) -> None:
-        await self.bot.wait_until_ready()
-
+            # <<REDACTED 6 lines>>
     async def _resolve_tmux_manager(self, channel_id: int, *, thread_id: int | None):
         """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
         from .channel_repo import ChannelRepoCog
@@ -144,42 +65,31 @@ class SchedulerCog(commands.Cog):
                 exc_info=True,
             )
 
-    async def _run_task(self, task: dict) -> None:
-        """Execute a single scheduled task in a Discord thread."""
+    # <<REDACTED 2 lines>>
         from ..claude.tmux_runner import TmuxClaudeRunner
 
-        task_id: int = task["id"]
+        # <<REDACTED 1 lines>>
         ctx = log_ctx(task_id=task_id, channel_id=task["channel_id"])
-        self._running.add(task_id)
+        # <<REDACTED 1 lines>>
         logger.info("%s _run_task: enter (name=%s)", ctx, task["name"])
-        try:
-            channel = self.bot.get_channel(task["channel_id"])
-            if channel is None:
+        # <<REDACTED 3 lines>>
                 logger.warning("%s channel not found (name=%s)", ctx, task["name"])
-                return
-            if not isinstance(channel, discord.TextChannel):
+                # <<REDACTED 2 lines>>
                 logger.warning("%s channel is not a TextChannel", ctx)
-                return
-
+                # <<REDACTED 2 lines>>
             # A scheduled task targets a channel, never a thread (#600 audit).
             tmux = await self._resolve_tmux_manager(channel.id, thread_id=None)
             if tmux is None:
                 logger.warning("%s no tmux manager (name=%s)", ctx, task["name"])
                 return
 
-            # Post a starter message first so the thread appears in the channel
-            # timeline and shows up in the left sidebar under the parent channel.
-            # channel.create_thread() without a message only appears in the
-            # Threads panel (🧵), not in the channel list.
-            starter = await channel.send(f"🔄 **[Scheduled]** `{task['name']}`")
+            # <<REDACTED 5 lines>>
             archive_minutes = await resolve_auto_archive_duration(
                 getattr(self.bot, "settings_repo", None)
             )
-            thread = await starter.create_thread(
-                name=f"[Scheduled] {task['name']}",
+            # <<REDACTED 2 lines>>
                 auto_archive_duration=archive_minutes,
-            )
-
+            # <<REDACTED 2 lines>>
             working_dir = task.get("working_dir") or self.runner.working_dir
 
             # #621: create the tmux window BEFORE building the runner.  This
@@ -231,10 +141,9 @@ class SchedulerCog(commands.Cog):
                 dangerously_skip_permissions=True,
                 effort=effort_for_launch(model, turn.effort if turn else self.runner.effort),
             )
-
-            registry = getattr(self.bot, "session_registry", None)
+# <<REDACTED 2 lines>>
             run_config = RunConfig(
-                thread=thread,
+                # <<REDACTED 1 lines>>
                 runner=runner,
                 # #687: persist the session row. Without it the thread is
                 # UNTRACKED to :mod:`c_lord.session_resume`, so every reply to a
@@ -249,9 +158,7 @@ class SchedulerCog(commands.Cog):
                 # it needs the same allowlist to gate them.
                 authorizer=getattr(self.bot, "authorizer", None),
                 working_dir=working_dir,
-                prompt=task["prompt"],
-                session_id=None,
-                registry=registry,
+                # <<REDACTED 3 lines>>
                 # #480: scheduled turns have no human poster — fall back to
                 # the bot owner so a question-mode pause still pings someone
                 # (#525: unless this deployment turned that fallback off).
@@ -262,7 +169,7 @@ class SchedulerCog(commands.Cog):
                 failure_notify_id=owner_notify_id(self.bot, kind="failure"),
                 # #917: the turn-end event names the task that started the run.
                 started_by=StartedBy("scheduler", str(task["id"]), str(task["name"])),
-            )
+            # <<REDACTED 1 lines>>
             # #754: a scheduled run is a live session like any other, so it is
             # on 📊 Session Status while it runs. It used to be invisible there.
             # Labelled by its (already public) name — the prompt stays private.
@@ -278,10 +185,7 @@ class SchedulerCog(commands.Cog):
                     ctx,
                     task["name"],
                     run_config.outcome.error,
-                )
-
-        except Exception:
+                # <<REDACTED 3 lines>>
             logger.exception("%s task failed (name=%s)", ctx, task["name"])
-        finally:
-            self._running.discard(task_id)
+        # <<REDACTED 2 lines>>
             logger.info("%s _run_task: exit", ctx)

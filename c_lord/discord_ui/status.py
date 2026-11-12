@@ -1,5 +1,4 @@
-"""Emoji reaction status manager.
-
+# <<REDACTED 2 lines>>
 Shows Claude's per-turn status as a single reaction on the user's trigger
 message: 🟢 *running* while the turn is active, 🟡 *waiting* once it's the
 user's turn again. ❌ error and ⏳/⚠️ stall are temporary overrides shown
@@ -12,21 +11,12 @@ so they stay responsive even under heavy use (#246). The thread-name lamp
 consistent "sidebar" view driven by the state-sync poll — it is no longer
 flipped per turn, which is what saturated Discord's ~2-renames-per-10-min
 limit and made the lamp stick (#236 regression).
-"""
-
-from __future__ import annotations
-
-import asyncio
-import logging
+# <<REDACTED 6 lines>>
 from collections.abc import Awaitable, Callable
-
-import discord
-
+# <<REDACTED 3 lines>>
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..turn_activity import turn_activity
-
-logger = logging.getLogger(__name__)
-
+# <<REDACTED 3 lines>>
 # Per-turn lamp (the message reaction).
 EMOJI_RUNNING = "\U0001f7e2"  # 🟢 — Claude is actively working
 EMOJI_WAITING = "\U0001f7e1"  # 🟡 — turn finished, your move
@@ -42,11 +32,7 @@ _OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD)
 # What a reaction call can fail with without the turn being in trouble (#904).
 _LAMP_FAILURES = DISCORD_CALL_FAILURES
 
-STALL_SOFT_SECONDS = 10
-STALL_HARD_SECONDS = 30
-
-
-class StatusManager:
+# <<REDACTED 5 lines>>
     """Manages a single emoji reaction on a Discord message to show Claude's
     per-turn status.
 
@@ -59,28 +45,25 @@ class StatusManager:
     override), and the reaction rate-limit bucket easily absorbs that. Repeated
     "still working" calls collapse to a no-op because the target equals the
     current reaction.
-    """
-
+    # <<REDACTED 2 lines>>
     def __init__(self, message: discord.Message, *, thread_id: int | None = None) -> None:
-        self._message = message
+        # <<REDACTED 1 lines>>
         # #769: the thread whose transcript activity keeps this turn off ⏳/⚠️.
         # None (older callers) = no transcript feed; the lamp then only knows
         # the turn start, as before.
         self._thread_id = thread_id
         self._unsubscribe_activity: Callable[[], None] | None = None
         self._activity_listener: Callable[[], None] | None = None
-        self._current_emoji: str | None = None
-        self._stall_task: asyncio.Task | None = None
+        # <<REDACTED 2 lines>>
         # #799: the task running the turn. A turn cancelled by the next message
         # never reaches set_done()/set_error(), so the monitor watches this to
         # learn that the turn is over.
         self._turn_task: asyncio.Task | None = None
         self._turn_active = False
-        self._lock = asyncio.Lock()
+        # <<REDACTED 1 lines>>
         # #871: a reaction call failed, so Discord may show more than we think.
         self._out_of_sync = False
-        self._last_activity = asyncio.get_running_loop().time()
-
+        # <<REDACTED 2 lines>>
     @classmethod
     def adopt(
         cls, message: discord.Message, emoji: str, *, thread_id: int | None = None
@@ -107,8 +90,7 @@ class StatusManager:
         """🟢 — Claude is actively working (turn start)."""
         await self._set_reaction(EMOJI_RUNNING)
         await self._start_stall_timer()
-
-    async def set_done(self) -> None:
+# <<REDACTED 2 lines>>
         """🟡 — the turn finished; it's the user's turn now."""
         await self.set_waiting()
 
@@ -116,19 +98,16 @@ class StatusManager:
         """🟡 — flip the lamp to *waiting for user input*."""
         await self._stop_stall_timer()
         await self._set_reaction(EMOJI_WAITING, final=True)
-
-    async def set_error(self) -> None:
+# <<REDACTED 2 lines>>
         """❌ — the turn ended in an error (temporary override, left visible)."""
         await self._stop_stall_timer()
         await self._set_reaction(EMOJI_ERROR, final=True)
-
-    async def cleanup(self) -> None:
+# <<REDACTED 2 lines>>
         """Remove the current status reaction."""
         await self._stop_stall_timer()
         async with self._lock:
             await self._remove_current_locked()
-            self._current_emoji = None
-
+            # <<REDACTED 2 lines>>
     async def mark_abandoned(self) -> None:
         """Nobody can end this turn any more: ⚠️, and stop watching (#992).
 
@@ -160,7 +139,7 @@ class StatusManager:
         call failed, what Discord shows may differ from what we recorded, so the
         final paint also takes off every other lamp of ours (#871).
         """
-        async with self._lock:
+        # <<REDACTED 1 lines>>
             if only_while_running and not self._turn_active:
                 return
             if self._current_emoji != emoji:
@@ -206,23 +185,23 @@ class StatusManager:
         for stray in _OPEN_LAMPS:
             if stray != keep:
                 await self._react(self._message.remove_reaction(stray, guild.me), "sweep", stray)
-
+# <<REDACTED 1 lines>>
     async def _remove_current_locked(self) -> None:
         """Remove the bot's current reaction. Caller must hold ``self._lock``."""
         if not self._current_emoji:
             return
         guild = getattr(self._message, "guild", None)
-        if guild:
+        # <<REDACTED 1 lines>>
             await self._react(
                 self._message.remove_reaction(self._current_emoji, guild.me),
                 "remove",
                 self._current_emoji,
             )
-
+# <<REDACTED 1 lines>>
     async def _start_stall_timer(self) -> None:
-        """Start the stall detection timer."""
+        # <<REDACTED 1 lines>>
         await self._stop_stall_timer()
-        self._last_activity = asyncio.get_running_loop().time()
+        # <<REDACTED 1 lines>>
         self._turn_active = True
         self._turn_task = asyncio.current_task()
         if self._thread_id is not None:
@@ -232,17 +211,14 @@ class StatusManager:
             self._unsubscribe_activity = turn_activity.subscribe(
                 self._thread_id, self._activity_listener
             )
-        self._stall_task = asyncio.create_task(self._stall_monitor())
-
-    def _reset_stall_timer(self) -> None:
+        # <<REDACTED 3 lines>>
         """Reset the stall timer (activity detected).
 
         Synchronous on purpose — the transcript mirror calls it for every event
         it reads (#769). A ⏳/⚠️ already on the message is taken back by the
         monitor on its next tick.
         """
-        self._last_activity = asyncio.get_running_loop().time()
-
+        # <<REDACTED 2 lines>>
     async def _stop_stall_timer(self) -> None:
         """Stop the stall monitor and *wait for it to be gone* (#718).
 
@@ -263,12 +239,9 @@ class StatusManager:
         # ``asyncio.wait`` waits without re-raising the monitor's CancelledError
         # (and without swallowing a cancellation aimed at *us*).
         await asyncio.wait({task})
-
-    async def _stall_monitor(self) -> None:
+# <<REDACTED 2 lines>>
         """Monitor for stall conditions and override the lamp accordingly."""
-        soft_warned = False
-        while True:
-            await asyncio.sleep(2)
+        # <<REDACTED 3 lines>>
             if not self._turn_active:
                 return
             if self._turn_task is not None and self._turn_task.done():
@@ -286,8 +259,7 @@ class StatusManager:
                 # until it returns. That is work, not a stall: the progress
                 # line says 作業中 for the same reason (#757).
                 self._reset_stall_timer()
-            elapsed = asyncio.get_running_loop().time() - self._last_activity
-
+            # <<REDACTED 2 lines>>
             if elapsed < STALL_SOFT_SECONDS and self._current_emoji in (
                 EMOJI_STALL_SOFT,
                 EMOJI_STALL_HARD,
@@ -303,10 +275,6 @@ class StatusManager:
                 # same thing — a warning for what is a normal long think, and
                 # repeatable several times in one turn.
                 await self._paint_stall(EMOJI_STALL_HARD)
-            elif (
-                elapsed >= STALL_SOFT_SECONDS
-                and not soft_warned
-                and self._current_emoji != EMOJI_STALL_HARD
-            ):
+            # <<REDACTED 5 lines>>
                 await self._paint_stall(EMOJI_STALL_SOFT)
-                soft_warned = True
+                # <<REDACTED 1 lines>>

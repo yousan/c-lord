@@ -1,38 +1,15 @@
-"""Skill command Cog.
-
-Provides a /skill slash command with autocomplete that lists all available
-Claude Code skills from ~/.claude/skills/ and executes the selected one.
-
-Usage:
-    /skill [name: goodmorning]                → runs /goodmorning in Claude Code
-    /skill [name: todoist] [args: filter "today"]  → runs /todoist filter "today"
-
-When used inside an existing thread (under the claude channel), the skill
-resumes the thread's session instead of creating a new thread.
-
-Skills are lazily reloaded every 60 seconds so new skills appear without restart.
-"""
-
-from __future__ import annotations
-
+# <<REDACTED 17 lines>>
 import asyncio
 import contextlib
-import logging
-import re
-import time
+# <<REDACTED 3 lines>>
 from collections.abc import Awaitable, Callable
-from pathlib import Path
+# <<REDACTED 1 lines>>
 from typing import TYPE_CHECKING
-
-import discord
-from discord import app_commands
-from discord.ext import commands
-
+# <<REDACTED 5 lines>>
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..command_gate import is_message_authorized
-from ..concurrency import SessionRegistry
-from ..database.repository import SessionRepository
+# <<REDACTED 2 lines>>
 from ..database.settings_repo import SettingsRepository
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.authorization import Authorizer
@@ -44,101 +21,32 @@ from ..thread_settings import resolve_auto_archive_duration
 from ..turn_events import StartedBy
 from ..utils.logger import log_ctx
 from ._run_helper import has_other_run_in_flight, run_claude_with_config
-from .run_config import RunConfig
-
+# <<REDACTED 2 lines>>
 if TYPE_CHECKING:
     from ..session_dir import SessionDirManager
     from ..tmux import TmuxSessionManager
-
-logger = logging.getLogger(__name__)
-
+# <<REDACTED 3 lines>>
 # Callbacks the shared skill core uses to stay agnostic of slash vs text entry.
 Responder = Callable[..., Awaitable[None]]
 Acknowledger = Callable[[], Awaitable[None]]
 
-# YAML frontmatter pattern to extract name/description from SKILL.md
-_FRONTMATTER_RE = re.compile(r"^---[ \t]*\n(?P<body>.*?)^---", re.DOTALL | re.MULTILINE)
-_FIELD_RE = re.compile(r"^(?P<key>\w[\w-]*):\s*(?P<value>.+)$", re.MULTILINE)
-
-# How often to re-scan the skills directory (seconds)
-SKILL_RELOAD_INTERVAL = 60.0
-
-
-def _parse_skill_meta(skill_dir: Path) -> dict[str, str] | None:
-    """Read SKILL.md frontmatter and return {name, description} or None."""
-    skill_md = skill_dir / "SKILL.md"
-    if not skill_md.exists():
-        return None
-    try:
-        text = skill_md.read_text(encoding="utf-8")
-        m = _FRONTMATTER_RE.match(text)
-        if not m:
-            return None
-        fields = dict(_FIELD_RE.findall(m.group("body")))
-        name = fields.get("name", skill_dir.name).strip()
-        description = fields.get("description", "").strip()
-        return {"name": name, "description": description}
-    except OSError:
-        logger.warning("Failed to read %s", skill_md)
-        return None
-
-
-def _load_skills(skills_dir: Path) -> list[dict[str, str]]:
-    """Scan skills_dir and return sorted list of {name, description}."""
-    skills: list[dict[str, str]] = []
-    if not skills_dir.is_dir():
-        logger.warning("Skills directory not found: %s", skills_dir)
-        return skills
-
-    for entry in sorted(skills_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        meta = _parse_skill_meta(entry)
-        if meta:
-            skills.append(meta)
-
-    logger.info("Loaded %d skills from %s", len(skills), skills_dir)
-    return skills
-
-
-class SkillCommandCog(commands.Cog):
-    """Cog that exposes Claude Code skills as a /skill slash command."""
-
-    def __init__(
-        self,
-        bot: commands.Bot,
-        repo: SessionRepository,
+# <<REDACTED 52 lines>>
         runner: ClaudeConfig,
-        claude_channel_id: int,
-        skills_dir: Path | str | None = None,
-        allowed_user_ids: set[int] | None = None,
-        registry: SessionRegistry | None = None,
+        # <<REDACTED 4 lines>>
         allowed_role_name: str | None = None,
         authorizer: Authorizer | None = None,
         settings_repo: SettingsRepository | None = None,
-    ) -> None:
-        self.bot = bot
+    # <<REDACTED 2 lines>>
         # #927: where /model's settings live. Optional (zero-config) — see
         # :meth:`_settings_repo_for_turn` for the fallback.
         self._settings_repo = settings_repo
-        self.repo = repo
-        self.runner = runner
-        self.claude_channel_id = claude_channel_id
-        self._allowed_user_ids = allowed_user_ids
+        # <<REDACTED 4 lines>>
         self._allowed_role_name = allowed_role_name
         # #713: the one allowlist rule, shared with every other gate (#466's
         # DRY, finished). ``setup_bridge`` passes the instance ClaudeChatCog
         # uses, so the owner resolved at startup applies to /skill too.
         self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
-        self._registry = registry or getattr(bot, "session_registry", None)
-
-        # Default to ~/.claude/skills/
-        if skills_dir is None:
-            skills_dir = Path.home() / ".claude" / "skills"
-        self._skills_dir = Path(skills_dir)
-        self._skills = _load_skills(self._skills_dir)
-        self._last_loaded: float = time.monotonic()
-
+        # <<REDACTED 9 lines>>
     async def _resolve_session_dir_manager(
         self, channel_id: int, thread_id: int | None = None
     ) -> SessionDirManager | None:
@@ -166,13 +74,7 @@ class SkillCommandCog(commands.Cog):
             return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
-    def _maybe_reload_skills(self) -> None:
-        """Reload skills from disk if SKILL_RELOAD_INTERVAL has elapsed."""
-        now = time.monotonic()
-        if now - self._last_loaded >= SKILL_RELOAD_INTERVAL:
-            self._skills = _load_skills(self._skills_dir)
-            self._last_loaded = now
-
+    # <<REDACTED 7 lines>>
     def _is_authorized(self, member: discord.Member | discord.User | int) -> bool:
         """Check if a member/user is authorized.
 
@@ -185,32 +87,7 @@ class SkillCommandCog(commands.Cog):
         if isinstance(member, int):
             return self._authorizer.is_allowed_user_id(member)
         return self._authorizer.is_allowed(member)
-
-    async def _skill_name_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        """Return up to 25 matching skill names for autocomplete."""
-        self._maybe_reload_skills()
-
-        current_lower = current.lower()
-        matches = [
-            s
-            for s in self._skills
-            if current_lower in s["name"].lower() or current_lower in s["description"].lower()
-        ]
-        choices = []
-        for s in matches[:25]:
-            label = s["name"]
-            if s["description"]:
-                short_desc = s["description"][:60]
-                if len(s["description"]) > 60:
-                    short_desc += "…"
-                label = f"{s['name']} — {short_desc}"
-            choices.append(app_commands.Choice(name=label[:100], value=s["name"]))
-        return choices
-
+# <<REDACTED 26 lines>>
     def _earlier_triggers_forgetter(
         self, thread_id: int, mirror_cog: object, prior: set[int | None]
     ) -> Callable[[], Awaitable[None]]:
@@ -347,10 +224,7 @@ class SkillCommandCog(commands.Cog):
             )
         return turn, True
 
-    def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:
-        """Check if the channel is a thread under the configured claude channel."""
-        return isinstance(channel, discord.Thread) and channel.parent_id == self.claude_channel_id
-
+    # <<REDACTED 4 lines>>
     async def _prepare_workspace(
         self,
         *,
@@ -416,16 +290,16 @@ class SkillCommandCog(commands.Cog):
         return True, working_dir
 
     async def _run_skill_impl(
-        self,
+        # <<REDACTED 1 lines>>
         *,
         channel: object,
         user: discord.Member | discord.User,
-        name: str,
+        # <<REDACTED 1 lines>>
         args: str | None,
         respond: Responder,
         ack: Acknowledger,
         message: discord.Message | None = None,
-    ) -> None:
+    # <<REDACTED 1 lines>>
         """Shared core for the ``/skill`` slash command and the ``!skill`` text twin.
 
         ``respond`` posts a message the way the caller needs (interaction
@@ -446,31 +320,15 @@ class SkillCommandCog(commands.Cog):
         )
         if not authorized:
             await respond("You don't have permission to use this command.", ephemeral=True)
-            return
-
-        # Validate skill name — only alphanumeric, hyphens, underscores
-        if not re.match(r"^[\w-]+$", name):
+            # <<REDACTED 4 lines>>
             await respond(f"Invalid skill name: `{name}`", ephemeral=True)
-            return
-
-        # Lazy reload before matching
-        self._maybe_reload_skills()
-
-        matched = next((s for s in self._skills if s["name"] == name), None)
-        if not matched:
+            # <<REDACTED 7 lines>>
             await respond(
-                f"Skill `{name}` not found. Use `/skill` with autocomplete.",
-                ephemeral=True,
-            )
-            return
-
-        # Build the prompt: /name [args]
+                # <<REDACTED 6 lines>>
         prompt = f"/{name} {args}" if args else f"/{name}"
-
+# <<REDACTED 1 lines>>
         await ack()
-
-        # In-thread mode: if invoked inside a thread under the claude channel, resume it
-        if isinstance(channel, discord.Thread) and self._is_claude_thread(channel):
+# <<REDACTED 3 lines>>
             # #811: another c-lord's thread — running here would take it over.
             foreign = await foreign_owner_notice_for(self.bot, self.repo, channel)
             if foreign is not None:
@@ -484,11 +342,7 @@ class SkillCommandCog(commands.Cog):
                 await respond("⚠️ tmux is not configured for this channel.", ephemeral=True)
                 return
 
-            session_id = None
-            record = await self.repo.get(channel.id)
-            if record:
-                session_id = record.session_id
-
+            # <<REDACTED 5 lines>>
             # #1234 (W57): what is on record *now*, before the workspace is
             # prepared — memory, row and pending (#1262: the memory too, since the
             # row may still be waiting for that message's write). These are
@@ -502,9 +356,9 @@ class SkillCommandCog(commands.Cog):
                 self.repo.pending_trigger(channel.id),
             }
 
-            display = f"`/{name} {args}`" if args else f"`/{name}`"
+            # <<REDACTED 1 lines>>
             await respond(f"Running {display} in this thread…")
-
+# <<REDACTED 1 lines>>
             # #927: before the workspace — a restart for a new pair closes the
             # window, and _prepare_workspace is what opens it again.
             turn, restarted = await self._fix_turn(channel, parent_channel_id, tmux)
@@ -528,14 +382,7 @@ class SkillCommandCog(commands.Cog):
             on_prompt_sent = self._earlier_triggers_forgetter(channel.id, mirror_cog, prior)
             # #754: a /skill run is on 📊 Session Status while it runs.
             async with board_turn(dashboard_of(self.bot), channel.id, prompt):
-                await run_claude_with_config(
-                    RunConfig(
-                        thread=channel,
-                        runner=runner,
-                        repo=self.repo,
-                        prompt=prompt,
-                        session_id=session_id,
-                        registry=self._registry,
+                # <<REDACTED 8 lines>>
                         session_dir_manager=sdm,
                         tmux_manager=tmux,
                         working_dir=working_dir,
@@ -547,16 +394,11 @@ class SkillCommandCog(commands.Cog):
                         notify_user_id=user.id,
                         started_by=StartedBy("user", str(user.id)),
                         on_prompt_sent=on_prompt_sent,
-                    )
-                )
-            return
-
-        # New-thread mode: create a thread in the claude channel
+                    # <<REDACTED 5 lines>>
         claude_channel = self.bot.get_channel(self.claude_channel_id)
         if not isinstance(claude_channel, discord.TextChannel):
             await respond("Claude channel not found.", ephemeral=True)
-            return
-
+            # <<REDACTED 2 lines>>
         # Resolve per-channel managers
         sdm = await self._resolve_session_dir_manager(claude_channel.id)
         # New-thread mode: no thread exists yet (#600 audit).
@@ -571,20 +413,16 @@ class SkillCommandCog(commands.Cog):
             )
             return
 
-        thread_name = f"/{name} {args}" if args else f"/{name}"
-        # Discord thread names are max 100 chars
+        # <<REDACTED 2 lines>>
         archive_minutes = await resolve_auto_archive_duration(
             getattr(self.bot, "settings_repo", None)
         )
         thread = await claude_channel.create_thread(
-            name=thread_name[:100],
-            type=discord.ChannelType.public_thread,
+            # <<REDACTED 2 lines>>
             auto_archive_duration=archive_minutes,
-        )
-
-        display = f"`/{name} {args}`" if args else f"`/{name}`"
+        # <<REDACTED 3 lines>>
         await respond(f"Running {display} → {thread.mention}")
-
+# <<REDACTED 1 lines>>
         # #927: a new thread has no running Claude, so this never restarts.
         turn, _ = await self._fix_turn(thread, claude_channel.id, tmux)
         ready, working_dir = await self._prepare_workspace(
@@ -595,14 +433,7 @@ class SkillCommandCog(commands.Cog):
         runner = self._make_runner(tmux, thread.id, working_dir, turn=turn)
         # #754: see above.
         async with board_turn(dashboard_of(self.bot), thread.id, prompt):
-            await run_claude_with_config(
-                RunConfig(
-                    thread=thread,
-                    runner=runner,
-                    repo=self.repo,
-                    prompt=prompt,
-                    session_id=None,
-                    registry=self._registry,
+            # <<REDACTED 8 lines>>
                     session_dir_manager=sdm,
                     tmux_manager=tmux,
                     working_dir=working_dir,
@@ -611,22 +442,7 @@ class SkillCommandCog(commands.Cog):
                     # #480: ping the invoking user if a question-mode pause blocks the skill.
                     notify_user_id=user.id,
                     started_by=StartedBy("user", str(user.id)),
-                )
-            )
-
-    @app_commands.command(name="skill", description="Run a Claude Code skill")
-    @app_commands.describe(
-        name="Skill name (type to filter)",
-        args="Optional arguments to pass to the skill",
-    )
-    @app_commands.autocomplete(name=_skill_name_autocomplete)
-    async def run_skill(
-        self,
-        interaction: discord.Interaction,
-        name: str,
-        args: str | None = None,
-    ) -> None:
-        """Run a Claude Code skill by name, optionally with arguments."""
+                # <<REDACTED 16 lines>>
         # Before defer, validation errors go on the initial response (instant,
         # ephemeral). After defer, everything goes through followup — and an
         # ephemeral one stays ephemeral (#748, see slash_io).

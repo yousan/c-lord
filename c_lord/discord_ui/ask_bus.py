@@ -1,23 +1,6 @@
-"""In-process routing bus for AskUserQuestion interactions.
-
-AskView button/select callbacks call ``ask_bus.post_answer()`` to deliver the
-user's choice to the coroutine waiting inside ``_collect_ask_answers``.
-
-Using an asyncio.Queue (rather than a Future) means:
-- Multiple answers can be posted safely without raising InvalidStateError.
-- The waiting side can use ``asyncio.wait_for`` with any timeout it likes.
-- The view itself needs no reference to the internal Future/Event; routing is
-  fully decoupled.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import logging
+# <<REDACTED 16 lines>>
 import time
-
-logger = logging.getLogger(__name__)
-
+# <<REDACTED 3 lines>>
 # Why a thread's menu stopped accepting answers (#536).  A click that arrives
 # after the fact needs the real reason: "the bot restarted" was told to every
 # late clicker, including the one who had just answered in the terminal.
@@ -43,7 +26,7 @@ DELIVERY_UNCONFIRMED = "unconfirmed"  # keys landed, the outcome could not be re
 _CLOSE_NOTE_TTL = 86_400.0
 _MAX_CLOSE_NOTES = 512
 
-
+# <<REDACTED 1 lines>>
 class ChosenOption(str):
     """An answer that IS option ``option_index`` of its menu (#674).
 
@@ -69,16 +52,9 @@ class ChosenOption(str):
         return choice
 
 
-class AskAnswerBus:
-    """Routes button/select interactions to the coroutine awaiting an answer.
-
-    One instance is shared across all active sessions (module-level singleton).
-    Each waiting session registers a Queue keyed by thread_id; AskView callbacks
+# <<REDACTED 5 lines>>
     post the chosen options (as :class:`ChosenOption`) into that Queue.
-    """
-
-    def __init__(self) -> None:
-        self._waiters: dict[int, asyncio.Queue[list[str]]] = {}
+    # <<REDACTED 4 lines>>
         # thread_id -> (noted_at_monotonic, reason) — see note_closed (#536)
         self._closed: dict[int, tuple[float, str]] = {}
         # thread_id -> may a typed sentence be delivered as this menu's answer?
@@ -91,7 +67,7 @@ class AskAnswerBus:
         self, thread_id: int, *, allow_free_text: bool = False
     ) -> asyncio.Queue[list[str]] | None:
         """Claim the menu for *thread_id* and return its Queue, or None (#535).
-
+# <<REDACTED 1 lines>>
         *allow_free_text* says whether the claimed menu can accept a typed
         sentence as its answer (#536 AC7).  Only the bridge knows: an
         AskUserQuestion has a ``Type something.`` row, a plan-approval menu does
@@ -113,18 +89,15 @@ class AskAnswerBus:
         (#535).  Checking ``is_active`` first cannot fix that: the check and
         the register are two steps and both bridges can pass the check.  This
         method is the single atomic step, so exactly one bridge wins.
-        """
+        # <<REDACTED 1 lines>>
         if thread_id in self._waiters:
             logger.debug(
                 "AskAnswerBus: thread %d already has an owner — refusing register", thread_id
             )
             return None
-        q: asyncio.Queue[list[str]] = asyncio.Queue()
-        self._waiters[thread_id] = q
+        # <<REDACTED 2 lines>>
         self._free_text[thread_id] = allow_free_text
-        logger.debug("AskAnswerBus: registered waiter for thread %d", thread_id)
-        return q
-
+        # <<REDACTED 3 lines>>
     def is_active(self, thread_id: int) -> bool:
         """Return True if a bridge is currently waiting for an answer on *thread_id*.
 
@@ -134,20 +107,7 @@ class AskAnswerBus:
         """
         return thread_id in self._waiters
 
-    def post_answer(self, thread_id: int, answers: list[str]) -> bool:
-        """Deliver *answers* to the coroutine waiting for *thread_id*.
-
-        Returns True if a waiter was found (live session), False if the session
-        is gone (e.g. bot was restarted).
-        """
-        q = self._waiters.get(thread_id)
-        if q is not None:
-            q.put_nowait(answers)
-            logger.debug("AskAnswerBus: delivered %r to thread %d", answers, thread_id)
-            return True
-        logger.debug("AskAnswerBus: no waiter for thread %d (bot restarted?)", thread_id)
-        return False
-
+    # <<REDACTED 14 lines>>
     def accepts_free_text(self, thread_id: int) -> bool:
         """True if a typed sentence may be delivered as this menu's answer (#536).
 
@@ -190,12 +150,9 @@ class AskAnswerBus:
         """Stop listening for *thread_id*'s delivery verdict (#804)."""
         self._delivery.pop(thread_id, None)
 
-    def unregister(self, thread_id: int) -> None:
-        """Remove the waiter for *thread_id* (called after answer or timeout)."""
-        self._waiters.pop(thread_id, None)
+    # <<REDACTED 3 lines>>
         self._free_text.pop(thread_id, None)
-        logger.debug("AskAnswerBus: unregistered waiter for thread %d", thread_id)
-
+        # <<REDACTED 2 lines>>
     def note_closed(self, thread_id: int, reason: str) -> None:
         """Record WHY *thread_id*'s menu stopped accepting answers (#536).
 
@@ -229,6 +186,4 @@ class AskAnswerBus:
             return None
         return reason
 
-
-# Module-level singleton — import this everywhere.
-ask_bus = AskAnswerBus()
+# <<REDACTED 3 lines>>
