@@ -8,6 +8,10 @@ dynamic = ["version"]
 description = "Connect Claude Code to Discord and GitHub — interactive chat, CI/CD automation, and workflow integration"
 readme = "README.md"
 license = {text = "MIT"}
+# Both files ship in the sdist and the wheel. NOTICE carries the copyright notice and
+# license text of claude-code-discord-bridge, the code c-lord started from — its
+# MIT license requires that they travel with every copy.
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = [
     "discord.py>=2.4,<3.0",

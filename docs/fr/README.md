@@ -807,6 +807,8 @@ La CI exécute ces vérifications sur Python 3.10, 3.11 et 3.12. Elles utilisent
 
 Le paragraphe ci-dessus décrit le projet amont, claude-code-discord-bridge, qui a fourni à c-lord son architecture initiale sous licence MIT. Ce projet dérivé est désormais maintenu par [@yousan](https://github.com/yousan), qui définit les exigences, relit les pull requests et approuve toutes les modifications, tandis que Claude Code se charge de l'implémentation.
 
+**Merci à [@ebibibi](https://github.com/ebibibi).** c-lord est parti du code de [claude-code-discord-bridge](https://github.com/ebibibi/claude-code-discord-bridge), publié par Masahiko Ebisuda sous licence MIT. Sa mention de copyright et le texte de sa licence sont conservés dans [NOTICE](../../NOTICE).
+
 Au quotidien, cela se passe ainsi. Une modification commence par une issue assortie de critères d'acceptation. Claude Code — qui tourne le plus souvent dans un fil c-lord, si bien que c-lord est construit avec c-lord — écrit un test qui échoue, le fait passer, montre la modification en fonctionnement sur un bot de staging avec des captures d'écran, puis ouvre une pull request. Deux vérifications obligatoires protègent `main`, et une pull request n'est fusionnée que lorsque chaque point de la [Definition of Done](../../CLAUDE.md#definition-of-done-dod--single-source-of-truth) est satisfait.
 
 L'historique propre à c-lord commence le 2026-02-22 par une copie de ce projet amont. Les rapports de bugs et les pull requests sont les bienvenus, qu'ils viennent de personnes ou d'agents.
@@ -827,4 +829,4 @@ EbiBot est le bot personnel d'ebibibi, construit sur le projet amont claude-code
 
 ## Licence
 
-[MIT](../../LICENSE)
+[MIT](../../LICENSE). La mention de copyright et la licence du code dont c-lord est parti se trouvent dans [NOTICE](../../NOTICE).

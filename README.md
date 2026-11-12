@@ -800,6 +800,8 @@ CI runs those checks on Python 3.10, 3.11 and 3.12. They use mocks, so green CI 
 
 **This codebase is developed by [Claude Code](https://docs.anthropic.com/en/docs/claude-code)**, Anthropic's AI coding agent. The original foundation, [`claude-code-discord-bridge`](https://github.com/ebibibi/claude-code-discord-bridge), was created by [@ebibibi](https://github.com/ebibibi) (Masahiko Ebisuda) and provided this project with its initial architecture under the MIT License. This derivative is now maintained by [@yousan](https://github.com/yousan), who defines requirements, reviews pull requests, and approves all changes — Claude Code does the implementation.
 
+**Thank you, [@ebibibi](https://github.com/ebibibi).** c-lord started from the code of [claude-code-discord-bridge](https://github.com/ebibibi/claude-code-discord-bridge), which Masahiko Ebisuda published under the MIT License. Its copyright notice and license text are kept in [NOTICE](NOTICE).
+
 Day to day that looks like this. A change starts as an Issue with acceptance criteria. Claude Code — usually running in a c-lord thread, so c-lord is built with c-lord — writes a failing test, makes it pass, shows the change working on a staging bot with screenshots, and opens a pull request. Two required checks guard `main`, and a pull request merges only when every item of the [Definition of Done](CLAUDE.md#definition-of-done-dod--single-source-of-truth) is met.
 
 c-lord's own history begins on 2026-02-22 with a copy of that upstream project. Bug reports and pull requests are welcome, from people and from agents alike.
@@ -814,4 +816,4 @@ c-lord's own history begins on 2026-02-22 with a copy of that upstream project. 
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The copyright notice and license of the code c-lord started from are in [NOTICE](NOTICE).
