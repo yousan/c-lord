@@ -1,4 +1,4 @@
-"""Discord Bot class."""
+"""The Discord bot class c-lord runs as."""
 
 from __future__ import annotations
 
@@ -32,8 +32,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _gateway_intents() -> discord.Intents:
+    """The default intents plus the two c-lord cannot work without.
+
+    ``message_content`` to read what people type, ``guilds`` to see the
+    channels and threads it is typed in.
+    """
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guilds = True
+    return intents
+
+
 class ClaudeDiscordBot(commands.Bot):
-    """Discord bot that bridges messages to Claude Code CLI."""
+    """Carries Discord messages to the Claude Code CLI and the answers back."""
 
     def __init__(
         self,
@@ -47,29 +59,26 @@ class ClaudeDiscordBot(commands.Bot):
         tmux_manager: TmuxSessionManager | None = None,
         expected_bot_user_id: int | None = None,
     ) -> None:
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.guilds = True
-
         super().__init__(
             # Accept both "!cmd" and "@bot cmd" so the text-command twins of the
             # slash commands (#209) can be triggered by a mention as well as the
             # "!" prefix.  E2E/webhook tests use "!"; humans can use either.
             command_prefix=commands.when_mentioned_or("!"),
-            intents=intents,
+            intents=_gateway_intents(),
         )
+        # Everything below comes after super().__init__() on purpose: commands.Bot
+        # has an ``owner_id`` of its own and would reset ours to its default.
         self.channel_id = channel_id
         self.owner_id = owner_id
         # #1140: another bot's dropped ``!command`` — one INFO per channel per window.
         self._dropped_bot_command_log = LogSampler()
+        # Which threads have a session running right now.
         self.session_registry = SessionRegistry()
-        # Optional repo for AskUserQuestion restart recovery
+        # Open AskUserQuestion menus, kept so they can be re-armed after a restart.
         self.ask_repo: PendingAskRepository | None = ask_repo
-        # Populated after on_ready when the channel is resolved
+        # Built in on_ready — it needs the channel, which is unknown until then.
         self.thread_dashboard: ThreadStatusDashboard | None = None
-        # Coordination channel for multi-session awareness (optional)
         self.coordination = CoordinationService(self, coordination_channel_id)
-        # AI Lounge — casual shared space for concurrent Claude sessions (optional)
         self.lounge_repo: LoungeRepository | None = lounge_repo
         self.lounge_channel_id: int | None = lounge_channel_id
         # Session directory lifecycle manager — cleans up clone dirs after runs
@@ -247,8 +256,15 @@ class ClaudeDiscordBot(commands.Bot):
             sys.exit(1)
 
     async def on_ready(self) -> None:
-        logger.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")
+        """Announce the login, then bring up the dashboard and the slash commands.
+
+        Discord fires this again after every reconnect, so each step has to be
+        safe to repeat.
+        """
+        me = self.user
+        logger.info("Logged in as %s (ID: %s)", me, me.id if me else "?")
         logger.info("Watching channel ID: %d", self.channel_id)
+
         # Issue #323: verify identity BEFORE doing anything else.
         self._assert_expected_identity()
 
@@ -256,8 +272,6 @@ class ClaudeDiscordBot(commands.Bot):
         # ``startup_recovery`` (#671), together with the dead ⏹ Stop buttons of
         # #634 — one entry point, run from ClaudeChatCog's on_ready. It used to
         # be a second, separate call here, reading a table nothing ever wrote to.
-
-        # Initialise the thread-status dashboard once we have a live channel object
         channel = self.get_channel(self.channel_id)
         if isinstance(channel, discord.TextChannel):
             from .discord_ui.thread_dashboard import ThreadStatusDashboard
@@ -308,6 +322,7 @@ class ClaudeDiscordBot(commands.Bot):
             synced = await self.tree.sync()
             logger.info("Synced %d global slash commands (available in all guilds)", len(synced))
         except Exception:
+            # A failed sync costs the slash commands, not the bot.
             logger.exception("Failed to sync slash commands")
 
         # #570: reap tmux windows whose Claude has exited. Fire-and-forget so a
@@ -378,36 +393,6 @@ class ClaudeDiscordBot(commands.Bot):
                 after.id,
                 exc_info=True,
             )
-
-    async def _cleanup_orphaned_session_dirs(self) -> None:
-        """Remove leftover clean session directories from previous bot runs.
-
-        Runs in a background task so it does not block on_ready().
-        """
-        import asyncio
-
-        assert self.session_dir_manager is not None  # caller ensures this
-        try:
-            results = await asyncio.to_thread(
-                self.session_dir_manager.cleanup_orphaned,
-                set(),  # no active sessions at startup
-            )
-            removed = [r for r in results if r.removed]
-            skipped = [r for r in results if not r.removed and "does not exist" not in r.reason]
-            if removed:
-                logger.info(
-                    "Startup session dir cleanup: removed %d orphaned dir(s): %s",
-                    len(removed),
-                    [r.path for r in removed],
-                )
-            if skipped:
-                logger.warning(
-                    "Startup session dir cleanup: skipped %d dir(s) (dirty or locked): %s",
-                    len(skipped),
-                    [(r.path, r.reason) for r in skipped],
-                )
-        except Exception:
-            logger.exception("Error during startup session dir cleanup")
 
     def _in_flight_thread_ids(self) -> set[int]:
         """Threads with a turn running right now, as far as the bot knows.

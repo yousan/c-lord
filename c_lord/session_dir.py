@@ -2170,11 +2170,9 @@ def _is_clean(path: str) -> bool:
 
 
 def _get_commit(path: str) -> str:
-    """Return the short commit hash, or empty string on error."""
+    """Abbreviated hash of the checked-out commit, or "" when git cannot name one."""
     result = _run(["git", "rev-parse", "--short", "HEAD"], cwd=path)
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
+    return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def _is_local_repo(source: str) -> bool:
@@ -2386,10 +2384,10 @@ class SessionDirManager:
         and contain a ``.git`` directory or file.
         """
         results: list[SessionDirInfo] = []
-        base = Path(self._base_dir)
-
+        # Take the whole listing before looking at any entry, so an unreadable
+        # base directory is one error up front and not a scan cut off midway.
         try:
-            entries = list(base.iterdir())
+            entries = list(Path(self._base_dir).iterdir())
         except OSError as exc:
             logger.error("Cannot scan base_dir %s: %s", self._base_dir, exc)
             return results
@@ -2446,14 +2444,13 @@ class SessionDirManager:
         If the directory does not exist this is a no-op (returns removed=False).
         """
         path = str(Path(self._base_dir) / str(thread_id))
-        if not Path(path).is_dir():
+        if not os.path.isdir(path):
             return CleanupResult(
                 path=path,
                 thread_id=thread_id,
                 removed=False,
                 reason="session directory does not exist",
             )
-
         return self._try_remove(path, thread_id)
 
     def cleanup_orphaned(self, active_thread_ids: set[int]) -> list[CleanupResult]:
@@ -2466,6 +2463,7 @@ class SessionDirManager:
         results: list[CleanupResult] = []
         for info in self.find_session_dirs():
             if info.thread_id in active_thread_ids:
+                # Someone is using it right now — not ours to judge.
                 results.append(
                     CleanupResult(
                         path=info.path,
@@ -2475,7 +2473,6 @@ class SessionDirManager:
                     )
                 )
                 continue
-
             if info.failed:
                 results.append(
                     CleanupResult(
@@ -2500,7 +2497,6 @@ class SessionDirManager:
                     kept_work=True,
                 )
             results.append(result)
-
         return results
 
     def _try_remove(self, path: str, thread_id: int | None) -> CleanupResult:

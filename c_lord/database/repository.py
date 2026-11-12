@@ -1,4 +1,9 @@
-"""Session repository for thread-to-session mapping."""
+"""Sessions: which Claude Code session each Discord thread continues.
+
+One row of ``sessions`` per thread. Besides the row, the repository keeps a
+little in-memory state about each thread's trigger message — writes and clears
+the database refused, so that they still hold for this process and land later.
+"""
 
 from __future__ import annotations
 
@@ -10,13 +15,14 @@ from dataclasses import dataclass, fields
 import aiosqlite
 
 from ..utils.logger import log_ctx
+from . import _sqlite
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SessionRecord:
-    """A stored session mapping."""
+    """A row of ``sessions``, column for column."""
 
     thread_id: int
     session_id: str
@@ -105,7 +111,7 @@ def _record(row) -> SessionRecord:
 
 
 class SessionRepository:
-    """CRUD operations for session records."""
+    """Async access to ``sessions``, plus the per-thread trigger bookkeeping."""
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -136,18 +142,24 @@ class SessionRepository:
         self._write_order = itertools.count()
         self._latest_write: dict[int, int] = {}
 
+    async def _write(self, sql: str, params: _sqlite.Params = ()) -> _sqlite.Written:
+        """Run one statement on a connection of its own and commit it."""
+        return await _sqlite.write(self.db_path, sql, params)
+
+    async def _records(self, sql: str, params: _sqlite.Params = ()) -> list[SessionRecord]:
+        """The rows of a ``SELECT *`` as records."""
+        rows = await _sqlite.read_all(self.db_path, sql, params, named=True)
+        return [_record(row) for row in rows]
+
     async def get(self, thread_id: int) -> SessionRecord | None:
         """Get session by Discord thread ID. A swept tombstone (#818) is not one."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                f"SELECT * FROM sessions WHERE thread_id = ? AND {_LIVE}",
-                (thread_id,),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            record = _record(row)
+        found = await self._records(
+            f"SELECT * FROM sessions WHERE thread_id = ? AND {_LIVE}",
+            (thread_id,),
+        )
+        if not found:
+            return None
+        record = found[0]
         # #1254: a trigger write the database refused still holds for this process.
         if thread_id in self._unwritten_triggers:
             record.trigger_message_id = self._unwritten_triggers[thread_id]
@@ -163,14 +175,11 @@ class SessionRepository:
         ``session_id``, and when (``closed_at``) it was tidied away. ``None`` for
         a live or stopped row — those are :meth:`get`'s.
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM sessions WHERE thread_id = ? AND closed_reason = ?",
-                (thread_id, SWEPT_REASON),
-            )
-            row = await cursor.fetchone()
-            return None if row is None else _record(row)
+        found = await self._records(
+            "SELECT * FROM sessions WHERE thread_id = ? AND closed_reason = ?",
+            (thread_id, SWEPT_REASON),
+        )
+        return found[0] if found else None
 
     async def save(
         self,
@@ -181,13 +190,20 @@ class SessionRepository:
         origin: str = "discord",
         summary: str | None = None,
     ) -> SessionRecord:
-        """Create or update a session mapping."""
-        async with aiosqlite.connect(self.db_path) as db:
+        """Record that *thread_id* now continues *session_id*; return the row.
+
+        A new thread gets a new row. For a known thread the session id is
+        replaced, the other values only where one is given (``None`` keeps what
+        the row had), and the row counts as used now. Trigger writes and clears
+        that were waiting for this thread go into the same transaction.
+        """
+        async with _sqlite.connection(self.db_path) as db:
             await db.execute(
-                """INSERT INTO sessions
-                     (thread_id, session_id, working_dir, model, origin, summary)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(thread_id) DO UPDATE SET
+                """
+                INSERT INTO sessions
+                    (thread_id, session_id, working_dir, model, origin, summary)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
                      session_id = excluded.session_id,
                      working_dir = COALESCE(excluded.working_dir, sessions.working_dir),
                      model = COALESCE(excluded.model, sessions.model),
@@ -206,7 +222,8 @@ class SessionRepository:
                                  THEN NULL ELSE sessions.closed_at END,
                      closed_reason = CASE WHEN sessions.closed_reason = ?
                                      THEN NULL ELSE sessions.closed_reason END,
-                     last_used_at = datetime('now', 'localtime')""",
+                     last_used_at = datetime('now', 'localtime')
+                """,
                 (
                     thread_id,
                     session_id,
@@ -240,26 +257,18 @@ class SessionRepository:
             unwritten
         ):
             self._unwritten_triggers.pop(thread_id, None)
-
-        record = await self.get(thread_id)
-        if record is None:
+        saved = await self.get(thread_id)
+        if saved is None:
             raise RuntimeError(f"Failed to retrieve session after save for thread {thread_id}")
-        return record
+        return saved
 
     async def list_all(self, limit: int = 50) -> list[SessionRecord]:
-        """List all sessions ordered by most recently used.
-
-        Args:
-            limit: Maximum number of records to return.
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                f"SELECT * FROM sessions WHERE {_LIVE} ORDER BY last_used_at DESC LIMIT ?",
-                (limit,),
-            )
-            rows = await cursor.fetchall()
-            return [_record(row) for row in rows]
+        """Up to *limit* sessions, most recently used first. Swept tombstones
+        (#818) are not sessions and are left out."""
+        return await self._records(
+            f"SELECT * FROM sessions WHERE {_LIVE} ORDER BY last_used_at DESC LIMIT ?",
+            (limit,),
+        )
 
     async def delete(self, thread_id: int) -> bool:
         """Delete a session mapping. Returns True if a row was deleted.
@@ -277,13 +286,8 @@ class SessionRepository:
             self._latest_write,
         ):
             held.pop(thread_id, None)
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "DELETE FROM sessions WHERE thread_id = ?",
-                (thread_id,),
-            )
-            await db.commit()
-            return cursor.rowcount > 0
+        done = await self._write("DELETE FROM sessions WHERE thread_id = ?", (thread_id,))
+        return done.changed
 
     async def reset(self, thread_id: int) -> bool:
         """Clear the session_id but keep the row, so the next message starts fresh.
@@ -292,14 +296,12 @@ class SessionRepository:
         future messages into _handle_thread_reply (issue #117).
         Returns True if a row was updated, False if no row existed.
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "UPDATE sessions SET session_id = '', last_used_at = datetime('now', 'localtime')"
-                f" WHERE thread_id = ? AND {_LIVE}",
-                (thread_id,),
-            )
-            await db.commit()
-            return cursor.rowcount > 0
+        done = await self._write(
+            "UPDATE sessions SET session_id = '', last_used_at = datetime('now', 'localtime')"
+            f" WHERE thread_id = ? AND {_LIVE}",
+            (thread_id,),
+        )
+        return done.changed
 
     # ── Issue #95: thread naming redesign helpers ─────────────────────
 
@@ -309,39 +311,31 @@ class SessionRepository:
 
     async def set_topic(self, thread_id: int, topic: str, source: str = "llm") -> None:
         """Set the stable topic and topic_source for a thread."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET topic = ?, topic_source = ? WHERE thread_id = ?",
-                (topic, source, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET topic = ?, topic_source = ? WHERE thread_id = ?",
+            (topic, source, thread_id),
+        )
 
     async def set_state(self, thread_id: int, state: str) -> None:
         """Set the session state (alive/pending/dead)."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET state = ? WHERE thread_id = ?",
-                (state, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET state = ? WHERE thread_id = ?",
+            (state, thread_id),
+        )
 
     async def set_tmux_window_id(self, thread_id: int, window_id: str | None) -> None:
         """Store the tmux internal window-id (e.g. '@7') for the thread."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET tmux_window_id = ? WHERE thread_id = ?",
-                (window_id, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET tmux_window_id = ? WHERE thread_id = ?",
+            (window_id, thread_id),
+        )
 
     async def lock_topic(self, thread_id: int) -> None:
         """Mark the topic as user-locked (no further auto-rewrite)."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET auto_topic_locked = 1 WHERE thread_id = ?",
-                (thread_id,),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET auto_topic_locked = 1 WHERE thread_id = ?",
+            (thread_id,),
+        )
 
     async def set_issue_ref(self, thread_id: int, issue_ref: str | None) -> None:
         """Persist the Issue/PR number the thread is working on (Issue #414).
@@ -355,15 +349,13 @@ class SessionRepository:
         Keeping it here rather than at the call sites means every path that
         records a number (naming pass, pending drain, API) seeds the origin.
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions "
-                "   SET issue_ref = ?, "
-                "       origin_issue_ref = COALESCE(origin_issue_ref, ?) "
-                " WHERE thread_id = ?",
-                (issue_ref, issue_ref, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions "
+            "   SET issue_ref = ?, "
+            "       origin_issue_ref = COALESCE(origin_issue_ref, ?) "
+            " WHERE thread_id = ?",
+            (issue_ref, issue_ref, thread_id),
+        )
 
     async def set_origin_issue_ref(self, thread_id: int, origin_issue_ref: str) -> None:
         """Seed ``origin_issue_ref`` (#593) without touching ``issue_ref`` (#856).
@@ -373,13 +365,11 @@ class SessionRepository:
         it must not move ``issue_ref``. Write-once like :meth:`set_issue_ref` —
         an origin already recorded is never replaced.
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET origin_issue_ref = COALESCE(origin_issue_ref, ?) "
-                " WHERE thread_id = ?",
-                (origin_issue_ref, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET origin_issue_ref = COALESCE(origin_issue_ref, ?) "
+            " WHERE thread_id = ?",
+            (origin_issue_ref, thread_id),
+        )
 
     async def set_closed(self, thread_id: int, closed: bool, *, reason: str = "manual") -> None:
         """Mark the workspace stopped (停止) or reopen it (#512, #574).
@@ -397,7 +387,7 @@ class SessionRepository:
         workspace is stopped — ``closed_at`` alone answers that, so the two
         cannot drift apart.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _sqlite.connection(self.db_path) as db:
             if closed:
                 await db.execute(
                     "UPDATE sessions SET closed_at = datetime('now', 'localtime'), "
@@ -427,7 +417,7 @@ class SessionRepository:
         can never resume (or refuse to resume) anything — the same discipline as
         ``closed_reason``.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _sqlite.connection(self.db_path) as db:
             if slept:
                 await db.execute(
                     "UPDATE sessions SET slept_at = datetime('now', 'localtime') "
@@ -463,13 +453,10 @@ class SessionRepository:
         the honest answer is still "this was slept". The caller clears it once
         the wake succeeds.
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET last_used_at = datetime('now', 'localtime') "
-                "WHERE thread_id = ?",
-                (thread_id,),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET last_used_at = datetime('now', 'localtime') WHERE thread_id = ?",
+            (thread_id,),
+        )
 
     async def update_trigger_message(self, thread_id: int, message_id: int) -> None:
         """Persist the Discord message ID that triggered the current Claude turn.
@@ -485,12 +472,10 @@ class SessionRepository:
         """
         order = next(self._write_order)
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
-                    (message_id, thread_id),
-                )
-                await db.commit()
+            done = await self._write(
+                "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
+                (message_id, thread_id),
+            )
         except Exception:
             # Kept only when no write that started after it landed or was kept.
             if self._note_latest_write(thread_id, order):
@@ -502,7 +487,7 @@ class SessionRepository:
         if not self._note_latest_write(thread_id, order):
             return  # a newer write is kept and still waiting to land
         self._unwritten_triggers.pop(thread_id, None)
-        if cursor.rowcount == 0:
+        if not done.changed:
             # #1212: no row yet (first turn) — written by ``save`` when it comes.
             self._pending_triggers[thread_id] = message_id
             while len(self._pending_triggers) > 1000:
@@ -604,7 +589,7 @@ class SessionRepository:
         self._unapplied_clears[thread_id] = waiting | among
         while len(self._unapplied_clears) > 1000:
             self._unapplied_clears.pop(next(iter(self._unapplied_clears)))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with _sqlite.connection(self.db_path) as db:
             await self._execute_clear(db, thread_id, among)
             await db.commit()
         left = self._unapplied_clears.get(thread_id, frozenset()) - among
@@ -629,13 +614,11 @@ class SessionRepository:
             return None
         if self._unwritten_triggers.get(thread_id) == replacing:
             self._unwritten_triggers[thread_id] = sent  # #1254: not written yet either
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET trigger_message_id = ?"
-                " WHERE thread_id = ? AND trigger_message_id = ?",
-                (sent, thread_id, replacing),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET trigger_message_id = ?"
+            " WHERE thread_id = ? AND trigger_message_id = ?",
+            (sent, thread_id, replacing),
+        )
         return sent
 
     def clear_is_waiting(self, thread_id: int, message_id: int) -> bool:
@@ -652,12 +635,10 @@ class SessionRepository:
         """
         for thread_id, value in list(self._unwritten_triggers.items()):
             try:
-                async with aiosqlite.connect(self.db_path) as db:
-                    await db.execute(
-                        "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
-                        (value, thread_id),
-                    )
-                    await db.commit()
+                await self._write(
+                    "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
+                    (value, thread_id),
+                )
             except Exception:
                 logger.warning(
                     "%s could not write the trigger message %s at shutdown (#1254)",
@@ -670,7 +651,7 @@ class SessionRepository:
                 del self._unwritten_triggers[thread_id]
         for thread_id, among in list(self._unapplied_clears.items()):
             try:
-                async with aiosqlite.connect(self.db_path) as db:
+                async with _sqlite.connection(self.db_path) as db:
                     await self._execute_clear(db, thread_id, among)
                     await db.commit()
             except Exception:
@@ -714,12 +695,10 @@ class SessionRepository:
         Used by TranscriptMirror (live) and TranscriptMirrorCog (restart
         recovery) to dedupe re-delivery of a dropped final answer (Issue #215).
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET mirror_replied_uuid = ? WHERE thread_id = ?",
-                (uuid, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET mirror_replied_uuid = ? WHERE thread_id = ?",
+            (uuid, thread_id),
+        )
 
     async def set_rename_backoff_until(self, thread_id: int, deadline: str | None) -> None:
         """Persist the state-sync rename rate-limit deadline (Issue #281).
@@ -729,23 +708,16 @@ class SessionRepository:
         rename window instead of forgetting the in-memory backoff and re-PATCHing
         within the window (429).
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sessions SET rename_backoff_until = ? WHERE thread_id = ?",
-                (deadline, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET rename_backoff_until = ? WHERE thread_id = ?",
+            (deadline, thread_id),
+        )
 
     async def list_alive(self) -> list[SessionRecord]:
         """List sessions whose state is 'alive'."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                f"SELECT * FROM sessions WHERE state = 'alive' AND {_LIVE} "
-                "ORDER BY last_used_at DESC"
-            )
-            rows = await cursor.fetchall()
-            return [_record(row) for row in rows]
+        return await self._records(
+            f"SELECT * FROM sessions WHERE state = 'alive' AND {_LIVE} ORDER BY last_used_at DESC"
+        )
 
     async def open_thread_ids(self) -> set[int]:
         """Thread ids whose workspace is **not** stopped — the live ones.
@@ -763,12 +735,11 @@ class SessionRepository:
         must stay archivable by name: 7 of the 186 threads found on 2026-09-04
         had lost their row, and a DB-driven sweep would strand them forever.
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT thread_id FROM sessions WHERE closed_at IS NULL OR TRIM(closed_at) = ''"
-            )
-            rows = await cursor.fetchall()
-            return {int(row[0]) for row in rows if row[0] is not None}
+        rows = await _sqlite.read_all(
+            self.db_path,
+            "SELECT thread_id FROM sessions WHERE closed_at IS NULL OR TRIM(closed_at) = ''",
+        )
+        return {int(row[0]) for row in rows if row[0] is not None}
 
     async def all_working_dirs(self) -> set[str]:
         """Every ``working_dir`` any row still claims — closed rows included.
@@ -783,12 +754,11 @@ class SessionRepository:
         (uncommitted work) was already an orphan to #613 — keeping the row as
         history must not quietly change that.
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                f"SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL AND {_LIVE}"
-            )
-            rows = await cursor.fetchall()
-            return {row[0] for row in rows if row[0]}
+        rows = await _sqlite.read_all(
+            self.db_path,
+            f"SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL AND {_LIVE}",
+        )
+        return {row[0] for row in rows if row[0]}
 
     async def cleanup_old(self, days: int = 30) -> list[SessionRecord]:
         """Mark sessions unused for N days as swept. Returns the rows it marked.
@@ -807,8 +777,7 @@ class SessionRepository:
         excluded, or every restart would announce the same sweep again.
         """
         where = f" WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ? AND {_LIVE}"
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with _sqlite.connection(self.db_path, named=True) as db:
             cursor = await db.execute("SELECT * FROM sessions" + where, (days,))
             swept = [_record(row) for row in await cursor.fetchall()]
             if not swept:
