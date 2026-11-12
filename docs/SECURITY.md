@@ -251,7 +251,12 @@ Being allowed is necessary, not sufficient — c-lord also has to consider the p
   `/skill`, or `POST /api/spawn`.
 - Inside a thread, a message is run only when the thread has a session record, or is a former
   c-lord thread that can be reconnected or started again from its repository binding
-  (#538/#556/#862). Other threads under the same channel are left alone, silently.
+  (#538/#556/#862). Otherwise nothing runs, and what the sender sees depends on the thread
+  (`_handle_untracked_thread`): a thread that carries no trace of c-lord, and a thread that belongs
+  to another c-lord instance, get no reaction at all; a webhook message is dropped quietly in
+  Discord but logged; a former c-lord thread with nothing left to reconnect to and no repository
+  binding gets a ⚠️ reaction on the message and, once, a notice saying the message did not reach
+  Claude (#538).
 - Text commands (`!stop`, `!clord` …) are delivered to every bot that can read the channel, so each
   instance answers only where it can point at its own record of the channel or thread — the
   configured `DISCORD_CHANNEL_ID` or a `/clord-init` binding (#596, `c_lord/command_gate.py`).

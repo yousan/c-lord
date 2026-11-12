@@ -97,8 +97,12 @@ class ThreadNoteCog(commands.Cog):
 
 1 ターンの実行は `c_lord/cogs/_run_helper.py` の `run_claude_with_config(RunConfig(...))` に任せる。
 ステータスのランプ、質問メニューの橋渡し、エラー表示、セッションの保存はそこが持っているので、
-Cog の中に同じものを書かない。`run_claude_in_thread()` は古い呼び出し方のために残してある互換用で、
-新しいコードでは使わない。
+Cog の中に同じものを書かない。
+
+CLAUDE.md の「Adding a New Cog」の手順 2 は `_run_helper.run_claude_in_thread()` と書いている。
+これは `RunConfig` を組んで `run_claude_with_config()` を呼ぶ互換の入口で、既存の Cog は
+`run_claude_with_config()` を直接呼んでいる。どちらでも共通の実行経路を通る —
+**自前で実行ロジックを複製しない**、が規則の趣旨。
 
 呼ぶ前に Cog の側で用意するもの（`webhook_trigger.py` の `on_message` 以降がそのままの例）:
 

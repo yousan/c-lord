@@ -31,14 +31,12 @@ bump させたくない PR は、squash コミット subject を `docs:` にす�
 
 ## 手動リリース（minor / major、「v1.5.0としてリリースして」）
 
-以下は `1.5.0` を例にする。作業は本番 checkout ではなく、自分のセッションの clone で行ってよい
-（タグは origin に push されるので、どの clone から打っても同じ）。
+以下は `1.5.0` を例にする。
 
 ### Step 1: main を最新化
 
+    cd /home/yousan/c-lord
     git checkout main && git pull
-
-本番 checkout（`cd /home/yousan/c-lord`）で行う場合も同じコマンド。
 
 ### Step 2: CHANGELOG.md を更新（PR で）
 

@@ -234,11 +234,11 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 
 ### Style
 
-- **整形 / lint**: ruff（設定は `pyproject.toml`）
+- **整形 / lint**: ruff（`pyproject.toml`）
 - **型ヒント**: 全関数シグネチャに必須
 - **Python**: 3.10+。全ファイルに `from __future__ import annotations`
 - **行長**: 最大 100 文字
-- **import**: ruff（`I`）で整列。型専用の import は `TYPE_CHECKING` 下
+- **import**: ruff（`I`）で整列。型専用は `TYPE_CHECKING` 下
 
 ### Error Handling
 
@@ -281,7 +281,7 @@ If you modify `tmux_runner.py`, `_run_helper.py`, or any Cog, the security audit
 詳細は `.claude/skills/tdd/SKILL.md`。
 
 - `pytest` + `pytest-asyncio`（auto モード）
-- テストは `tests/` にソースの構成に合わせて置く
+- テストは `tests/` に、ソースの構成どおりに置く
 - 純粋なロジック（parser, chunker, types）: 90%+
 - Discord 依存（Cog, StatusManager）: モックで 30%+
 - **テストの無い実装コードを書かない**
@@ -330,8 +330,8 @@ c_lord/                  # Installable Python package
     task_repo.py         # 定期タスク
   discord_ui/
     status.py            # Emoji reaction status manager (applied immediately)
-    embeds.py            # embed の組み立て
     authorization.py     # 許可リストの規則 (#713)
+    embeds.py            # embed の組み立て
                          # NOTE: chunker.py / streaming_manager.py /
                          # tui_strip.py / progress_buffer.py were removed in
                          # #53 — the scrape→post path they served is gone.
@@ -432,9 +432,9 @@ PR. When you (or Opus) author an Issue:
 ## Git & PR Workflow
 
 - **`main` から分岐**: `feature/description`, `fix/description`, `docs/description`
-- **CI 必須**: Python 3 バージョン ×（ruff check + ruff format + pytest）
+- **CI 必須**: 3 つの Python バージョン（3.10 / 3.11 / 3.12）すべてで ruff check + ruff format + pytest
 - **`main` へ直接 push しない**: 必ず PR
-- **squash merge 推奨**: `main` の履歴を保つ
+- **squash merge 推奨**: `main` の履歴をきれいに保つ
 - **コミット**: `<type>: <description>` — feat, fix, refactor, docs, test, chore, security
 - **Required checks**: `dod-gate` and `test (3.10/3.11/3.12)` are required status checks on `main`. **A PR with a red `dod-gate` cannot be merged — not by humans, not by sub-Claude.** If `dod-gate` is red, fix the PR body or the issue before merging. `enforce_admins=true` means the admin account is also blocked.
 
@@ -505,10 +505,10 @@ webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッド�
 | スキル | 用途 |
 |-------|------|
 | `tdd` | TDD（**必須**）— テストが先、実装が後 |
-| `verify` | コミット前の検査（lint + format + test + security） |
+| `verify` | コミット前検査（lint + format + test + security） |
 | `add-cog` | Cog を足す手順 |
 | `security-audit` | subprocess / 注入の脅威のチェックリスト |
-| `python-quality` | Python の書き方と規約 |
+| `python-quality` | Python の書き方・規約 |
 | `test-guide` | テストの型、Discord のモック、カバレッジ目安 |
 | `release` | バージョン / リリース手順 |
 
@@ -517,7 +517,7 @@ webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッド�
 | コマンド | 用途 |
 |---------|------|
 | `/verify` | 検証一式を流す |
-| `/new-cog <name>` | Cog をテストごと作る |
+| `/new-cog <name>` | Cog とテストを作る |
 
 ### Hooks (`.claude/settings.json`)
 
@@ -525,7 +525,7 @@ webhook での再現入力・前提条件 (`E2E_TEST_THREAD_ID` のスレッド�
 
 ## What Does NOT Belong Here
 
-- 個人 bot の設定（token、チャンネル ID、ユーザー ID）
+- 個人 bot の設定（token、channel ID、user ID）
 - サーバ固有の Cog・ワークフロー
 - Anthropic API の直接呼び出し（使うのは Claude Code CLI）
 - 大半に不要な重い依存
