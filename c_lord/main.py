@@ -1,14 +1,21 @@
 """Entry point for c-lord bot."""
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import asyncio
 import fcntl
 import hashlib
-# <<REDACTED 4 lines>>
+import logging
+import os
+import signal
+import sys
 from collections.abc import Callable, Coroutine
-# <<REDACTED 1 lines>>
+from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
-# <<REDACTED 1 lines>>
+
 from dotenv import find_dotenv, load_dotenv
-# <<REDACTED 2 lines>>
+
+from .bot import ClaudeDiscordBot
 from .claude.config import ClaudeConfig
 from .command_gate import is_trusted_bot_id_text
 from .coordination.env import MAX_ID_DIGITS as COORDINATION_MAX_ID_DIGITS
@@ -16,11 +23,22 @@ from .git_mirrors import stop_running_git
 from .session_cleanup import DirOutcome, retire_swept_workspace, sweep_days
 from .setup import setup_bridge
 from .shutdown_watchdog import arm_shutdown_watchdog, shutdown_timeout_from_env
-# <<REDACTED 2 lines>>
+from .utils.logger import setup_logging
+
 if TYPE_CHECKING:
     from .ext.api_server import ApiServer
 
-# <<REDACTED 2 lines>>
+logger = logging.getLogger(__name__)
+
+#: Claude CLI settings that go into the config exactly as the environment has
+#: them (no validation, no trimming): variable → value used when it is unset.
+_CLAUDE_ENV_DEFAULTS = {
+    "CLAUDE_COMMAND": "claude",
+    "CLAUDE_MODEL": "sonnet",
+    "CLAUDE_PERMISSION_MODE": "acceptEdits",
+    "CLAUDE_WORKING_DIR": "",
+}
+
 #: Defaults of the two numeric limits (#1119).
 _DEFAULT_MAX_CONCURRENT = "3"
 _DEFAULT_TIMEOUT = "300"
@@ -33,7 +51,24 @@ _MAX_LIMIT_DIGITS = 18
 #: each swept thread quotes it, and README/docs/COMMANDS.md now state it.
 SESSION_CLEANUP_DAYS = 30
 
-# <<REDACTED 1 lines>>
+
+def _claude_env(name: str) -> str:
+    """Read one of the pass-through Claude settings, falling back to its default."""
+    return os.getenv(name, _CLAUDE_ENV_DEFAULTS[name])
+
+
+def _require_setting(name: str, value: str) -> None:
+    """Stop the process when a setting the bot cannot start without is empty."""
+    if not value:
+        logger.error("%s is required", name)
+        sys.exit(1)
+
+
+def _optional_id(text: str) -> int | None:
+    """An ID from the config as a number; an empty entry means "not configured"."""
+    return int(text) if text else None
+
+
 def acquire_single_instance_lock(data_dir: Path) -> IO[bytes] | None:
     """Acquire an exclusive non-blocking flock on ``data_dir/.bot.lock``.
 
@@ -189,11 +224,16 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     # (env-var-only setups); the read skill then renders its path-less variant.
     if resolved_env_path:
         os.environ.setdefault("CLORD_ENV_PATH", resolved_env_path)
-# <<REDACTED 6 lines>>
+
+    # Not stripped: the token is handed to Discord exactly as it was written.
+    token = os.getenv("DISCORD_BOT_TOKEN", "")
+    _require_setting("DISCORD_BOT_TOKEN", token)
+
     # #1194: spaces around an ID (``KEY="123 "``) started before #1084 — ``int()``
     # ignores them — so strip them here, as the counts below do (#1119).
     channel_id = os.getenv("DISCORD_CHANNEL_ID", "").strip()
-    # <<REDACTED 4 lines>>
+    _require_setting("DISCORD_CHANNEL_ID", channel_id)
+
     # Every Discord ID is "ASCII digits only" (#1084). ``isdigit()`` alone is
     # True for ``²`` and full-width digits, and the channel id was only checked
     # for being non-empty — so ``int()`` further down raised ValueError and the
@@ -281,19 +321,25 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     max_concurrent = limits["MAX_CONCURRENT_SESSIONS"]
     timeout = limits["SESSION_TIMEOUT_SECONDS"]
 
-    # <<REDACTED 3 lines>>
+    return {
+        "token": token,
+        "channel_id": channel_id,
         "expected_bot_user_id": expected_bot_user_id,
-        # <<REDACTED 2 lines>>
+        "claude_command": _claude_env("CLAUDE_COMMAND"),
+        "claude_model": _claude_env("CLAUDE_MODEL"),
         "claude_effort": os.getenv("CLAUDE_EFFORT", ""),
         # #918: where those two came from, for the /model display.
         "claude_model_source": _env_source("CLAUDE_MODEL", resolved_env_path, "組み込み既定"),
         "claude_effort_source": _env_source("CLAUDE_EFFORT", resolved_env_path, "未設定"),
-        # <<REDACTED 2 lines>>
+        "claude_permission_mode": _claude_env("CLAUDE_PERMISSION_MODE"),
+        "claude_working_dir": _claude_env("CLAUDE_WORKING_DIR"),
         "max_concurrent": max_concurrent,
         "timeout": timeout,
         "owner_id": owner_id_raw,
         "coordination_channel_id": coordination_raw,
-    # <<REDACTED 3 lines>>
+    }
+
+
 # Where the REST API listens when ``CLORD_API_PORT`` is not set.
 DEFAULT_API_PORT = 8080
 #: The largest TCP port; a larger CLORD_API_PORT is refused, not a crash (#1237).
@@ -465,17 +511,17 @@ def install_shutdown_signal_handlers(
         stop_running_git()
         loop.create_task(shutdown())
 
-    # <<REDACTED 1 lines>>
+    for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _on_signal)
 
 
 async def main(env_path: Path | None = None) -> None:
-    # <<REDACTED 1 lines>>
+    """Bring the bot up and stay connected until it is told to stop."""
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     setup_logging(log_level)
     config = load_config(env_path)
-# <<REDACTED 1 lines>>
+
     data_dir = resolve_data_dir(env_path)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -490,28 +536,40 @@ async def main(env_path: Path | None = None) -> None:
     # double-connect launched from a different clone/directory.
     _token_lock = acquire_token_lock(config["token"])  # noqa: F841
 
-    # <<REDACTED 2 lines>>
+    db_path = str(data_dir / "sessions.db")
+
     runner = ClaudeConfig(
-        # <<REDACTED 2 lines>>
+        command=config["claude_command"],
+        model=config["claude_model"],
         effort=config["claude_effort"] or None,
         model_source=config.get("claude_model_source"),
         effort_source=config.get("claude_effort_source"),
-        # <<REDACTED 9 lines>>
+        permission_mode=config["claude_permission_mode"],
+        working_dir=config["claude_working_dir"] or None,
+        timeout_seconds=int(config["timeout"]),
+    )
+
+    owner_id = _optional_id(config["owner_id"])
+    coordination_channel_id = _optional_id(config["coordination_channel_id"])
     allowed_user_ids = {owner_id} if owner_id else None
     allowed_role_name = os.getenv("CLORD_ALLOWED_ROLE") or None
 
-    # <<REDACTED 4 lines>>
+    bot = ClaudeDiscordBot(
+        channel_id=int(config["channel_id"]),
+        owner_id=owner_id,
+        coordination_channel_id=coordination_channel_id,
         expected_bot_user_id=(
             int(config["expected_bot_user_id"]) if config["expected_bot_user_id"] else None
         ),
-    # <<REDACTED 2 lines>>
+    )
+
     api_server = await build_api_server(
         bot,
         default_channel_id=int(config["channel_id"]),
         data_dir=data_dir,
     )
 
-    # <<REDACTED 1 lines>>
+    async with bot:
         components = await setup_bridge(
             bot,
             runner,
@@ -524,7 +582,7 @@ async def main(env_path: Path | None = None) -> None:
             enable_scheduler=True,
             max_concurrent=int(config["max_concurrent"]),
         )
-# <<REDACTED 1 lines>>
+
         await start_api_server(api_server)
 
         # Cleanup old sessions on startup.
@@ -572,7 +630,9 @@ async def main(env_path: Path | None = None) -> None:
                 sweep_days_value,
                 [r.thread_id for r in deleted],
             )
-# <<REDACTED 3 lines>>
+
+        # Signals have to be hooked up before start() below takes over.
+        loop = asyncio.get_running_loop()
 
         async def _shutdown() -> None:
             if api_server is not None:
@@ -580,4 +640,9 @@ async def main(env_path: Path | None = None) -> None:
             await bot.close()
 
         install_shutdown_signal_handlers(loop, _shutdown)
-# <<REDACTED 6 lines>>
+
+        await bot.start(config["token"])
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

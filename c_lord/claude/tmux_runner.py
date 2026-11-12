@@ -8,7 +8,10 @@ The trade-off is that structured stream events (tool use, thinking, etc.)
 are not available — only plain text deltas.  However, users can
 ``tmux attach -t clord:wN`` to see the full Claude TUI in real time.
 """
-# <<REDACTED 4 lines>>
+
+from __future__ import annotations
+
+import asyncio
 import contextlib
 import logging
 import os
@@ -1549,6 +1552,21 @@ def _normalize_capture(text: str) -> str:
     return text
 
 
+def _turn_result(*, error: str | None, usage_limit: UsageLimit | None = None) -> StreamEvent:
+    """The one event that tells whoever consumes a turn that it is over.
+
+    ``is_complete`` is what the consumer watches for; ``error`` is None for a
+    turn that simply finished.
+    """
+    return StreamEvent(
+        raw={},
+        message_type=MessageType.RESULT,
+        is_complete=True,
+        error=error,
+        usage_limit=usage_limit,
+    )
+
+
 class TmuxClaudeRunner:
     """Runs Claude Code inside a tmux window and streams output via capture-pane.
 
@@ -1561,7 +1579,8 @@ class TmuxClaudeRunner:
         tmux_manager: TmuxSessionManager,
         thread_id: int,
         model: str = "sonnet",
-        # <<REDACTED 2 lines>>
+        working_dir: str | None = None,
+        timeout_seconds: int = 300,
         permission_mode: str = "acceptEdits",
         dangerously_skip_permissions: bool = False,
         try_continue: bool = False,
@@ -1573,7 +1592,9 @@ class TmuxClaudeRunner:
         # #1223: the turn-end bus token of the turn in progress, if any.
         self._turn_token: object | None = None
         self.model = model
-        # <<REDACTED 2 lines>>
+        # Public on purpose: Cogs read both back when they build a runner like this one.
+        self.working_dir = working_dir
+        self.timeout_seconds = timeout_seconds
         self._permission_mode = permission_mode
         self._dangerously_skip_permissions = dangerously_skip_permissions
         self._effort = effort
@@ -1782,7 +1803,11 @@ class TmuxClaudeRunner:
                 exc_info=True,
             )
 
-    # <<REDACTED 5 lines>>
+    async def run(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Start Claude in tmux and yield extracted response events.
 
         See :meth:`_run_turn`. This wrapper only tells the turn-end bus when the
@@ -1798,7 +1823,10 @@ class TmuxClaudeRunner:
                 turn_end_bus.note_turn_ended(self._thread_id, token)
 
     async def _run_turn(
-        # <<REDACTED 4 lines>>
+        self,
+        prompt: str,
+        session_id: str | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Start Claude in tmux and yield extracted response events.
 
         1. Check if Claude is already running; if not, start it.
@@ -1920,7 +1948,7 @@ class TmuxClaudeRunner:
                     )
                 else:
                     reason = _delivery_failure("メッセージの送信", prompt)
-                # <<REDACTED 4 lines>>
+                yield _turn_result(
                     # #701: the fleet's tmux going down explains every one of the
                     # reasons above, and none of them can say so — the pane they
                     # describe belonged to a server that is gone.
@@ -1952,7 +1980,7 @@ class TmuxClaudeRunner:
                 )
                 if not ok:
                     self.send_refused = True  # #1271: nothing reached the pane
-                    # <<REDACTED 4 lines>>
+                    yield _turn_result(
                         error=(
                             await self._fleet_tmux_error(server_at_start)
                             or await self._start_failure_reason(prompt)
@@ -1980,7 +2008,7 @@ class TmuxClaudeRunner:
                     )
                     if not ok:
                         self.send_refused = True  # #1271: nothing reached the pane
-                        # <<REDACTED 4 lines>>
+                        yield _turn_result(
                             error=(
                                 await self._fleet_tmux_error(server_at_start)
                                 or await self._start_failure_reason(prompt)
@@ -2005,7 +2033,7 @@ class TmuxClaudeRunner:
                 )
                 if not ok:
                     self.send_refused = True  # #1271: nothing reached the pane
-                    # <<REDACTED 4 lines>>
+                    yield _turn_result(
                         error=(
                             await self._fleet_tmux_error(server_at_start)
                             or await self._start_failure_reason(prompt)
@@ -2835,7 +2863,7 @@ class TmuxClaudeRunner:
             # discord-reply skill, not through the runner stream.
             error = None
 
-        # <<REDACTED 4 lines>>
+        yield _turn_result(
             error=error,
             usage_limit=usage_limit,
         )
@@ -2978,7 +3006,8 @@ class TmuxClaudeRunner:
         )
         return StreamEvent(
             raw={},
-            # <<REDACTED 2 lines>>
+            message_type=MessageType.RESULT,
+            is_complete=True,
             error=None if self._silent_stop else STOPPED_BY_USER_ERROR,
         )
 

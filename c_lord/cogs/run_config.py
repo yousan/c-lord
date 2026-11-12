@@ -1,17 +1,36 @@
-# <<REDACTED 10 lines>>
+"""Everything one Claude Code run needs, as a single dataclass.
+
+Run helpers used to grow a positional parameter per feature. Passing one
+object instead keeps call sites readable, and a new field no longer means
+touching every caller.
+"""
+
+from __future__ import annotations
+
+import dataclasses
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-# <<REDACTED 4 lines>>
+from typing import TYPE_CHECKING
+
+import discord
+
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..claude.types import UsageLimit
-# <<REDACTED 5 lines>>
+from ..concurrency import SessionRegistry
+from ..database.ask_repo import PendingAskRepository
+from ..database.lounge_repo import LoungeRepository
+from ..database.repository import SessionRepository
+from ..database.settings_repo import SettingsRepository
 from ..discord_ui.authorization import Authorizer
-# <<REDACTED 1 lines>>
+from ..discord_ui.status import StatusManager
 from ..turn_events import StartedBy, TurnInfo
-# <<REDACTED 3 lines>>
+
+if TYPE_CHECKING:
+    from ..discord_ui.views import StopView
     from ..session_dir import SessionDirManager
     from ..tmux import TmuxSessionManager
-# <<REDACTED 2 lines>>
+
+
 @dataclass
 class RunOutcome:
     """What a completed run needs to tell its caller (#562).
@@ -54,13 +73,24 @@ class RunOutcome:
     turn: TurnInfo | None = None
 
 
-# <<REDACTED 6 lines>>
+@dataclass
+class RunConfig:
+    """The full set of inputs for one Claude Code run.
+
+    Required:
+        thread: The Discord thread the results go to.
         runner: A TmuxClaudeRunner instance for this thread.
-        # <<REDACTED 7 lines>>
+        prompt: What to send — the user's message, or the line that invokes a skill.
+
+    Optional:
+        session_id: Session to resume; None starts a new one.
+        repo: Where the thread ↔ session mapping is saved. None for automated
+              workflows that keep no session.
+        status: StatusManager that puts the emoji reactions on the user's message.
         registry: SessionRegistry. When provided, the session is registered
                   during execution (``/workspace-cleanup`` reads it). Nothing
                   is sent to Claude (#758/#766).
-        # <<REDACTED 1 lines>>
+        ask_repo: Keeps open AskUserQuestion menus across a bot restart.
         lounge_repo: Unused since #766 (the lounge text was never delivered —
                      #758). Kept so existing callers keep working.
         settings_repo: KV store for the persisted per-model context-window total
@@ -78,17 +108,27 @@ class RunOutcome:
         tmux_manager: Read by nothing here, for the same reason — a thread's
                       tmux window outlives its turns. Kept so existing callers
                       keep working.
-    # <<REDACTED 3 lines>>
+    """
+
+    thread: discord.Thread
     runner: TmuxClaudeRunner
-    # <<REDACTED 7 lines>>
+    prompt: str
+    session_id: str | None = None
+    repo: SessionRepository | None = None
+    status: StatusManager | None = None
+    registry: SessionRegistry | None = None
+    ask_repo: PendingAskRepository | None = None
+    lounge_repo: LoungeRepository | None = None
     # #370: persists the per-model context-window total so the /context probe
     # (which renders into the human-visible tmux pane) fires at most once per
     # model per host instead of once per session / bot-restart.
     settings_repo: SettingsRepository | None = None
-    # <<REDACTED 1 lines>>
+    stop_view: StopView | None = None
     session_dir_manager: SessionDirManager | None = None
     tmux_manager: TmuxSessionManager | None = None
-    # <<REDACTED 3 lines>>
+    # Images from the message, already downloaded to temp files and handed to
+    # Claude with ``--image``. Whoever runs the turn deletes them when it ends.
+    image_paths: list[str] | None = None
     # Absolute path of the session's working directory. Persisted to the
     # sessions DB so TranscriptMirrorCog can restart mirrors after a bot
     # restart. None when no session_dir_manager.
@@ -128,11 +168,22 @@ class RunOutcome:
     # #1262: called right before the prompt is handed to tmux — after this, a
     # cancelled turn may still have delivered it. ``None`` ⇒ nothing to do.
     on_send_started: Callable[[], None] | None = None
-# <<REDACTED 1 lines>>
+
     # #562: how the run turned out, written by the runner side and read by the
     # caller after it returns. RunConfig's *inputs* stay a value object; this is
     # a separate, explicitly mutable output channel rather than a field the
     # caller is expected to mutate.
     outcome: RunOutcome = field(default_factory=lambda: RunOutcome())
 
-    # <<REDACTED 11 lines>>
+    def __post_init__(self) -> None:
+        # Runs for every copy too (``dataclasses.replace`` goes through __init__),
+        # so no RunConfig — however it was made — carries an empty prompt.
+        if not self.prompt:
+            raise ValueError("RunConfig.prompt must not be empty")
+
+    def with_prompt(self, prompt: str) -> RunConfig:
+        """A copy of this config that sends *prompt* instead; ``self`` is untouched.
+
+        Every other field — ``outcome`` included — is the same object in both.
+        """
+        return dataclasses.replace(self, prompt=prompt)
