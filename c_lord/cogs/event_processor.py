@@ -11,9 +11,14 @@ transcript mirror reads them from Claude Code's jsonl (#712, #723).  The
 embeds, views and timer that once rendered tool use, thinking, todo lists,
 permission / plan / elicitation prompts and compaction from runner events were
 removed in #1316: nothing constructed those events any more.
-# <<REDACTED 6 lines>>
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
 from typing import TYPE_CHECKING
-# <<REDACTED 1 lines>>
+
 from ..api_error import API_ERROR_PREFIX, advice_for_error
 from ..claude.tmux_runner import (
     FLEET_TMUX_RESTART_ERROR_PREFIX,
@@ -24,30 +29,49 @@ from ..claude.tmux_runner import (
     TRUST_STUCK_ERROR_PREFIX,
     unavailable_model,
 )
-# <<REDACTED 1 lines>>
+from ..claude.types import MessageType, SessionState, StreamEvent
 from ..discord_ui.embeds import session_start_embed, unknown_tui_prompt_embed
 from ..login_alert import login_alert
 from ..usage_limit import usage_limit_notices
 from ..utils.logger import log_ctx
-# <<REDACTED 2 lines>>
+from .run_config import RunConfig
+
 if TYPE_CHECKING:
     import discord
-# <<REDACTED 5 lines>>
+
+logger = logging.getLogger(__name__)
+
+
+class EventProcessor:
     """Handles one turn's runner events and the Discord posts they call for.
-# <<REDACTED 1 lines>>
+
     One instance per turn. Call process(event) for each event from the runner;
     call finalize() in a finally block.
-# <<REDACTED 1 lines>>
+
     State:
-    # <<REDACTED 30 lines>>
+    - ``session_id`` — the session this turn is on, as the runner last
+      reported it. Read it once the stream has ended: it is what the turn
+      hands back to its caller.
+    """
+
+    def __init__(self, config: RunConfig) -> None:
+        self._config = config
+        # Starts from the session being resumed (None for a brand-new one) and
+        # follows whatever id the runner reports.
+        self._state = SessionState(session_id=config.session_id, thread_id=config.thread.id)
         # #856: ``RunConfig.on_session_saved`` fires once per turn.
         self._session_saved_notified: bool = False
-# <<REDACTED 5 lines>>
+        # Whether this turn already posted its session-start embed.
+        self._session_start_sent: bool = False
         # The session-start embed this turn posted, if any. It is bookkeeping,
         # so it is taken away again when the turn ends.
         self._session_start_msg: discord.Message | None = None
 
-    # <<REDACTED 23 lines>>
+    @property
+    def session_id(self) -> str | None:
+        """The session id as of the latest SYSTEM / RESULT event."""
+        return self._state.session_id
+
     @property
     def _failure_mention(self) -> str | None:
         """Message content that pings whoever is waiting on a broken turn (#681).
@@ -70,13 +94,27 @@ if TYPE_CHECKING:
             uid = self._config.notify_user_id
         return uid
 
-    # <<REDACTED 11 lines>>
+    async def process(self, event: StreamEvent) -> None:
+        """Act on one runner event.
+
+        A SYSTEM event that also completes the turn is handled as both, in
+        that order.
+        """
+        if event.message_type == MessageType.SYSTEM:
+            await self._on_system(event)
+        if event.is_complete:
+            await self._on_complete(event)
+
+    async def finalize(self) -> None:
         """End-of-turn hook. Call in a finally block.
 
         Holds nothing to release since #1316 (it used to cancel the per-tool
         timers); kept so callers have one place to end a turn.
         """
-# <<REDACTED 6 lines>>
+
+    # -- per-event handlers ---------------------------------------------
+
+    async def _on_system(self, event: StreamEvent) -> None:
         """Handle SYSTEM events — a TUI menu, an unknown prompt, or the session id."""
         # In-pane AskUserQuestion (jsonl/tmux mode) — show Discord buttons and
         # answer the open TUI menu by sending keystrokes back to the pane (#166).
@@ -86,13 +124,17 @@ if TYPE_CHECKING:
 
         # Unknown TUI interactive prompt — warn Discord so the session doesn't stall silently
         if event.unknown_tui_prompt is not None:
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 await self._config.thread.send(
                     embed=unknown_tui_prompt_embed(event.unknown_tui_prompt)
                 )
             return
 
-        # <<REDACTED 5 lines>>
+        if not event.session_id:
+            return
+        self._state.session_id = event.session_id
+
+        if self._config.repo:
             await self._config.repo.save(
                 self._config.thread.id,
                 self._state.session_id,
@@ -103,28 +145,34 @@ if TYPE_CHECKING:
             hook = self._config.on_session_saved
             if hook is not None and not self._session_saved_notified:
                 self._session_saved_notified = True
-                # <<REDACTED 1 lines>>
+                with contextlib.suppress(Exception):
                     await hook(self._config.thread.id)
-# <<REDACTED 3 lines>>
+
+        # Announce the session once, and only when this turn began a new one —
+        # a resumed session was announced by the turn that started it.
+        if not self._config.session_id and not self._session_start_sent:
             self._session_start_msg = await self._config.thread.send(
                 embed=session_start_embed(self._state.session_id)
             )
-            # <<REDACTED 3 lines>>
-        """Handle ASSISTANT events — an AskUserQuestion carried on the event itself."""
-        # <<REDACTED 6 lines>>
+            self._session_start_sent = True
+
+    async def _on_complete(self, event: StreamEvent) -> None:
         """Handle RESULT events — the turn is over.
-# <<REDACTED 1 lines>>
+
         Sets the lamp (🟡 / ❌), posts the error embed when the turn failed and
         records why on ``RunConfig.outcome``, removes the session-start embed,
         and saves the session id. Claude's answer is not posted here: the
         transcript mirror delivers it from the jsonl (#712).
         """
-        # <<REDACTED 2 lines>>
+        # Imported here: ``_run_helper`` imports this module at its top.
+        from ._run_helper import _make_error_embed
+
         if event.error == STOPPED_BY_USER_ERROR:
             # #878: the user asked for this. The stop reply (⏹️ Session stopped)
             # already says so — an ❌ and an error embed with a failure ping
             # would report a requested stop as a breakdown. 🟡: their turn now.
-            # <<REDACTED 2 lines>>
+            if self._config.status:
+                await self._config.status.set_done()
         elif event.error:
             # #562: tell the caller this turn produced nothing, so the turn-end
             # ping says "応答がありませんでした" instead of "Claude has finished".
@@ -186,7 +234,8 @@ if TYPE_CHECKING:
             if err_msg is not None:
                 # #915: the turn-end line must not ping the same person again.
                 self._config.outcome.pinged_user_id = self._failure_notify_uid
-            # <<REDACTED 2 lines>>
+            if self._config.status:
+                await self._config.status.set_error()
             # #1309: the embed reaches whoever opens the thread; the cure is on
             # the host, so the owner is told by DM — once per outage.
             if self._config.outcome.login_required:
@@ -195,19 +244,23 @@ if TYPE_CHECKING:
                 await login_alert.report(
                     self._config.thread, session=session if isinstance(session, str) else None
                 )
-        # <<REDACTED 3 lines>>
+        else:
+            if self._config.status:
+                await self._config.status.set_done()
             # #1309: a turn that ran was logged in — the outage, if any, is over.
             await login_alert.recovered()
-# <<REDACTED 1 lines>>
+
         await self._remove_session_start_embed()
 
-        # <<REDACTED 2 lines>>
+        if event.session_id:
+            if self._config.repo:
                 await self._config.repo.save(
                     self._config.thread.id,
                     event.session_id,
                     working_dir=self._config.working_dir,
                 )
-            # <<REDACTED 2 lines>>
+            self._state.session_id = event.session_id
+
     async def _handle_pane_ask(self, event: StreamEvent) -> None:
         """Bridge an in-pane AskUserQuestion menu to Discord buttons (#166).
 
@@ -263,5 +316,5 @@ if TYPE_CHECKING:
         """
         msg, self._session_start_msg = self._session_start_msg, None
         if msg is not None:
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 await msg.delete()

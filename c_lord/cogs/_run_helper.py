@@ -1,14 +1,36 @@
-# <<REDACTED 4 lines>>
+"""Runs one turn of Claude and sees it through to the end — shared by every cog.
+
+Nothing here knows Discord's widgets or the runner's internals; it only puts
+the steps of a turn in order:
+
 1. Registers the session in the concurrency registry (``/workspace-cleanup`` reads
    it). The lounge + concurrency notice text is not built: the tmux TUI has no
    per-turn --append-system-prompt, so it was never delivered (#758), and #766
-   stopped building it
-# <<REDACTED 12 lines>>
+   stopped building it.
+2. Feeds every event the runner yields to :class:`EventProcessor`, which posts
+   what c-lord itself has to say about the turn.
+3. Once the stream ends, bridges a question menu that is still open in the
+   pane, and posts the context-usage footer.
+
+Cogs build a :class:`RunConfig` and call
+``run_claude_with_config(config: RunConfig) -> str | None``.
+``run_claude_in_thread(...)``, the positional form from before ``RunConfig``
+existed, still works and simply forwards to it.
+"""
+
+from __future__ import annotations
+
 import asyncio
-# <<REDACTED 3 lines>>
+import contextlib
+import logging
+import os
+import re
 import time
 from dataclasses import dataclass
-# <<REDACTED 3 lines>>
+from typing import TYPE_CHECKING
+
+import discord
+
 from .. import turn_events
 from ..api_error import API_ERROR_PREFIX, advice_for_error
 from ..claude.context_usage import (
@@ -32,7 +54,6 @@ from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.ask_handler import (  # noqa: F401
     ASK_ANSWER_TIMEOUT,
     bridge_pane_ask,
-    collect_ask_answers,
 )
 from ..discord_ui.embeds import (
     api_error_embed,
@@ -51,7 +72,17 @@ from ..transcript.mirror import note_run_ended
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
 from ..version import label_with_age, runtime_version
-# <<REDACTED 5 lines>>
+from .event_processor import EventProcessor
+from .run_config import RunConfig
+
+if TYPE_CHECKING:
+    from ..concurrency import SessionRegistry
+    from ..database.ask_repo import PendingAskRepository
+    from ..database.lounge_repo import LoungeRepository
+    from ..database.repository import SessionRepository
+    from ..discord_ui.status import StatusManager
+
+logger = logging.getLogger(__name__)
 # Context-window total per session_id, learned via TmuxClaudeRunner's /context
 # probe (or a per-model fallback) and reused for the rest of the session.  The
 # value is ``(model, total)``: when the model in the transcript changes (e.g.
@@ -69,7 +100,11 @@ _context_window_cache: dict[str, tuple[str | None, int]] = {}
 # modify-write race.  Stored in the existing ``settings`` KV (no new table).
 _CONTEXT_WINDOW_KEY_PREFIX = "context_window:"
 
-# <<REDACTED 3 lines>>
+# The runner's "gave up waiting" error. Used with ``.match``, so it only counts
+# at the very start of the error text; group 1 is the number of seconds.
+_TIMEOUT_PATTERN = re.compile(r"Timed out after (\d+) seconds")
+
+
 def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> discord.Embed:
     """Pick the embed that matches what actually went wrong."""
     # #631: a rate limit is checked first — it is the one empty-turn outcome
@@ -115,12 +150,16 @@ def _make_error_embed(error: str, usage_limit: UsageLimit | None = None) -> disc
         return api_error_embed(
             error.removeprefix(API_ERROR_PREFIX).strip(), advice_for_error(error)
         )
-    # <<REDACTED 3 lines>>
+    timed_out = _TIMEOUT_PATTERN.match(error)
+    if timed_out:
+        return timeout_embed(int(timed_out.group(1)))
     # #562: "never started" is not "stopped responding" — a timeout embed here
     # would send the reader looking for output that was never produced.
     if error.startswith(NO_RESPONSE_ERROR_PREFIX):
         return no_response_embed(error)
-    # <<REDACTED 3 lines>>
+    return error_embed(error)
+
+
 def _failure_reason(config: RunConfig, outcome: str) -> str | None:
     """A short code for why the turn failed, or ``None`` if it did not (#917).
 
@@ -151,21 +190,56 @@ def _failure_reason(config: RunConfig, outcome: str) -> str | None:
 
 def _register_session(config: RunConfig) -> None:
     """Register this turn in the session registry, if one is configured.
-# <<REDACTED 1 lines>>
+
     ``/workspace-cleanup`` reads the registry to skip workspaces that are running.
     Nothing is sent to Claude: the lounge / concurrency notice text used to be
     built here and dropped (#758), and #766 stopped building it.
-    # <<REDACTED 1 lines>>
+    """
     if config.registry is None:
         return
-    # <<REDACTED 13 lines>>
+    config.registry.register(config.thread.id, config.prompt[:100], config.runner.working_dir)
+
+
+def _removed(path: str) -> bool:
+    """Delete *path*; say whether it went. Never raises (gone already, no permission, …)."""
+    try:
+        os.unlink(path)
+    except Exception:
+        return False
+    return True
+
+
+async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:
+    """Delete the temp files a turn's image attachments were saved to.
+
+    Best-effort, one file at a time: a file that cannot be removed is skipped
+    without a word.
+    """
+    for path in image_paths:
+        if _removed(path):
+            logger.debug("Deleted image tempfile: %s", path)
+
+
+async def _report_unexpected_error(config: RunConfig) -> None:
+    """Tell the thread, and the lamp, that the turn blew up.
+
+    Each step is attempted regardless of the other: this also runs while the
+    bot is shutting down, when the connection may already be closed.
+    """
+    with contextlib.suppress(Exception):
+        await config.thread.send(embed=error_embed("An unexpected error occurred."))
+    if config.status:
+        with contextlib.suppress(Exception):
+            await config.status.set_error()
+
+
 async def _load_persisted_window(settings_repo: object, model: str) -> int | None:
     """Return the disk-persisted context-window total for ``model``, or None.
 
     Best-effort: a missing key, a malformed value, or any storage error yields
     None so the caller falls back to a live probe.
     """
-    # <<REDACTED 1 lines>>
+    with contextlib.suppress(Exception):
         raw = await settings_repo.get(f"{_CONTEXT_WINDOW_KEY_PREFIX}{model}")  # type: ignore[attr-defined]
         if raw is not None:
             value = int(raw)
@@ -176,7 +250,7 @@ async def _load_persisted_window(settings_repo: object, model: str) -> int | Non
 
 async def _store_persisted_window(settings_repo: object, model: str, total: int) -> None:
     """Persist ``total`` as the context-window for ``model`` (best-effort)."""
-    # <<REDACTED 1 lines>>
+    with contextlib.suppress(Exception):
         await settings_repo.set(f"{_CONTEXT_WINDOW_KEY_PREFIX}{model}", str(total))  # type: ignore[attr-defined]
 
 
@@ -213,7 +287,7 @@ async def _resolve_context_window(
     total: int | None = None
     probe = getattr(config.runner, "probe_context_window", None)
     if probe is not None:
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             result = await probe(model)
             total = result if isinstance(result, int) else None
     if total is not None:
@@ -230,7 +304,7 @@ async def _context_footer_enabled(settings_repo: object | None, field: str) -> b
     """Return True unless ``context_footer.<field>`` is explicitly set to ``"0"``."""
     if settings_repo is None:
         return True
-    # <<REDACTED 1 lines>>
+    with contextlib.suppress(Exception):
         val = await settings_repo.get(f"context_footer.{field}", default="1")  # type: ignore[attr-defined]
         return val != "0"
     return True
@@ -398,8 +472,9 @@ def withdraw_in_flight(thread_id: int) -> bool:
 def _note_orphans(thread_id: int, run: _InFlightRun, ctx: str) -> None:
     """Say so when *run* starts while an earlier run for its thread never exited.
 
-    The AskUserQuestion resume is not one: it is a nested call inside the same
-    turn (same task), and its outer run exits right after it.
+    A nested call inside the same turn (same task) is not one: its outer run
+    exits right after it. (The AskUserQuestion resume used to re-enter this way;
+    that path was removed in #1315.)
 
     An earlier run whose task has already ended can never log its ``exit`` —
     it is dropped from the ledger after being reported, so it is reported once.
@@ -426,17 +501,22 @@ def _note_orphans(thread_id: int, run: _InFlightRun, ctx: str) -> None:
         _IN_FLIGHT.pop(thread_id, None)
 
 
-# <<REDACTED 6 lines>>
+async def run_claude_with_config(config: RunConfig) -> str | None:
+    """Run one turn as described by *config* — the entry point every cog uses.
+
+    A cog builds a :class:`RunConfig` and hands it over; everything a turn
+    involves happens from here.
     #293: ``run_claude: enter`` and ``run_claude: exit`` are logged here and
     nowhere else, and ``exit`` is logged in a ``finally`` — so every ``enter``
     gets its ``exit``, whether the turn finished, failed, was pre-empted by the
     next message or was cancelled outright. The line says which
     (``outcome=ok|error|stopped|preempted|cancelled|crashed``) and how long the turn ran.
-    ``exit`` used to sit at the end of the turn body, where a cancel, an
-    exception or the AskUserQuestion resume all skipped it — and an ``enter``
-    with no ``exit`` read as a hang every time.
+    ``exit`` used to sit at the end of the turn body, where a cancel or an
+    exception skipped it — and an ``enter`` with no ``exit`` read as a hang
+    every time.
 
-    # <<REDACTED 3 lines>>
+    Returns the session id the turn ended on, or ``None`` if it failed.
+    """
     thread_id = config.thread.id
     ctx = log_ctx(thread_id=thread_id, session_id=config.session_id)
     logger.info("%s run_claude: enter (prompt=%d chars)", ctx, len(config.prompt))
@@ -445,9 +525,10 @@ def _note_orphans(thread_id: int, run: _InFlightRun, ctx: str) -> None:
     _note_orphans(thread_id, run, ctx)
     _IN_FLIGHT.setdefault(thread_id, []).append(run)
 
-    # #917: the outermost run of a turn announces its end. The AskUserQuestion
-    # resume below re-enters this function with a copy of the config that shares
-    # ``outcome``, and finds the turn already begun.
+    # #917: the outermost run of a turn announces its end. A call that re-enters
+    # this function with a config sharing ``outcome`` finds the turn already
+    # begun. (Nothing in c-lord re-enters since the AskUserQuestion resume was
+    # removed in #1315.)
     announces_end = config.outcome.turn is None
     if announces_end:
         config.outcome.turn = turn_events.begin_turn(
@@ -540,32 +621,37 @@ async def _run_turn(config: RunConfig, ctx: str) -> str | None:
         runner.on_prompt_sent = config.on_prompt_sent
     if config.on_send_started is not None:
         runner.on_send_started = config.on_send_started
-    # <<REDACTED 1 lines>>
+    processor = EventProcessor(config)
     run_errored = False
-# <<REDACTED 6 lines>>
+    try:
+        async for event in runner.run(config.prompt, session_id=config.session_id):
+            await processor.process(event)
             if event.is_complete and event.error:
                 run_errored = True
                 # #621: hand the reason back to the caller. A scheduled/webhook
                 # turn has nobody reading the thread, so an error that only ever
                 # became an embed is an error nobody ever sees.
                 config.outcome.error = event.error
-    # <<REDACTED 1 lines>>
+    except Exception:
         logger.exception("%s Error running Claude CLI", ctx)
         run_errored = True
         config.outcome.error = "An unexpected error occurred."
-        # <<REDACTED 15 lines>>
+        await _report_unexpected_error(config)
+        return processor.session_id
+    finally:
+        await processor.finalize()
+        if config.registry is not None:
+            config.registry.unregister(config.thread.id)
+        if config.image_paths:
+            await _cleanup_image_tempfiles(config.image_paths)
+
     # #219/#222: the run loop may have finalized just before an AskUserQuestion
     # menu rendered, leaving Claude blocked on a TUI menu that was never
     # bridged. Recover it by re-checking the pane. (This used to sit behind the
     # skill-mode guards, which left production never recovering a post-turn
     # menu, so the user saw no choices — #222.)
     pending_pane_ask = None
-    if (
-        not run_errored
-        and not processor.pending_ask
-        and isinstance(runner, TmuxClaudeRunner)
-        and not runner.stopped
-    ):
+    if not run_errored and isinstance(runner, TmuxClaudeRunner) and not runner.stopped:
         # ``runner.stopped`` guard (#315): a turn pre-empted by a follow-up message
         # was deliberately torn down; re-bridging its leftover menu here would
         # re-park the run on a fresh ``timeout=None`` await and the new turn could
@@ -586,13 +672,6 @@ async def _run_turn(config: RunConfig, ctx: str) -> str | None:
             notify_user_id=config.notify_user_id,
         )
 
-    # <<REDACTED 8 lines>>
-            authorizer=config.authorizer,
-            notify_user_id=config.notify_user_id,
-        # <<REDACTED 3 lines>>
-                "%s Resuming after AskUserQuestion answer",
-                log_ctx(thread_id=config.thread.id, session_id=processor.session_id),
-            # <<REDACTED 3 lines>>
     # #583: a turn the user's next message displaced gets no closing ceremony.
     # The footer describes a turn that did not reach its end, and it lands after
     # "⚡ Interrupted…" — i.e. on top of the message that replaced it, reading as
@@ -600,4 +679,35 @@ async def _run_turn(config: RunConfig, ctx: str) -> str | None:
     if not run_errored and not getattr(runner, "preempted", False):
         await _post_context_usage(config, processor.session_id)
 
-    # <<REDACTED 27 lines>>
+    return processor.session_id
+
+
+async def run_claude_in_thread(
+    thread: discord.Thread,
+    runner: TmuxClaudeRunner,
+    repo: SessionRepository | None,
+    prompt: str,
+    session_id: str | None,
+    status: StatusManager | None = None,
+    registry: SessionRegistry | None = None,
+    ask_repo: PendingAskRepository | None = None,
+    lounge_repo: LoungeRepository | None = None,
+) -> str | None:
+    """The pre-``RunConfig`` calling convention, kept for existing callers.
+
+    Packs its arguments into a :class:`RunConfig` (every other field at its
+    default) and defers to :func:`run_claude_with_config`.
+    """
+    return await run_claude_with_config(
+        RunConfig(
+            thread=thread,
+            runner=runner,
+            prompt=prompt,
+            session_id=session_id,
+            repo=repo,
+            status=status,
+            registry=registry,
+            ask_repo=ask_repo,
+            lounge_repo=lounge_repo,
+        )
+    )

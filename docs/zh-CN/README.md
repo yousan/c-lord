@@ -498,7 +498,7 @@ c_lord/
     chunker.py             # 感知代码块和表格的消息分割
     embeds.py              # Discord embed 构建器
     ask_view.py            # AskUserQuestion 的按钮/下拉菜单
-    ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB 生命周期
+    ask_handler.py         # bridge_pane_ask() — AskUserQuestion UI + DB 生命周期
     streaming_manager.py   # StreamingMessageManager — 防抖就地消息编辑
     thread_dashboard.py    # 显示会话状态的实时置顶 embed
   session_sync.py          # CLI 会话发现和导入

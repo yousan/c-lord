@@ -1,15 +1,36 @@
-# <<REDACTED 12 lines>>
+"""The buttons and dropdowns of one question, and the modal for a typed answer.
+
+An :class:`AskView` draws a single question of an ask menu.  It is a
+*persistent* view: it never times out, and every component carries a stable
+``custom_id`` so the bot can re-attach the view with ``bot.add_view()`` after a
+restart:
+
+- ``ask_{thread_id}_{q_idx}_select`` — the dropdown
+- ``ask_{thread_id}_{q_idx}_{n}`` — the button of option *n* (0-based)
+- ``ask_{thread_id}_{q_idx}_confirm`` / ``..._other`` — submit / free text
+
+The view never talks to Claude itself.  Answers travel over the ask bus:
 AskView callbacks call ``ask_bus.post_answer(thread_id, answers)``; if the
-# <<REDACTED 7 lines>>
+bus has an owner waiting on that thread the answer is queued for it, and
+otherwise the view says — on the menu message itself — why the answer could not
+be taken (or, on a view restored after a restart, types it into the pane that
+is still showing the menu).
 
 Options are identified by **index**, never by label (#674): a Select option's
 ``value`` is ``option:{index}``, a button is bound to its index, and what goes
 on the bus is a :class:`~.ask_bus.ChosenOption` — the full label, carrying the
 index it was chosen at.
-# <<REDACTED 4 lines>>
+"""
+
+from __future__ import annotations
+
 import contextlib
 import datetime as dt
-# <<REDACTED 5 lines>>
+import logging
+from typing import TYPE_CHECKING
+
+import discord
+
 from .ask_bus import (
     CLOSE_ANSWERED,
     CLOSE_INTERRUPTED,
@@ -19,21 +40,31 @@ from .ask_bus import (
     AskAnswerBus,
     ChosenOption,
 )
-# <<REDACTED 1 lines>>
+from .ask_bus import ask_bus as _default_ask_bus
 from .ask_menus import ask_menus, disable_stale_copies
 from .authorization import AuthorizedViewMixin, Authorizer
 from .embeds import ask_sending_embed, ask_undelivered_embed
 from .error_reporting import ErrorReportingViewMixin
-# <<REDACTED 2 lines>>
+
+if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable
 
-    # <<REDACTED 3 lines>>
+    from ..claude.types import AskOption, AskQuestion
+    from ..database.ask_repo import PendingAskRepository
+
     # #671: ``(selected, menu message) -> (delivered, reason)``. Implemented by
     # ``ask_menu_recovery.PaneMenuAnswerer``; typed structurally so the view does
     # not import the recovery module (which imports the view).
     RecoveryDeliver = Callable[[list[str], object | None], Awaitable[tuple[bool, str]]]
 
-# <<REDACTED 2 lines>>
+logger = logging.getLogger(__name__)
+
+# Up to this many options are drawn as buttons; more become a dropdown.
+_MAX_OPTION_BUTTONS = 4
+# Discord's ceiling on the entries of one Select.
+_MAX_SELECT_OPTIONS = 25
+# Discord's ceiling on a Select entry's label and description.
+_SELECT_TEXT_LIMIT = 100
 # When this process started.  A menu message older than this can only have come
 # from a previous process — which is the one case where "the bot restarted" is
 # the true explanation for an undeliverable answer (#536).
@@ -55,7 +86,8 @@ _CLOSED_RESTARTED = "この質問のあとに bot が再起動したため、セ
 
 # Left on the other copies of a menu once one of them is resolved (#536).
 _STALE_COPY_NOTE = "-# 🔁 この質問は別のメッセージで解決済みです（このボタンは無効です）"
-# <<REDACTED 2 lines>>
+
+
 def _button_label(label: str, index: int) -> str:
     """A label Discord will accept, for the option at *index* (#579).
 
@@ -87,18 +119,36 @@ def _option_value(index: int) -> str:
 
 
 class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
-    # <<REDACTED 10 lines>>
+    """One question's components: option buttons or a dropdown, plus extras.
+
+    Single-select questions with few options get one button per option; a
+    multiSelect question, or one with too many options for a button row, gets a
+    dropdown (and, for multiSelect, a ✅ confirm button).  Questions that allow
+    free text also get an ✏️ Other button that opens :class:`AskModal`.
+
     A click leaves the message in the **interim** ``⏳ 送信中`` state, never ✅
     (#651): at this point the answer has only reached an in-process queue. The
     bridge that actually types it into the pane replaces this with the outcome
     it verified against Claude's transcript.
 
-    # <<REDACTED 15 lines>>
+    The view is persistent (``timeout=None``) so it can be registered again
+    after a restart; nothing here depends on state that only the posting
+    process had, apart from the optional *recovery* hook below.
+    """
+
+    def __init__(
+        self,
+        question: AskQuestion,
+        thread_id: int,
+        q_idx: int,
+        bus: AskAnswerBus | None = None,
+        ask_repo: PendingAskRepository | None = None,
         authorizer: Authorizer | None = None,
         recovery: RecoveryDeliver | None = None,
-    # <<REDACTED 2 lines>>
+    ) -> None:
+        super().__init__(timeout=None)
         self._authorizer = authorizer
-        # <<REDACTED 1 lines>>
+        self._thread_id = thread_id
         # #671: what to do when the ask bus has no waiter. Set only on views
         # rebuilt at startup, where that is the NORMAL state (the coroutine that
         # would have received the answer died with the previous process) and the
@@ -107,7 +157,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         # Kept so the resolved message can still show WHAT was asked (#536):
         # the old code wiped the embed and left a bare "Selected: X".
         self._question = question
-        # <<REDACTED 2 lines>>
+        self._bus = _default_ask_bus if bus is None else bus
+        self._ask_repo = ask_repo
         # multiSelect records the choice in the Select and submits via the
         # ✅ confirm button (#418); single-select delivers immediately.
         self._multi_select = question.multi_select
@@ -116,22 +167,27 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         # #672: the Select is kept so a recorded choice can be written back into
         # it as ``default=True`` — see _multi_select_record.
         self._select: discord.ui.Select | None = None
-# <<REDACTED 12 lines>>
-                        label=_button_label(opt.label, i)[:100],
-                        # <<REDACTED 1 lines>>
-                        value=_option_value(i),
-                    # <<REDACTED 1 lines>>
-                    for i, opt in enumerate(options[:25])
-                # <<REDACTED 3 lines>>
+
+        # Components are named after the thread and question they belong to.
+        id_stem = f"ask_{thread_id}_{q_idx}"
+        options = question.options
+        if options and (question.multi_select or len(options) > _MAX_OPTION_BUTTONS):
+            select = self._build_select(question, options, custom_id=f"{id_stem}_select")
             select.callback = (
                 self._multi_select_record if question.multi_select else self._select_callback
             )
             self._select = select
-            # <<REDACTED 4 lines>>
+            self.add_item(select)
+        else:
+            for i, opt in enumerate(options[:_MAX_OPTION_BUTTONS]):
+                btn = discord.ui.Button(
                     label=_button_label(opt.label, i),
-                    # <<REDACTED 4 lines>>
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"{id_stem}_{i}",
+                    row=0,
+                )
                 btn.callback = _make_button_callback(self, i)
-                # <<REDACTED 2 lines>>
+                self.add_item(btn)
         # multiSelect needs an explicit submit affordance — the Select only
         # records the choice, so without this button the user has no way to
         # confirm (Discord's dismiss-to-submit is undiscoverable) (#418).
@@ -150,7 +206,42 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         # opens its own TUI feedback field), so a generic Other modal would
         # mis-send keystrokes into the open menu.
         if question.allow_other:
-            # <<REDACTED 13 lines>>
+            other_btn = discord.ui.Button(
+                label="✏️ Other",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"{id_stem}_other",
+                row=1,
+            )
+            other_btn.callback = self._other_callback
+            self.add_item(other_btn)
+
+    @staticmethod
+    def _build_select(
+        question: AskQuestion, options: list[AskOption], *, custom_id: str
+    ) -> discord.ui.Select:
+        """The dropdown for *options* — callers attach the callback themselves."""
+        offered = options[:_MAX_SELECT_OPTIONS]
+        pickable = len(options) if question.multi_select else 1
+        return discord.ui.Select(
+            placeholder=question.header or "Choose an option…",
+            min_values=1,
+            max_values=min(pickable, _MAX_SELECT_OPTIONS),
+            options=[
+                discord.SelectOption(
+                    label=_button_label(opt.label, i)[:_SELECT_TEXT_LIMIT],
+                    description=opt.description[:_SELECT_TEXT_LIMIT] if opt.description else None,
+                    value=_option_value(i),
+                )
+                for i, opt in enumerate(offered)
+            ],
+            custom_id=custom_id,
+        )
+
+    async def _drop_ledger_row(self) -> None:
+        """Take this thread's menu out of the restart ledger, when there is one."""
+        if self._ask_repo is not None:
+            await self._ask_repo.delete(self._thread_id)
+
     def _index_of(self, value: str) -> int | None:
         """The option a Select *value* names, or None when it names none (#674).
 
@@ -205,22 +296,23 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             return _CLOSED_RESTARTED
         return _CLOSED_UNKNOWN
 
-    # <<REDACTED 1 lines>>
+    async def _deliver(self, interaction: discord.Interaction, values: list[str]) -> None:
         """Deliver *values* via the bus and show the outcome IN THE THREAD (#536).
-# <<REDACTED 1 lines>>
+
         Both outcomes replace the menu with an embed that still carries the
         question, so the thread reads as "asked X, answered Y" long after the
         buttons are gone — and so a failure is visible to everyone in the thread
         rather than only to the person who clicked.
-# <<REDACTED 1 lines>>
+
         Whatever happens, the buttons stop inviting clicks: on the clicked
         message via this edit, on every other live copy via
         :func:`disable_stale_copies`.
-        # <<REDACTED 2 lines>>
+        """
+        delivered = self._bus.post_answer(self._thread_id, values)
         question = self._question
         message = getattr(interaction, "message", None)
         recovering = False
-        # <<REDACTED 1 lines>>
+        if delivered:
             # #651: the bus accepted the answer — that is all that is known
             # right now. The keystrokes have not been sent, and "sent" is not
             # "received" either (#650). The bridge replaces this with the
@@ -240,7 +332,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             )
             embed = ask_sending_embed(question.question, question.header, values)
             recovering = True
-        # <<REDACTED 3 lines>>
+        else:
+            await self._drop_ledger_row()
             reason = self._undeliverable_reason(interaction)
             logger.info(
                 "AskView: answer %r could not be delivered for thread %d (%s)",
@@ -259,7 +352,8 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         ask_menus.forget(self._thread_id, message_id)
         with contextlib.suppress(Exception):
             await disable_stale_copies(self._thread_id, message_id, _STALE_COPY_NOTE)
-        # <<REDACTED 2 lines>>
+        self.stop()
+
     async def _recover_via_pane(self, values: list[str], message: object | None) -> None:
         """Type *values* into the still-open TUI menu after a restart (#671).
 
@@ -280,9 +374,9 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         # NEXT boot re-armed a menu that no longer existed and then retired it —
         # overwriting the message that recorded the answer. The bridge gets this
         # from ``_close``; this path has no bridge, so it does it here.
-        # <<REDACTED 1 lines>>
+        if self._ask_repo is not None:
             with contextlib.suppress(Exception):
-                # <<REDACTED 1 lines>>
+                await self._ask_repo.delete(self._thread_id)
         if ok:
             return
         # Never the values themselves: on the ✏️ Other path they are whatever the
@@ -302,7 +396,9 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
                     view=None,
                 )
 
-    # <<REDACTED 2 lines>>
+    async def _select_callback(self, interaction: discord.Interaction) -> None:
+        """A single-select dropdown was used: its pick is the answer, right away."""
+        values = interaction.data.get("values", [])  # type: ignore[union-attr]
         indices = self._indices_of(values)
         if not indices:
             # Never deliver an empty answer: that is the #315 pre-emption signal,
@@ -321,7 +417,7 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             )
             return
         await self._deliver(interaction, self._answers(indices))
-# <<REDACTED 1 lines>>
+
     async def _multi_select_record(self, interaction: discord.Interaction) -> None:
         """Record a multiSelect choice WITHOUT delivering — the user submits via
         the ✅ confirm button (#418).
@@ -359,7 +455,7 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         #
         # ``view=self`` is load-bearing: without it the default marks above are
         # never sent to Discord and the selection stays process-local (#672).
-        # <<REDACTED 1 lines>>
+        await interaction.response.edit_message(
             content=(
                 f"🔲 **選択中:** {chosen}\n"
                 "**まだ送信されていません** — 下の「✅ 確定」を押すと Claude に届きます。"
@@ -432,9 +528,19 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             values,
             " (recovered from the message)" if recovered else "",
         )
-        # <<REDACTED 1 lines>>
+        await self._deliver(interaction, values)
 
-    # <<REDACTED 6 lines>>
+    async def _other_callback(self, interaction: discord.Interaction) -> None:
+        """✏️ Other: ask for a sentence in a modal and deliver it as the answer.
+
+        A modal that is dismissed, times out, or comes back empty changes
+        nothing — the menu stays open for another try.
+        """
+        modal = AskModal(title="Your answer")
+        await interaction.response.send_modal(modal)
+        timed_out = await modal.wait()
+        if not timed_out and modal.answer:
+            delivered = self._bus.post_answer(self._thread_id, [modal.answer])
             message = getattr(interaction, "message", None)
             question = self._question
             recovering = False
@@ -447,21 +553,21 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
                 embed = ask_sending_embed(question.question, question.header, [modal.answer])
                 recovering = True
             else:
-                # <<REDACTED 2 lines>>
+                await self._drop_ledger_row()
                 reason = self._undeliverable_reason(interaction)
                 # The free text is whatever the user typed — length only, never
                 # the content (same convention as the prompt logging in
                 # _run_helper: a modal is exactly where a secret would be pasted).
-                # <<REDACTED 1 lines>>
+                logger.warning(
                     "AskView._other_callback: free text (%d chars) undeliverable "
                     "for thread %d (%s)",
                     len(modal.answer),
-                    # <<REDACTED 1 lines>>
+                    self._thread_id,
                     reason,
                 )
                 embed = ask_undelivered_embed(
                     question.question, question.header, [modal.answer], reason
-                # <<REDACTED 1 lines>>
+                )
             # The modal already consumed the interaction response, so the menu
             # message is edited directly rather than through the interaction.
             if message is not None:
@@ -473,14 +579,49 @@ class AskView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             ask_menus.forget(self._thread_id, message_id)
             with contextlib.suppress(Exception):
                 await disable_stale_copies(self._thread_id, message_id, _STALE_COPY_NOTE)
-            # <<REDACTED 24 lines>>
+            self.stop()
+
+
+class AskModal(discord.ui.Modal):
+    """A one-field modal that collects a typed answer.
+
+    ``answer`` stays ``""`` unless the modal is actually submitted, which is
+    how the caller tells "typed something" from "closed it".
+    """
+
+    # Discord's ceiling on a modal title.
+    _TITLE_LIMIT = 45
+
+    # Declared on the class: discord.py gives every instance its own copy,
+    # reachable as ``self.text_input`` and already among the modal's items.
+    text_input: discord.ui.TextInput = discord.ui.TextInput(
+        label="Your answer",
+        placeholder="Type your answer here…",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500,
+    )
+
+    def __init__(self, title: str) -> None:
+        super().__init__(title=title[: self._TITLE_LIMIT])
+        self.answer: str = ""
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Keep the text first: the caller is woken by ``stop()`` and reads it.
+        self.answer = self.text_input.value
+        await interaction.response.defer()
+        self.stop()
+
+
 def _make_button_callback(view: AskView, index: int):
     """Factory that creates a button callback with *view* and option *index* bound.
-# <<REDACTED 5 lines>>
 
     Bound to the index, not the label (#674): two options the pane parser could
     not read both have the label ``""`` (#579), and matching by label always
     answered with the first of them.
-    # <<REDACTED 3 lines>>
+    """
+
+    async def on_press(interaction: discord.Interaction) -> None:
         await view._deliver(interaction, view._answers([index]))
-# <<REDACTED 2 lines>>
+
+    return on_press

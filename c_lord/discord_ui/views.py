@@ -1,13 +1,21 @@
-# <<REDACTED 6 lines>>
+"""Small button views attached to c-lord's own notices (stop, reopen, re-run, …)."""
+
+from __future__ import annotations
+
+import contextlib
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol, runtime_checkable
-# <<REDACTED 3 lines>>
+
+import discord
+
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..session_stop import StopOutcome, StopResult, stop_reply
 from .authorization import AuthorizedViewMixin, Authorizer
 from .error_reporting import ErrorReportingViewMixin
 from .slash_io import followup
-# <<REDACTED 3 lines>>
+
+logger = logging.getLogger(__name__)
 # Protocol-compatible type: any object with an async interrupt() method.
 # TmuxClaudeRunner satisfies this.
 
@@ -18,7 +26,7 @@ class Interruptable(Protocol):
     # implementations) counts as sent.
     async def interrupt(self) -> bool | None: ...
 
-# <<REDACTED 1 lines>>
+
 # Every message that carries a ⏹ Stop button starts with this. The startup sweep
 # (:mod:`c_lord.stale_stop_buttons`, #634) finds a previous process's leftovers
 # by it, so the text lives here and nowhere else — a copy that drifts becomes
@@ -27,26 +35,58 @@ STOP_MESSAGE_PREFIX = "-# ⏺ Session running"
 
 
 class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
-    # <<REDACTED 2 lines>>
+    """The ⏹ Stop button under the "session running" line of a turn.
+
     Clicking it runs ``on_stop`` — the same stop ``/stop`` and ``!stop`` run
     (``ClaudeChatCog._stop_thread_work``, #878): interrupt the turn, end the
     background commands, and keep a self-started turn from carrying on. The
     reply comes from :func:`c_lord.session_stop.stop_reply`, so the button
     never says "stopped" when the stop failed. Without ``on_stop`` (older
     callers) it falls back to ``runner.interrupt()``.
-# <<REDACTED 5 lines>>
+
+    The button answers only in the process that posted it (no ``custom_id``,
+    no timeout). When the turn ends by itself, :meth:`disable` removes the
+    message the button sits on.
+    """
+
     def __init__(
         self,
         runner: Interruptable,
         authorizer: Authorizer | None = None,
         on_stop: Callable[[], Awaitable[StopResult]] | None = None,
     ) -> None:
-        # <<REDACTED 2 lines>>
+        super().__init__(timeout=None)
+        self._runner = runner
         self._on_stop = on_stop
         self._authorizer = authorizer
-        # <<REDACTED 11 lines>>
+        # True once the button was pressed or the message was cleared away.
+        self._stopped = False
+        # The message this button is attached to — see set_message.
+        self._message: discord.Message | None = None
+
+    def set_message(self, message: discord.Message) -> None:
+        """Tell the view which message it was sent on, so :meth:`disable` can find it."""
+        self._message = message
+
+    def _retire(self) -> bool:
+        """Mark the button used up. False when it already was — do nothing then."""
+        if self._stopped:
+            return False
+        self._stopped = True
+        return True
+
+    @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger)
+    async def stop_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         """Stop the thread's Claude work — the same stop as /stop and !stop (#878)."""
-        # <<REDACTED 7 lines>>
+        if not self._retire():
+            # A second press while the first is still being handled: just ACK.
+            await interaction.response.defer()
+            return
+
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
 
         result = await self._run_stop()
         content, embed, ephemeral = stop_reply(result)
@@ -57,9 +97,10 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             # dead "stopped" control over a turn that may still be running.
             self._stopped = False
             button.disabled = False
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 await interaction.edit_original_response(view=self)
-# <<REDACTED 2 lines>>
+
+        with contextlib.suppress(Exception):
             if embed is not None:
                 await interaction.followup.send(embed=embed)
             else:
@@ -70,9 +111,20 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
             return await self._on_stop()
         sent = await self._runner.interrupt()
         return StopResult(StopOutcome.FAILED if sent is False else StopOutcome.STOPPED)
-# <<REDACTED 2 lines>>
+
+    async def disable(self, message: discord.Message | None = None) -> None:
         """Delete the stop-button message after the session ends naturally.
-# <<REDACTED 12 lines>>
+
+        Does nothing once the button was pressed or the message already
+        cleared. *message* overrides the one given to :meth:`set_message`.
+        """
+        # Retired before Discord is touched: a failed delete must not leave the
+        # view looking live.
+        if not self._retire():
+            return
+        self.stop()
+        target = message or self._message
+        if target:
             try:
                 await target.delete()
             except discord.HTTPException:
@@ -119,12 +171,13 @@ class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui
 
     @discord.ui.button(label="再開する", emoji="▶️", style=discord.ButtonStyle.primary)
     async def reopen_button(
-        # <<REDACTED 2 lines>>
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         """Reopen the session and run the held message."""
         # Guard against a double click: reopening twice would dispatch the held
         # message twice, i.e. run the user's instruction two times.
         if self._reopened:
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(discord.HTTPException):
                 await interaction.response.send_message(
                     "▶️ このスレッドは再開済みです。", ephemeral=True
                 )
@@ -134,7 +187,7 @@ class ReopenSessionView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui
         button.disabled = True
         button.label = "再開しました"
         with contextlib.suppress(*DISCORD_CALL_FAILURES):
-            # <<REDACTED 1 lines>>
+            await interaction.response.defer()
         # ``interaction.message`` is None for interactions that did not originate
         # from a message (never the case for a button, but the type allows it).
         if interaction.message is not None:
@@ -179,11 +232,12 @@ class TextAnsweredMenuView(AuthorizedViewMixin, ErrorReportingViewMixin, discord
         style=discord.ButtonStyle.secondary,
     )
     async def rerun_button(
-        # <<REDACTED 2 lines>>
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         """Re-run the message as a new instruction instead of a menu answer."""
         # A double click would dispatch the instruction twice.
         if self._rerun:
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(discord.HTTPException):
                 await interaction.response.send_message(
                     "⚡ すでに新しい指示として実行しています。", ephemeral=True
                 )
@@ -193,7 +247,7 @@ class TextAnsweredMenuView(AuthorizedViewMixin, ErrorReportingViewMixin, discord
         button.disabled = True
         button.label = "新しい指示として実行しました"
         with contextlib.suppress(*DISCORD_CALL_FAILURES):
-            # <<REDACTED 1 lines>>
+            await interaction.response.defer()
         if interaction.message is not None:
             with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await interaction.message.edit(view=self)
@@ -224,12 +278,13 @@ class StatusShowAllView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui
         on_show_all: Callable[[discord.Interaction], Awaitable[None]],
         authorizer: Authorizer | None = None,
     ) -> None:
-        # <<REDACTED 1 lines>>
+        super().__init__(timeout=None)
         self._on_show_all = on_show_all
         self._authorizer = authorizer
 
     @discord.ui.button(label="すべてを表示", emoji="📋", style=discord.ButtonStyle.secondary)
     async def show_all_button(
-        # <<REDACTED 2 lines>>
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         """Show the channel-wide status to the presser only."""
         await self._on_show_all(interaction)

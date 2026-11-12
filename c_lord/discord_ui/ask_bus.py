@@ -1,6 +1,22 @@
-# <<REDACTED 16 lines>>
+"""The hand-off point between a menu's buttons and whoever is waiting on them.
+
+A question menu has two ends that never meet directly: the coroutine that
+posted the menu and now waits for its answer, and the Discord interaction that
+fires when somebody presses a button.  They find each other here, by thread id.
+
+The waiting end calls :meth:`AskAnswerBus.register` and gets a queue; the
+pressing end calls :meth:`AskAnswerBus.post_answer`, which drops the answer
+into that queue.  A queue (rather than a one-shot future) means a second press
+can never raise, and the waiter is free to pick its own timeout.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
 import time
-# <<REDACTED 3 lines>>
+
+logger = logging.getLogger(__name__)
 # Why a thread's menu stopped accepting answers (#536).  A click that arrives
 # after the fact needs the real reason: "the bot restarted" was told to every
 # late clicker, including the one who had just answered in the terminal.
@@ -26,7 +42,7 @@ DELIVERY_UNCONFIRMED = "unconfirmed"  # keys landed, the outcome could not be re
 _CLOSE_NOTE_TTL = 86_400.0
 _MAX_CLOSE_NOTES = 512
 
-# <<REDACTED 1 lines>>
+
 class ChosenOption(str):
     """An answer that IS option ``option_index`` of its menu (#674).
 
@@ -39,9 +55,8 @@ class ChosenOption(str):
     text with no index (✏️ Other, a typed sentence) is matched by label.
 
     It is still the option's full label as a string, so everything that only
-    *shows* an answer — the embeds, the logs, the non-tmux answer prompt —
-    reads it unchanged. (``option_index``, not ``index``: that would shadow
-    ``str.index``.)
+    *shows* an answer — the embeds, the logs — reads it unchanged.
+    (``option_index``, not ``index``: that would shadow ``str.index``.)
     """
 
     option_index: int
@@ -52,9 +67,17 @@ class ChosenOption(str):
         return choice
 
 
-# <<REDACTED 5 lines>>
+class AskAnswerBus:
+    """Per-thread answer queues, shared by every session in the process.
+
+    Whoever claims a thread's menu waits on the Queue it is given; the button
+    and Select callbacks of that menu's View
     post the chosen options (as :class:`ChosenOption`) into that Queue.
-    # <<REDACTED 4 lines>>
+    """
+
+    def __init__(self) -> None:
+        # thread_id -> the queue its current menu owner is waiting on
+        self._waiters: dict[int, asyncio.Queue[list[str]]] = {}
         # thread_id -> (noted_at_monotonic, reason) — see note_closed (#536)
         self._closed: dict[int, tuple[float, str]] = {}
         # thread_id -> may a typed sentence be delivered as this menu's answer?
@@ -67,7 +90,7 @@ class ChosenOption(str):
         self, thread_id: int, *, allow_free_text: bool = False
     ) -> asyncio.Queue[list[str]] | None:
         """Claim the menu for *thread_id* and return its Queue, or None (#535).
-# <<REDACTED 1 lines>>
+
         *allow_free_text* says whether the claimed menu can accept a typed
         sentence as its answer (#536 AC7).  Only the bridge knows: an
         AskUserQuestion has a ``Type something.`` row, a plan-approval menu does
@@ -89,15 +112,18 @@ class ChosenOption(str):
         (#535).  Checking ``is_active`` first cannot fix that: the check and
         the register are two steps and both bridges can pass the check.  This
         method is the single atomic step, so exactly one bridge wins.
-        # <<REDACTED 1 lines>>
+        """
         if thread_id in self._waiters:
             logger.debug(
                 "AskAnswerBus: thread %d already has an owner — refusing register", thread_id
             )
             return None
-        # <<REDACTED 2 lines>>
+        waiter: asyncio.Queue[list[str]] = asyncio.Queue()
+        self._waiters[thread_id] = waiter
         self._free_text[thread_id] = allow_free_text
-        # <<REDACTED 3 lines>>
+        logger.debug("AskAnswerBus: registered waiter for thread %d", thread_id)
+        return waiter
+
     def is_active(self, thread_id: int) -> bool:
         """Return True if a bridge is currently waiting for an answer on *thread_id*.
 
@@ -107,7 +133,21 @@ class ChosenOption(str):
         """
         return thread_id in self._waiters
 
-    # <<REDACTED 14 lines>>
+    def post_answer(self, thread_id: int, answers: list[str]) -> bool:
+        """Hand *answers* to whoever owns *thread_id*'s menu.
+
+        ``True`` says only that an owner was there to receive them — not that
+        Claude has seen them.  ``False`` means nobody is waiting any more (the
+        menu was closed, or the process that posted it is gone).
+        """
+        try:
+            self._waiters[thread_id].put_nowait(answers)
+        except KeyError:
+            logger.debug("AskAnswerBus: no waiter for thread %d (bot restarted?)", thread_id)
+            return False
+        logger.debug("AskAnswerBus: delivered %r to thread %d", answers, thread_id)
+        return True
+
     def accepts_free_text(self, thread_id: int) -> bool:
         """True if a typed sentence may be delivered as this menu's answer (#536).
 
@@ -150,9 +190,16 @@ class ChosenOption(str):
         """Stop listening for *thread_id*'s delivery verdict (#804)."""
         self._delivery.pop(thread_id, None)
 
-    # <<REDACTED 3 lines>>
-        self._free_text.pop(thread_id, None)
-        # <<REDACTED 2 lines>>
+    def unregister(self, thread_id: int) -> None:
+        """Give up *thread_id*'s menu.  Safe to call when nothing is claimed.
+
+        Only what :meth:`register` set up is dropped; the closure note and the
+        delivery channel have lifetimes of their own.
+        """
+        for claimed in (self._waiters, self._free_text):
+            claimed.pop(thread_id, None)
+        logger.debug("AskAnswerBus: unregistered waiter for thread %d", thread_id)
+
     def note_closed(self, thread_id: int, reason: str) -> None:
         """Record WHY *thread_id*'s menu stopped accepting answers (#536).
 
@@ -186,4 +233,6 @@ class ChosenOption(str):
             return None
         return reason
 
-# <<REDACTED 3 lines>>
+
+# The one bus of this process: views post to it, bridges wait on it.
+ask_bus = AskAnswerBus()

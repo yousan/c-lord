@@ -1,26 +1,112 @@
-# <<REDACTED 9 lines>>
+"""Runs the tasks in the ``scheduled_tasks`` table when they fall due.
+
+How the pieces fit:
+
+- Tasks are rows in SQLite, added and removed at runtime over the REST API.
+- A single master loop wakes every ``MASTER_LOOP_INTERVAL_SECONDS`` and starts
+  whatever is due. ``discord.ext.tasks`` drives that one loop only — a
+  decorator per task would fix the set of tasks at import time.
+- What a task *does* is up to Claude, working from the task's prompt;
   c-lord only manages scheduling.
-# <<REDACTED 13 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import TYPE_CHECKING
+
+import discord
+from discord.ext import commands, tasks
+
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
 from ..model_scopes import begin_turn_for, effort_for_launch
 from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..turn_events import StartedBy
 from ..utils.logger import log_ctx
-# <<REDACTED 4 lines>>
+from ._run_helper import run_claude_with_config
+from .run_config import RunConfig
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
     from ..claude.config import ClaudeConfig
-    # <<REDACTED 13 lines>>
+    from ..database.task_repo import TaskRepository
+
+# How often the master loop looks for due tasks, in seconds.
+MASTER_LOOP_INTERVAL_SECONDS = 30
+
+
+class SchedulerCog(commands.Cog):
+    """Starts each due task in a thread of its own.
+
+    Args:
+        bot: The bot the cog is loaded into.
         runner: ClaudeConfig with CLI settings.
-        # <<REDACTED 6 lines>>
+        repo: Where the scheduled tasks are stored.
+    """
+
+    def __init__(
+        self,
+        bot: commands.Bot,
         runner: ClaudeConfig,
-        # <<REDACTED 26 lines>>
+        *,
+        repo: TaskRepository,
+    ) -> None:
+        self.bot = bot
+        self.runner = runner
+        self.repo = repo
+        # Ids of the tasks whose run is under way. A run adds and removes its
+        # own id (``_run_task``); the loop only consults it.
+        self._running: set[int] = set()
+        # The runs the loop started and nobody awaits — referenced from here so
+        # they cannot be garbage-collected half way through.
+        self._launched: set[asyncio.Task[None]] = set()
+
+    # -- the master loop ------------------------------------------------
+
+    async def cog_load(self) -> None:
+        self._master_loop.start()
+        logger.info("SchedulerCog loaded — master loop started")
+
+    def cog_unload(self) -> None:
+        # The loop stops looking for work; runs already launched carry on.
+        self._master_loop.cancel()
+        logger.info("SchedulerCog unloaded — master loop stopped")
+
+    @tasks.loop(seconds=MASTER_LOOP_INTERVAL_SECONDS)
+    async def _master_loop(self) -> None:
+        """One tick: launch what is due, in the order the repository gives it."""
+        due = await self.repo.get_due()
+        if not due:
+            return
         due_ids = [t["id"] for t in due]
         logger.info("SchedulerCog: %d task(s) due (ids=%s)", len(due), due_ids)
-        # <<REDACTED 3 lines>>
-                logger.debug("%s still running — skipping", log_ctx(task_id=task_id))
-                # <<REDACTED 8 lines>>
-                name=f"clord-scheduler-{task_id}",
-            # <<REDACTED 6 lines>>
+        for task in due:
+            await self._launch(task)
+
+    @_master_loop.before_loop
+    async def _before_master_loop(self) -> None:
+        """No tick before the bot is connected: a run needs its channels."""
+        await self.bot.wait_until_ready()
+
+    async def _launch(self, task: dict) -> None:
+        """Start *task* running by itself — unless its previous run is still going.
+
+        The next run time is pushed forward before the run starts, so a run
+        that outlives a tick is not started a second time by the next one. A
+        task that is skipped keeps its due time and comes up again next tick.
+        """
+        task_id = task["id"]
+        if task_id in self._running:
+            logger.debug("%s still running — skipping", log_ctx(task_id=task_id))
+            return
+        await self.repo.update_next_run(task_id, interval_seconds=task["interval_seconds"])
+        run = asyncio.create_task(self._run_task(task), name=f"clord-scheduler-{task_id}")
+        self._launched.add(run)
+        run.add_done_callback(self._launched.discard)
+
     async def _resolve_tmux_manager(self, channel_id: int, *, thread_id: int | None):
         """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
         from .channel_repo import ChannelRepoCog
@@ -65,31 +151,40 @@ from ..utils.logger import log_ctx
                 exc_info=True,
             )
 
-    # <<REDACTED 2 lines>>
+    async def _run_task(self, task: dict) -> None:
+        """Run one task from start to finish in a new thread of its channel."""
         from ..claude.tmux_runner import TmuxClaudeRunner
 
-        # <<REDACTED 1 lines>>
+        task_id = task["id"]
         ctx = log_ctx(task_id=task_id, channel_id=task["channel_id"])
-        # <<REDACTED 1 lines>>
+        self._running.add(task_id)
         logger.info("%s _run_task: enter (name=%s)", ctx, task["name"])
-        # <<REDACTED 3 lines>>
+        try:
+            channel = self.bot.get_channel(task["channel_id"])
+            if channel is None:
                 logger.warning("%s channel not found (name=%s)", ctx, task["name"])
-                # <<REDACTED 2 lines>>
+                return
+            if not isinstance(channel, discord.TextChannel):
                 logger.warning("%s channel is not a TextChannel", ctx)
-                # <<REDACTED 2 lines>>
+                return
             # A scheduled task targets a channel, never a thread (#600 audit).
             tmux = await self._resolve_tmux_manager(channel.id, thread_id=None)
             if tmux is None:
                 logger.warning("%s no tmux manager (name=%s)", ctx, task["name"])
                 return
 
-            # <<REDACTED 5 lines>>
+            # The thread hangs off a message posted in the channel. A thread
+            # created with no message behind it shows up in the thread list
+            # only — not in the channel's timeline, nor in the sidebar — so
+            # nobody would see that the task ran.
+            starter = await channel.send(f"🔄 **[Scheduled]** `{task['name']}`")
             archive_minutes = await resolve_auto_archive_duration(
                 getattr(self.bot, "settings_repo", None)
             )
-            # <<REDACTED 2 lines>>
+            thread = await starter.create_thread(
+                name=f"[Scheduled] {task['name']}",
                 auto_archive_duration=archive_minutes,
-            # <<REDACTED 2 lines>>
+            )
             working_dir = task.get("working_dir") or self.runner.working_dir
 
             # #621: create the tmux window BEFORE building the runner.  This
@@ -141,9 +236,10 @@ from ..utils.logger import log_ctx
                 dangerously_skip_permissions=True,
                 effort=effort_for_launch(model, turn.effort if turn else self.runner.effort),
             )
-# <<REDACTED 2 lines>>
+
+            registry = getattr(self.bot, "session_registry", None)
             run_config = RunConfig(
-                # <<REDACTED 1 lines>>
+                thread=thread,
                 runner=runner,
                 # #687: persist the session row. Without it the thread is
                 # UNTRACKED to :mod:`c_lord.session_resume`, so every reply to a
@@ -158,7 +254,9 @@ from ..utils.logger import log_ctx
                 # it needs the same allowlist to gate them.
                 authorizer=getattr(self.bot, "authorizer", None),
                 working_dir=working_dir,
-                # <<REDACTED 3 lines>>
+                prompt=task["prompt"],
+                session_id=None,
+                registry=registry,
                 # #480: scheduled turns have no human poster — fall back to
                 # the bot owner so a question-mode pause still pings someone
                 # (#525: unless this deployment turned that fallback off).
@@ -169,7 +267,7 @@ from ..utils.logger import log_ctx
                 failure_notify_id=owner_notify_id(self.bot, kind="failure"),
                 # #917: the turn-end event names the task that started the run.
                 started_by=StartedBy("scheduler", str(task["id"]), str(task["name"])),
-            # <<REDACTED 1 lines>>
+            )
             # #754: a scheduled run is a live session like any other, so it is
             # on 📊 Session Status while it runs. It used to be invisible there.
             # Labelled by its (already public) name — the prompt stays private.
@@ -185,7 +283,10 @@ from ..utils.logger import log_ctx
                     ctx,
                     task["name"],
                     run_config.outcome.error,
-                # <<REDACTED 3 lines>>
+                )
+        except Exception:
+            # Nobody awaits this task, so the failure is reported here or nowhere.
             logger.exception("%s task failed (name=%s)", ctx, task["name"])
-        # <<REDACTED 2 lines>>
+        finally:
+            self._running.discard(task_id)
             logger.info("%s _run_task: exit", ctx)

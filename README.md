@@ -811,7 +811,7 @@ c_lord/
     reply_chunker.py       # Fence- and table-aware message splitting (Skill reply)
     embeds.py              # Discord embed builders
     ask_view.py            # Buttons/Select Menus for AskUserQuestion
-    ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB lifecycle
+    ask_handler.py         # bridge_pane_ask() — AskUserQuestion UI + DB lifecycle
     thread_dashboard.py    # Live pinned embed showing session states
   session_dir.py           # One git clone per thread (never removes a dir with uncommitted changes)
   ext/

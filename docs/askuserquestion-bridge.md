@@ -15,9 +15,10 @@ stall with no way to answer. This bridge parses that menu, shows Discord
 buttons, and delivers the choice back to the still-open menu as keystrokes.
 
 > Note: the JSONL transcript carries the AskUserQuestion tool call, but the
-> tmux runner does **not** populate `StreamEvent.ask_questions` — that field is
-> only filled by the (currently unused) SDK-streaming runner. The live bridge
-> works by **parsing the pane** (`_parse_ask_from_pane`), not the JSONL.
+> tmux runner does **not** populate `StreamEvent.ask_questions` — nothing in the
+> tree sets that field, and the code that consumed it (`collect_ask_answers`,
+> the resume-with-the-answer-as-a-prompt path) was removed in #1315. The live
+> bridge works by **parsing the pane** (`_parse_ask_from_pane`), not the JSONL.
 
 ## Side-by-side
 
@@ -140,7 +141,7 @@ a log line — it is never delivered as an empty answer, which is the #315
 pre-emption signal and would Esc the menu away.
 
 Because what travels is still the full label, everything that only *shows* the
-answer (the ⏳ / ✅ embeds, the non-tmux answer prompt) now shows the whole
+answer (the ⏳ / ✅ embeds, the logs) now shows the whole
 option rather than its first 80 characters.
 
 ## How a multi-select is answered (#418)
@@ -563,8 +564,8 @@ several times a day.
 The recovery machinery (`pending_asks` + a persistent `AskView` re-registered on
 boot) had shipped long before, and had **never run once**: all four bridge routes
 go through `bridge_pane_ask`, and none of them wrote a row. The only writer,
-`collect_ask_answers`, needs `StreamEvent.ask_questions`, which nothing in the
-tree sets. Measured at `e7015d6`: `select count(*) from pending_asks` = 0, and
+`collect_ask_answers` (removed since, #1315), needed `StreamEvent.ask_questions`,
+which nothing in the tree sets. Measured at `e7015d6`: `select count(*) from pending_asks` = 0, and
 `Restoring N pending AskUserQuestion view(s)` appears **0 times in all 169 bot
 logs ever written**.
 

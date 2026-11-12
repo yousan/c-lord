@@ -1,15 +1,37 @@
-# <<REDACTED 17 lines>>
+"""``/skill`` (and its text twin ``!skill``): run a Claude Code skill by name.
+
+The skills are whatever lives under ``~/.claude/skills/``. The slash command
+offers them with autocomplete and has Claude type ``/<name> <args>``:
+
+    /skill name:goodmorning                  →  /goodmorning
+    /skill name:todoist args:filter "today"  →  /todoist filter "today"
+
+Used inside a thread of the Claude channel, the skill runs in that thread's
+session; anywhere else, a new thread is opened for it. The list of skills is
+re-read lazily, at most every ``SKILL_RELOAD_INTERVAL`` seconds, so a skill
+added on disk shows up without restarting the bot.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import contextlib
-# <<REDACTED 3 lines>>
+import logging
+import re
+import time
 from collections.abc import Awaitable, Callable
-# <<REDACTED 1 lines>>
+from pathlib import Path
 from typing import TYPE_CHECKING
-# <<REDACTED 5 lines>>
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..command_gate import is_message_authorized
-# <<REDACTED 2 lines>>
+from ..concurrency import SessionRegistry
+from ..database.repository import SessionRepository
 from ..database.settings_repo import SettingsRepository
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.authorization import Authorizer
@@ -21,32 +43,141 @@ from ..thread_settings import resolve_auto_archive_duration
 from ..turn_events import StartedBy
 from ..utils.logger import log_ctx
 from ._run_helper import has_other_run_in_flight, run_claude_with_config
-# <<REDACTED 2 lines>>
+from .run_config import RunConfig
+
 if TYPE_CHECKING:
     from ..session_dir import SessionDirManager
     from ..tmux import TmuxSessionManager
-# <<REDACTED 3 lines>>
+
+logger = logging.getLogger(__name__)
 # Callbacks the shared skill core uses to stay agnostic of slash vs text entry.
 Responder = Callable[..., Awaitable[None]]
 Acknowledger = Callable[[], Awaitable[None]]
 
-# <<REDACTED 52 lines>>
+# Seconds between two readings of the skills directory.
+SKILL_RELOAD_INTERVAL = 60.0
+
+# Discord's ceilings: choices offered at once, and the length of one's label.
+_MAX_CHOICES = 25
+_CHOICE_LABEL_LIMIT = 100
+# How much of a skill's description a choice shows before it is cut.
+_CHOICE_DESCRIPTION_CHARS = 60
+# Discord's ceiling on a thread name.
+_THREAD_NAME_LIMIT = 100
+
+# The opening and closing fence of a SKILL.md frontmatter block.
+_FENCE = "---"
+# One ``key: value`` entry of a frontmatter block. The key starts its line; the
+# whitespace skipped after the colon may run over line ends, so a key with
+# nothing after it takes the next non-blank line as its value.
+_FRONTMATTER_ENTRY = re.compile(r"^(\w[\w-]*):\s*(.+)$", re.MULTILINE)
+# What a skill name may look like. It is typed into Claude's prompt, so this
+# check is a security boundary — keep it strict.
+_SKILL_NAME = re.compile(r"^[\w-]+$")
+
+
+def _frontmatter_block(text: str) -> str | None:
+    """The text between the ``---`` fences opening *text*, or ``None``.
+
+    The first line must be the fence itself (spaces or tabs may trail it), and
+    the block runs up to the next line that begins with a fence.
+    """
+    opening, newline, rest = text.partition("\n")
+    if not newline or not opening.startswith(_FENCE) or opening[len(_FENCE) :].strip(" \t"):
+        return None
+    block: list[str] = []
+    for line in rest.split("\n"):
+        if line.startswith(_FENCE):
+            return "\n".join(block)
+        block.append(line)
+    return None
+
+
+def _parse_skill_meta(skill_dir: Path) -> dict[str, str] | None:
+    """``{"name", "description"}`` from *skill_dir*'s ``SKILL.md`` frontmatter.
+
+    ``None`` when there is no ``SKILL.md``, no frontmatter in it, or it cannot
+    be read. A missing ``name`` falls back to the directory's name.
+    """
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        return None
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("Failed to read %s", skill_md)
+        return None
+
+    block = _frontmatter_block(text)
+    if block is None:
+        return None
+    # dict() keeps the last of several entries with the same key.
+    entries = dict(_FRONTMATTER_ENTRY.findall(block))
+    return {
+        "name": entries.get("name", skill_dir.name).strip(),
+        "description": entries.get("description", "").strip(),
+    }
+
+
+def _load_skills(skills_dir: Path) -> list[dict[str, str]]:
+    """Every skill found directly under *skills_dir*, in directory-name order."""
+    if not skills_dir.is_dir():
+        logger.warning("Skills directory not found: %s", skills_dir)
+        return []
+    candidates = (entry for entry in sorted(skills_dir.iterdir()) if entry.is_dir())
+    skills = [meta for meta in map(_parse_skill_meta, candidates) if meta]
+    logger.info("Loaded %d skills from %s", len(skills), skills_dir)
+    return skills
+
+
+def _choice_label(skill: dict[str, str]) -> str:
+    """How *skill* reads in the autocomplete list: its name, then a short description."""
+    name, description = skill["name"], skill["description"]
+    if not description:
+        return name
+    shown = description[:_CHOICE_DESCRIPTION_CHARS]
+    if len(description) > _CHOICE_DESCRIPTION_CHARS:
+        shown += "…"
+    return f"{name} — {shown}"
+
+
+class SkillCommandCog(commands.Cog):
+    """The ``/skill`` slash command, its autocomplete, and the ``!skill`` text twin."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        repo: SessionRepository,
         runner: ClaudeConfig,
-        # <<REDACTED 4 lines>>
+        claude_channel_id: int,
+        skills_dir: Path | str | None = None,
+        allowed_user_ids: set[int] | None = None,
+        registry: SessionRegistry | None = None,
         allowed_role_name: str | None = None,
         authorizer: Authorizer | None = None,
         settings_repo: SettingsRepository | None = None,
-    # <<REDACTED 2 lines>>
+    ) -> None:
+        self.bot = bot
         # #927: where /model's settings live. Optional (zero-config) — see
         # :meth:`_settings_repo_for_turn` for the fallback.
         self._settings_repo = settings_repo
-        # <<REDACTED 4 lines>>
+        self.repo = repo
+        self.runner = runner
+        self.claude_channel_id = claude_channel_id
+        self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         # #713: the one allowlist rule, shared with every other gate (#466's
         # DRY, finished). ``setup_bridge`` passes the instance ClaudeChatCog
         # uses, so the owner resolved at startup applies to /skill too.
         self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
-        # <<REDACTED 9 lines>>
+        self._registry = registry or getattr(bot, "session_registry", None)
+        self._skills_dir = (
+            Path.home() / ".claude" / "skills" if skills_dir is None else Path(skills_dir)
+        )
+        # Read once now; ``_maybe_reload_skills`` keeps it fresh afterwards.
+        self._skills = _load_skills(self._skills_dir)
+        self._last_loaded: float = time.monotonic()
+
     async def _resolve_session_dir_manager(
         self, channel_id: int, thread_id: int | None = None
     ) -> SessionDirManager | None:
@@ -74,7 +205,17 @@ Acknowledger = Callable[[], Awaitable[None]]
             return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
-    # <<REDACTED 7 lines>>
+    def _maybe_reload_skills(self) -> None:
+        """Read the skills directory again once the last reading has aged out."""
+        now = time.monotonic()
+        if self._skills_fresh_at(now):
+            return
+        self._skills, self._last_loaded = _load_skills(self._skills_dir), now
+
+    def _skills_fresh_at(self, now: float) -> bool:
+        """Whether the list read at ``_last_loaded`` still counts at *now*."""
+        return now - self._last_loaded < SKILL_RELOAD_INTERVAL
+
     def _is_authorized(self, member: discord.Member | discord.User | int) -> bool:
         """Check if a member/user is authorized.
 
@@ -87,7 +228,29 @@ Acknowledger = Callable[[], Awaitable[None]]
         if isinstance(member, int):
             return self._authorizer.is_allowed_user_id(member)
         return self._authorizer.is_allowed(member)
-# <<REDACTED 26 lines>>
+
+    async def _skill_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Choices for ``/skill name:`` — skills whose name or description contains *current*.
+
+        Defined above ``run_skill``, whose decorator refers to it by name.
+        """
+        self._maybe_reload_skills()
+        needle = current.lower()
+        matching = [
+            skill
+            for skill in self._skills
+            if needle in skill["name"].lower() or needle in skill["description"].lower()
+        ]
+        return [
+            app_commands.Choice(
+                name=_choice_label(skill)[:_CHOICE_LABEL_LIMIT],
+                value=skill["name"],
+            )
+            for skill in matching[:_MAX_CHOICES]
+        ]
+
     def _earlier_triggers_forgetter(
         self, thread_id: int, mirror_cog: object, prior: set[int | None]
     ) -> Callable[[], Awaitable[None]]:
@@ -224,7 +387,10 @@ Acknowledger = Callable[[], Awaitable[None]]
             )
         return turn, True
 
-    # <<REDACTED 4 lines>>
+    def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:
+        """Whether *channel* is a thread of the Claude channel."""
+        return isinstance(channel, discord.Thread) and channel.parent_id == self.claude_channel_id
+
     async def _prepare_workspace(
         self,
         *,
@@ -290,16 +456,16 @@ Acknowledger = Callable[[], Awaitable[None]]
         return True, working_dir
 
     async def _run_skill_impl(
-        # <<REDACTED 1 lines>>
+        self,
         *,
         channel: object,
         user: discord.Member | discord.User,
-        # <<REDACTED 1 lines>>
+        name: str,
         args: str | None,
         respond: Responder,
         ack: Acknowledger,
         message: discord.Message | None = None,
-    # <<REDACTED 1 lines>>
+    ) -> None:
         """Shared core for the ``/skill`` slash command and the ``!skill`` text twin.
 
         ``respond`` posts a message the way the caller needs (interaction
@@ -320,15 +486,26 @@ Acknowledger = Callable[[], Awaitable[None]]
         )
         if not authorized:
             await respond("You don't have permission to use this command.", ephemeral=True)
-            # <<REDACTED 4 lines>>
+            return
+
+        # ``match`` with ``$``, not ``fullmatch``: the long-standing check.
+        if not _SKILL_NAME.match(name):
             await respond(f"Invalid skill name: `{name}`", ephemeral=True)
-            # <<REDACTED 7 lines>>
+            return
+
+        self._maybe_reload_skills()
+        if not any(skill["name"] == name for skill in self._skills):
             await respond(
-                # <<REDACTED 6 lines>>
+                f"Skill `{name}` not found. Use `/skill` with autocomplete.",
+                ephemeral=True,
+            )
+            return
         prompt = f"/{name} {args}" if args else f"/{name}"
-# <<REDACTED 1 lines>>
+
         await ack()
-# <<REDACTED 3 lines>>
+
+        # Inside a thread of the Claude channel: run in that thread's session.
+        if isinstance(channel, discord.Thread) and self._is_claude_thread(channel):
             # #811: another c-lord's thread — running here would take it over.
             foreign = await foreign_owner_notice_for(self.bot, self.repo, channel)
             if foreign is not None:
@@ -342,7 +519,8 @@ Acknowledger = Callable[[], Awaitable[None]]
                 await respond("⚠️ tmux is not configured for this channel.", ephemeral=True)
                 return
 
-            # <<REDACTED 5 lines>>
+            record = await self.repo.get(channel.id)
+            session_id: str | None = record.session_id if record else None
             # #1234 (W57): what is on record *now*, before the workspace is
             # prepared — memory, row and pending (#1262: the memory too, since the
             # row may still be waiting for that message's write). These are
@@ -356,9 +534,9 @@ Acknowledger = Callable[[], Awaitable[None]]
                 self.repo.pending_trigger(channel.id),
             }
 
-            # <<REDACTED 1 lines>>
+            display = f"`{prompt}`"
             await respond(f"Running {display} in this thread…")
-# <<REDACTED 1 lines>>
+
             # #927: before the workspace — a restart for a new pair closes the
             # window, and _prepare_workspace is what opens it again.
             turn, restarted = await self._fix_turn(channel, parent_channel_id, tmux)
@@ -382,7 +560,14 @@ Acknowledger = Callable[[], Awaitable[None]]
             on_prompt_sent = self._earlier_triggers_forgetter(channel.id, mirror_cog, prior)
             # #754: a /skill run is on 📊 Session Status while it runs.
             async with board_turn(dashboard_of(self.bot), channel.id, prompt):
-                # <<REDACTED 8 lines>>
+                await run_claude_with_config(
+                    RunConfig(
+                        thread=channel,
+                        runner=runner,
+                        repo=self.repo,
+                        prompt=prompt,
+                        session_id=session_id,
+                        registry=self._registry,
                         session_dir_manager=sdm,
                         tmux_manager=tmux,
                         working_dir=working_dir,
@@ -394,11 +579,15 @@ Acknowledger = Callable[[], Awaitable[None]]
                         notify_user_id=user.id,
                         started_by=StartedBy("user", str(user.id)),
                         on_prompt_sent=on_prompt_sent,
-                    # <<REDACTED 5 lines>>
+                    )
+                )
+            return
+
+        # Anywhere else: open a new thread in the Claude channel and run there.
         claude_channel = self.bot.get_channel(self.claude_channel_id)
         if not isinstance(claude_channel, discord.TextChannel):
             await respond("Claude channel not found.", ephemeral=True)
-            # <<REDACTED 2 lines>>
+            return
         # Resolve per-channel managers
         sdm = await self._resolve_session_dir_manager(claude_channel.id)
         # New-thread mode: no thread exists yet (#600 audit).
@@ -413,16 +602,19 @@ Acknowledger = Callable[[], Awaitable[None]]
             )
             return
 
-        # <<REDACTED 2 lines>>
+        # The thread is named after what Claude is asked to type.
+        thread_name = prompt[:_THREAD_NAME_LIMIT]
         archive_minutes = await resolve_auto_archive_duration(
             getattr(self.bot, "settings_repo", None)
         )
         thread = await claude_channel.create_thread(
-            # <<REDACTED 2 lines>>
+            name=thread_name,
+            type=discord.ChannelType.public_thread,
             auto_archive_duration=archive_minutes,
-        # <<REDACTED 3 lines>>
+        )
+        display = f"`{prompt}`"
         await respond(f"Running {display} → {thread.mention}")
-# <<REDACTED 1 lines>>
+
         # #927: a new thread has no running Claude, so this never restarts.
         turn, _ = await self._fix_turn(thread, claude_channel.id, tmux)
         ready, working_dir = await self._prepare_workspace(
@@ -433,7 +625,14 @@ Acknowledger = Callable[[], Awaitable[None]]
         runner = self._make_runner(tmux, thread.id, working_dir, turn=turn)
         # #754: see above.
         async with board_turn(dashboard_of(self.bot), thread.id, prompt):
-            # <<REDACTED 8 lines>>
+            await run_claude_with_config(
+                RunConfig(
+                    thread=thread,
+                    runner=runner,
+                    repo=self.repo,
+                    prompt=prompt,
+                    session_id=None,
+                    registry=self._registry,
                     session_dir_manager=sdm,
                     tmux_manager=tmux,
                     working_dir=working_dir,
@@ -442,7 +641,22 @@ Acknowledger = Callable[[], Awaitable[None]]
                     # #480: ping the invoking user if a question-mode pause blocks the skill.
                     notify_user_id=user.id,
                     started_by=StartedBy("user", str(user.id)),
-                # <<REDACTED 16 lines>>
+                )
+            )
+
+    @app_commands.command(name="skill", description="Run a Claude Code skill")
+    @app_commands.describe(
+        name="Skill name (type to filter)",
+        args="Optional arguments to pass to the skill",
+    )
+    @app_commands.autocomplete(name=_skill_name_autocomplete)
+    async def run_skill(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        args: str | None = None,
+    ) -> None:
+        """Slash entry point: hand the request to the shared skill core."""
         # Before defer, validation errors go on the initial response (instant,
         # ephemeral). After defer, everything goes through followup — and an
         # ephemeral one stays ephemeral (#748, see slash_io).

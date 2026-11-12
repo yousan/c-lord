@@ -1,19 +1,31 @@
-# <<REDACTED 7 lines>>
+"""Claude's question menus, as seen from Discord.
+
+When Claude asks the user something, the question is drawn in the thread as an
+:class:`~.ask_view.AskView` (buttons or a dropdown), remembered in the database
+so the menu survives a bot restart, and waited on for up to
+``ASK_ANSWER_TIMEOUT`` (24 hours) before it is closed as timed out.
 
 It also bridges the *in-pane* AskUserQuestion menu in jsonl/tmux mode
 (``bridge_pane_ask``): there Claude is blocked on a TUI menu, so the answer is
 delivered by sending menu keystrokes back to the pane rather than resuming with
 a new prompt (#166).
-# <<REDACTED 6 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
 import inspect
-# <<REDACTED 1 lines>>
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
-# <<REDACTED 3 lines>>
+
+import discord
+
 from .. import turn_events
 from ..claude.types import AskQuestion, ask_question_to_dict
-# <<REDACTED 1 lines>>
+from ..database.ask_repo import PendingAskRepository
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..menu_ledger import menu_fingerprint, shared_ledger
 from ..transcript.ask_result import (
@@ -40,9 +52,9 @@ from .ask_bus import (
     DELIVERY_UNDELIVERED,
     ChosenOption,
 )
-# <<REDACTED 1 lines>>
+from .ask_bus import ask_bus as _ask_bus
 from .ask_menus import ask_menus as _ask_menus
-# <<REDACTED 1 lines>>
+from .ask_view import AskView
 from .authorization import Authorizer
 from .bridged_context import bridged_context as _bridged_context
 from .embeds import (
@@ -53,11 +65,14 @@ from .embeds import (
     ask_undelivered_embed,
 )
 from .pane_context import box_char_count, fold_pane_context, should_fold_pane_context
-# <<REDACTED 1 lines>>
+
 if TYPE_CHECKING:
     from ..claude.tmux_runner import TmuxClaudeRunner
 
-# <<REDACTED 6 lines>>
+logger = logging.getLogger(__name__)
+
+# How long a menu waits for an answer before it is closed: one day, in seconds.
+ASK_ANSWER_TIMEOUT = 86_400
 # #359: while waiting for a Discord click, also watch the tmux pane.  The human
 # can answer/cancel the menu directly in the pane (tmux attach); without this
 # watch the bridge would wait for a click for ``ASK_ANSWER_TIMEOUT`` while the
@@ -130,12 +145,12 @@ def _context_chunks(text: str) -> tuple[list[str], bool]:
         chunks[0] = "…" + chunks[0]
     return chunks, truncated
 
-# <<REDACTED 1 lines>>
+
 async def _close(
     thread_id: int,
     reason: str,
     message: object | None = None,
-    # <<REDACTED 1 lines>>
+    ask_repo: PendingAskRepository | None = None,
 ) -> None:
     """Mark this thread's menu closed for *reason* and stop tracking *message* (#536).
 
@@ -719,7 +734,7 @@ async def bridge_pane_ask(
     thread: discord.Thread,
     question: AskQuestion,
     runner: TmuxClaudeRunner,
-    # <<REDACTED 1 lines>>
+    ask_repo: PendingAskRepository | None = None,
     authorizer: Authorizer | None = None,
     notify_user_id: int | None = None,
 ) -> None:
@@ -767,7 +782,9 @@ async def bridge_pane_ask(
             authorizer=authorizer,
             notify_user_id=notify_user_id,
         )
-    # <<REDACTED 3 lines>>
+    finally:
+        _ask_bus.unregister(thread.id)
+
 
 def _preempted(runner: object) -> bool:
     """Was *runner* stopped by the next message rather than by a stop (#1007)?"""
@@ -821,7 +838,7 @@ async def _bridge_claimed_menu(
     question: AskQuestion,
     runner: TmuxClaudeRunner,
     answer_queue: asyncio.Queue[list[str]],
-    # <<REDACTED 1 lines>>
+    ask_repo: PendingAskRepository | None = None,
     authorizer: Authorizer | None = None,
     notify_user_id: int | None = None,
 ) -> None:
@@ -956,7 +973,8 @@ async def _bridge_claimed_menu(
             previous = await ask_repo.get(thread.id)
             superseded_id = getattr(previous, "message_id", None)
         with contextlib.suppress(Exception):
-            # <<REDACTED 2 lines>>
+            await ask_repo.save(
+                thread_id=thread.id,
                 # The recovery path re-reads the pane rather than resuming a CLI
                 # session, so no session id is needed — the column is NOT NULL.
                 session_id="",
@@ -1131,51 +1149,3 @@ async def _bridge_claimed_menu(
     # window. ``unknown`` there (#746: ⏳ 確認中, corrected on the menu later)
     # maps to UNCONFIRMED, which #804 already treats as "do not re-send".
     _ask_bus.note_delivery(thread.id, _delivery_verdict(outcome))
-
-
-# <<REDACTED 5 lines>>
-    authorizer: Authorizer | None = None,
-    notify_user_id: int | None = None,
-# <<REDACTED 36 lines>>
-        # #535: a None means another bridge already has this thread's menu on
-        # screen. Posting a second copy is the bug we are fixing, and its
-        # answers would go to the owner's queue anyway — so skip this question
-        # and let the owner's menu collect the answer.
-        # <<REDACTED 1 lines>>
-        if answer_queue is None:
-            logger.warning(
-                "collect_ask_answers: thread %d already has an active menu bridge — "
-                "skipping duplicate menu for q_idx=%d",
-                thread.id,
-                q_idx,
-            )
-            continue
-# <<REDACTED 1 lines>>
-        view = AskView(
-            q, thread_id=thread.id, q_idx=q_idx, ask_repo=ask_repo, authorizer=authorizer
-        )
-        msg = await thread.send(
-            content=_mention(notify_user_id),
-            embed=ask_embed(q.question, q.header, q.options, q.multi_select),
-            view=view,
-        )
-        _ask_menus.register(thread.id, msg)  # #536: keep stale copies addressable
-        if q_idx == 0:  # #917: one event per ask, however many questions it carries
-            turn_events.emit_blocked(thread, message_id=getattr(msg, "id", None))
-# <<REDACTED 4 lines>>
-            await _close(thread.id, CLOSE_TIMEOUT, msg, ask_repo)
-            # <<REDACTED 4 lines>>
-            with contextlib.suppress(*DISCORD_CALL_FAILURES):
-                # <<REDACTED 19 lines>>
-            await _close(thread.id, CLOSE_INTERRUPTED, msg, ask_repo)
-            # <<REDACTED 2 lines>>
-        await _close(thread.id, CLOSE_ANSWERED, msg, ask_repo)
-        # #651: on this path the answer needs no verification — it is returned
-        # from here and injected as Claude's next prompt, so it cannot be lost
-        # in a menu. Say so, rather than leaving the click's interim ⏳ standing.
-        # #804: and report it, so every path that consumes an answer ends in a
-        # verdict — a path that stays silent leaves its waiter timing out.
-        _ask_bus.note_delivery(thread.id, DELIVERY_DELIVERED)
-        await _finalize_menu_message(msg, q, selected, ASK_ANSWERED)
-
-        # <<REDACTED 11 lines>>
