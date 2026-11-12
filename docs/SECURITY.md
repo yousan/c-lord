@@ -13,7 +13,7 @@ The bridge's security goal is:
 | Threat | Mitigation |
 |--------|-----------|
 | Unauthorized users invoking Claude | One `Authorizer` shared by every gate — messages, buttons, `/skill`, `/clord-init`. **Unconfigured, it allows only the Discord application's owner** (#713) |
-| Unauthorized users clicking decision buttons (Allow/Approve/Stop) | Same allowlist enforced in every View via `AuthorizedViewMixin.interaction_check` (#466) |
+| Unauthorized users clicking decision buttons (answer a question / approve a plan / Stop) | Same allowlist enforced in every View via `AuthorizedViewMixin.interaction_check` (#466) |
 | Shell injection via user prompts | `create_subprocess_exec` (no shell), `--` separator before prompt arg |
 | Flag injection via prompts | `--` separator prevents `-p`, `--resume` etc. in prompt text |
 | Session hijacking via crafted IDs | Strict regex validation: `^[a-f0-9\-]+$` |
@@ -212,12 +212,13 @@ member of the server without being told. See
 #### Interactive buttons enforce the same allowlist (#466)
 
 The allowlist gates not only *messages* but every interactive button c-lord
-posts — tool-permission **Allow/Deny**, plan **Approve/Cancel**, MCP
-elicitation, AskUserQuestion choices, the **Stop** button, and the
-auto-upgrade **Approve** button. Because c-lord threads are *public*, any
+posts — AskUserQuestion choices, plan-approval choices (the same buttons —
+#251), the **Stop** and **Reopen** buttons, and the auto-upgrade **Approve**
+button. (Tool-permission prompts never reach Discord: c-lord accepts them in
+the pane, so there is no Allow/Deny button to guard.) Because c-lord threads are *public*, any
 server member who can see the channel could otherwise click these and decide
-on the session owner's behalf (e.g. approve a tool permission → let Claude run
-something).
+on the session owner's behalf (e.g. approve a plan → let Claude carry it
+out).
 
 Each `discord.ui.View` mixes in `AuthorizedViewMixin`
 (`c_lord/discord_ui/authorization.py`), whose `interaction_check` consults the

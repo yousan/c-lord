@@ -5266,7 +5266,6 @@ class TestTrustStuckEmbed:
         config.repo = None
         config.outcome.no_response = False
         processor = EventProcessor(config)
-        processor._fold_progress = AsyncMock()  # type: ignore[method-assign]
 
         await processor.process(
             StreamEvent(

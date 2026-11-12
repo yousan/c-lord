@@ -4,8 +4,8 @@ Handles the core message flow:
 1. User sends message in the configured channel
 2. Bot creates a thread (or continues in existing thread)
 3. Claude Code CLI is invoked with stream-json output
-4. Status reactions and tool embeds are posted in real-time
-5. Final response is posted to the thread
+4. The status reaction on the trigger message follows the turn
+5. The transcript mirror posts Claude's answer to the thread
 """
 
 from __future__ import annotations

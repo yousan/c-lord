@@ -1,13 +1,16 @@
-"""AutoUpgradeCog — Webhook-triggered package upgrade + optional restart.
+"""Upgrade the installed package from Discord, then restart the bot.
 
-Generic pattern for auto-upgrading a pip/uv package when a webhook fires.
-Typical use: upstream library pushes a new release → CI sends webhook → bot upgrades itself.
+Two ways in, one pipeline:
 
-Security design:
-- Only processes messages with a webhook_id
-- Optional webhook_id allowlist
-- All commands are hardcoded or from UpgradeConfig — no user input in subprocess args
-- Uses create_subprocess_exec (never shell=True)
+* a webhook posts the configured trigger line (a release workflow, typically);
+* an authorised user runs ``/upgrade`` (off unless the config turns it on).
+
+Either way a progress thread is opened and the steps run in it: the upgrade
+command, the sync command and — when one is configured — the restart command,
+after waiting for the turns that are running to finish.
+
+Every command line comes from :class:`UpgradeConfig`. Nothing typed in Discord
+is ever part of one, and nothing goes through a shell.
 """
 
 from __future__ import annotations
@@ -15,8 +18,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass
+from typing import Any
 
 import discord
 from discord import app_commands
@@ -30,27 +34,24 @@ from ..voice_webhooks import is_voice_message
 
 logger = logging.getLogger(__name__)
 
-# Default timeout for each subprocess step (seconds).
+#: Seconds one upgrade / sync step may take unless the config says otherwise.
 _STEP_TIMEOUT = 120
+
+_OK = "✅"
+_FAILED = "❌"
+
+
+def _admits(allowlist: set[int] | None, candidate: int) -> bool:
+    """Whether *candidate* passes *allowlist*; no list at all admits everything."""
+    return allowlist is None or candidate in allowlist
 
 
 class UpgradeApprovalView(AuthorizedViewMixin, discord.ui.View):
-    """A Discord View with a single approval button for upgrade/restart gates.
+    """A single "approve" button, posted where people will actually see it.
 
-    Posts to the parent channel (not the upgrade thread) so users can approve
-    from the bottom of the channel without scrolling up to find the thread.
-
-    Usage::
-
-        approved = asyncio.Event()
-        view = UpgradeApprovalView(approved_event=approved, bot_id=bot.user.id)
-        channel_msg = await channel.send("Approve restart?", view=view)
-        await approved.wait()           # blocks until button clicked
-        await channel_msg.delete()      # clean up
-
-    The same ``approved`` event can be watched in parallel with a reaction loop
-    so that *either* a reaction on the thread message *or* clicking this button
-    grants approval.
+    The button and the ✅ reaction in the upgrade thread are two doors to the
+    same room: pressing it sets the event the cog is waiting on. Who may press
+    it is :class:`AuthorizedViewMixin`'s business.
     """
 
     def __init__(
@@ -65,48 +66,42 @@ class UpgradeApprovalView(AuthorizedViewMixin, discord.ui.View):
         self._event = approved_event
         self._bot_id = bot_id
         self._authorizer = authorizer
-        # Override the default label set by the decorator
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.label = label
-                break
+        self.approve.label = label
 
     @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        """Grant approval when any non-bot user clicks the button."""
-        if self._bot_id is not None and interaction.user.id == self._bot_id:
+        if self._is_own_click(interaction):
             await interaction.response.defer()
             return
-        button.disabled = True
-        button.label = "✅ Approved"
+        self._seal(button)
         await interaction.response.edit_message(view=self)
         self._event.set()
         self.stop()
 
+    def _is_own_click(self, interaction: discord.Interaction) -> bool:
+        """Whether the bot itself pressed the button — which decides nothing."""
+        return self._bot_id is not None and interaction.user.id == self._bot_id
+
+    @staticmethod
+    def _seal(button: discord.ui.Button) -> None:
+        """Make *button* show that the answer was given, and take no more presses."""
+        button.label = "✅ Approved"
+        button.disabled = True
+
 
 @dataclass(frozen=True)
 class UpgradeConfig:
-    """Configuration for auto-upgrade behaviour.
+    """What to upgrade, how, and who may ask for it.
 
-    Attributes:
-        package_name: The pip/uv package name to upgrade.
-        trigger_prefix: Webhook message prefix that triggers the upgrade.
-        working_dir: Directory to run upgrade commands in.
-        upgrade_command: Custom upgrade command as arg list.
-            Defaults to ["uv", "lock", "--upgrade-package", <package_name>].
-        sync_command: Custom sync command as arg list.
-            Defaults to ["uv", "sync"].
-        restart_command: Optional restart command
-            (e.g. ["sudo", "systemctl", "restart", "my.service"]).
-        allowed_webhook_ids: Optional set of allowed webhook IDs.
-        channel_ids: Optional set of channel IDs to listen in.
-        step_timeout: Timeout in seconds for each subprocess step.
-        restart_approval: If True, wait for a user to react with ✅ before
-            restarting. Useful when the bot is updated from within its own
-            Discord sessions (self-update pattern). Default: False.
+    ``upgrade_command`` / ``sync_command`` default to ``uv lock
+    --upgrade-package <package_name>`` and ``uv sync``, both run in
+    ``working_dir``. Without a ``restart_command`` the bot is not restarted.
+    ``allowed_webhook_ids`` / ``channel_ids`` narrow which webhook messages
+    count as the trigger; ``None`` means no restriction.
     """
 
     package_name: str
+    #: The exact webhook message that starts an upgrade; also the thread's name.
     trigger_prefix: str = "🔄 upgrade"
     working_dir: str = "."
     upgrade_command: list[str] | None = None
@@ -115,38 +110,29 @@ class UpgradeConfig:
     allowed_webhook_ids: set[int] | None = None
     channel_ids: set[int] | None = None
     step_timeout: int = _STEP_TIMEOUT
+    #: Wait for a person to approve before restarting.
     restart_approval: bool = False
+    #: Wait for a person to approve before running anything at all.
     upgrade_approval: bool = False
-    """If True, wait for a user to react with ✅ before running any upgrade
-    commands. Useful when you want manual control over when updates are applied.
-    When False (default), upgrade steps run automatically on webhook trigger."""
+    #: Whether ``/upgrade`` does anything.
     slash_command_enabled: bool = False
-    """If True, register a /upgrade slash command that manually triggers the upgrade
-    pipeline. Defaults to False so existing bots are unaffected until explicitly opted in.
-    When enabled, the command respects upgrade_approval and restart_approval flags."""
 
 
 class AutoUpgradeCog(commands.Cog):
-    """Cog that auto-upgrades a package when triggered by a Discord webhook.
+    """Runs the upgrade pipeline when the trigger arrives.
 
-    Usage::
+    Example::
 
         config = UpgradeConfig(
             package_name="c-lord",
-            trigger_prefix="🔄 ebibot-upgrade",
-            working_dir="/home/user/my-bot",
             restart_command=["sudo", "systemctl", "restart", "my-bot.service"],
         )
-        await bot.add_cog(AutoUpgradeCog(bot, config, drain_check=lambda: not active_sessions))
+        await bot.add_cog(AutoUpgradeCog(bot, config))
 
-    Args:
-        bot: The Discord bot instance.
-        config: Upgrade configuration.
-        drain_check: Optional callable that returns True when it is safe to restart
-            (e.g. no active user sessions). Called repeatedly until True or timeout.
-        drain_timeout: Maximum seconds to wait for drain_check to return True.
-            After this, the restart proceeds regardless. Default: 300s.
-        drain_poll_interval: Seconds between drain_check polls. Default: 10s.
+    Before restarting, the cog waits until nothing is running. By default it
+    asks every other cog that satisfies :class:`~c_lord.protocols.DrainAware`;
+    pass ``drain_check`` to decide some other way. The wait gives up after
+    ``drain_timeout`` seconds and restarts regardless.
     """
 
     def __init__(
@@ -162,7 +148,10 @@ class AutoUpgradeCog(commands.Cog):
         self._drain_check = drain_check
         self._drain_timeout = drain_timeout
         self._drain_poll_interval = drain_poll_interval
+        # One upgrade at a time, whichever way it was asked for.
         self._lock = asyncio.Lock()
+
+    # -- triggers ----------------------------------------------------------
 
     def claims_message(self, message: discord.Message) -> bool:
         """Whether *message* is this cog's upgrade trigger — #862.
@@ -173,32 +162,28 @@ class AutoUpgradeCog(commands.Cog):
         """
         if not message.webhook_id or is_voice_message(message):
             return False  # #971: c-lord speaking for a sub-agent triggers nothing
-        if (
-            self.config.allowed_webhook_ids is not None
-            and message.webhook_id not in self.config.allowed_webhook_ids
-        ):
+        if not _admits(self.config.allowed_webhook_ids, message.webhook_id):
             return False
-        if (
-            self.config.channel_ids is not None
-            and message.channel.id not in self.config.channel_ids
-        ):
+        if not _admits(self.config.channel_ids, message.channel.id):
             return False
         return message.content.strip() == self.config.trigger_prefix
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        """Handle upgrade trigger messages."""
+        """Start an upgrade when the trigger line arrives from an allowed webhook."""
         if not self.claims_message(message):
             return
-
         logger.info("Auto-upgrade trigger received: %r", self.config.trigger_prefix)
-
-        if self._lock.locked():
+        if self._in_progress:
             await message.reply("⏳ Upgrade is already running. Skipping.")
             return
-
         async with self._lock:
             await self._run_upgrade(message)
+
+    @property
+    def _in_progress(self) -> bool:
+        """Whether an upgrade, however it was asked for, is running right now."""
+        return self._lock.locked()
 
     def _is_allowed(self, user: discord.Member | discord.User) -> bool:
         """Whether *user* is on the process's allowlist (#781).
@@ -212,11 +197,7 @@ class AutoUpgradeCog(commands.Cog):
 
     @app_commands.command(name="upgrade", description="Manually trigger a package upgrade")
     async def upgrade_command(self, interaction: discord.Interaction) -> None:
-        """Slash command entry point for manual upgrades.
-
-        Only active when config.slash_command_enabled=True. Requires no webhook —
-        any authorised user can trigger the upgrade from Discord directly.
-        The same upgrade_approval / restart_approval safety gates apply.
+        """Run the upgrade pipeline on request from an authorised user.
 
         "Authorised" is the process's allowlist (#781) — it used to be anyone
         who could see the command. Checked before anything else, including
@@ -232,48 +213,47 @@ class AutoUpgradeCog(commands.Cog):
 
         if not self.config.slash_command_enabled:
             await interaction.response.send_message(
-                "⚠️ Slash command upgrades are not enabled for this bot.",
-                ephemeral=True,
+                "⚠️ Slash command upgrades are not enabled for this bot.", ephemeral=True
             )
             return
 
-        if self._lock.locked():
+        if self._in_progress:
             await interaction.response.send_message(
-                "⏳ Upgrade is already running. Please wait.",
-                ephemeral=True,
+                "⏳ Upgrade is already running. Please wait.", ephemeral=True
             )
             return
 
-        channel = interaction.channel
-        # Resolve the text channel to create the upgrade thread in.
-        # Works from both a TextChannel and a Thread (use the thread's parent).
-        if isinstance(channel, discord.TextChannel):
-            text_channel: discord.TextChannel = channel
-        elif isinstance(channel, discord.Thread) and isinstance(
-            channel.parent, discord.TextChannel
-        ):
-            text_channel = channel.parent
-        else:
+        home = self._thread_home(interaction.channel)
+        if home is None:
             await interaction.response.send_message(
-                "⚠️ This command can only be used in a text channel or thread.",
-                ephemeral=True,
+                "⚠️ This command can only be used in a text channel or thread.", ephemeral=True
             )
             return
 
+        # Acknowledge before taking the lock: the pipeline outlives Discord's
+        # three seconds by a wide margin.
         await interaction.response.defer()
-
         archive_minutes = await resolve_auto_archive_duration(
             getattr(self.bot, "settings_repo", None)
         )
         async with self._lock:
-            thread = await text_channel.create_thread(
+            thread = await home.create_thread(
                 name=self.config.trigger_prefix[:100],
                 auto_archive_duration=archive_minutes,
             )
             await self._run_pipeline(thread, status_target=None)
 
+    @staticmethod
+    def _thread_home(channel: object) -> discord.TextChannel | None:
+        """The text channel a progress thread can be opened in, seen from *channel*."""
+        if isinstance(channel, discord.TextChannel):
+            return channel
+        if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.TextChannel):
+            return channel.parent
+        return None
+
     async def _run_upgrade(self, trigger_message: discord.Message) -> None:
-        """Execute the upgrade pipeline triggered by a webhook message."""
+        """Open the progress thread on the trigger message and run the pipeline in it."""
         archive_minutes = await resolve_auto_archive_duration(
             getattr(self.bot, "settings_repo", None)
         )
@@ -282,102 +262,123 @@ class AutoUpgradeCog(commands.Cog):
         )
         await self._run_pipeline(thread, status_target=trigger_message)
 
-    async def _run_pipeline(
-        self,
-        thread: discord.Thread,
-        status_target: discord.Message | None,
-    ) -> None:
-        """Core upgrade pipeline: approve → upgrade → sync → restart.
+    # -- the pipeline ------------------------------------------------------
 
-        Args:
-            thread: Discord thread to post progress updates into.
-            status_target: Message to add ✅/❌ reaction to on completion/failure.
-                           None when triggered via slash command (no message to react to).
+    async def _run_pipeline(
+        self, thread: discord.Thread, status_target: discord.Message | None
+    ) -> None:
+        """Upgrade, sync and (if configured) restart, reporting into *thread*.
+
+        *status_target* is the message that gets the ✅ / ❌ verdict; the slash
+        command has none and passes ``None``. Nothing raised in here leaves:
+        a failure is said in the thread and marked on *status_target*.
         """
         try:
-            # Step 0: Optional upgrade approval before any subprocess runs
-            if self.config.upgrade_approval:
-                await self._wait_for_approval(
-                    status_target,
-                    thread,
-                    prompt=(
-                        f"📦 New release of **{self.config.package_name}** detected. "
-                        "React ✅ on this message to start the upgrade."
-                    ),
-                )
-
-            # Step 1: Upgrade package
-            upgrade_cmd = self.config.upgrade_command or [
-                "uv",
-                "lock",
-                "--upgrade-package",
-                self.config.package_name,
-            ]
-            ok = await self._run_step(thread, "upgrade", upgrade_cmd)
-            if not ok:
-                if status_target is not None:
-                    await status_target.add_reaction("❌")
-                return
-
-            # Step 2: Sync dependencies
-            sync_cmd = self.config.sync_command or ["uv", "sync"]
-            ok = await self._run_step(thread, "sync", sync_cmd)
-            if not ok:
-                if status_target is not None:
-                    await status_target.add_reaction("❌")
-                return
-
-            # Step 3: Optional restart
-            if self.config.restart_command:
-                if self.config.restart_approval:
-                    await self._wait_for_approval(status_target, thread)
-                # Snapshot active sessions BEFORE drain so we can resume them after restart.
-                active_thread_ids = self._collect_active_thread_ids()
-                await self._drain(thread)
-                await self._mark_sessions_for_resume(active_thread_ids, thread)
-                await self._restart(status_target, thread)
-            else:
-                if status_target is not None:
-                    await status_target.add_reaction("✅")
-                await thread.send("✅ Upgrade complete (no restart configured).")
-
-        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — asyncio.TimeoutError != builtins.TimeoutError on Python 3.10
+            await self._run_stages(thread, status_target)
+        except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — distinct types on 3.10
             await thread.send("❌ Step timed out.")
-            if status_target is not None:
-                await status_target.add_reaction("❌")
+            await self._mark(status_target, _FAILED)
         except Exception:
             logger.exception("Auto-upgrade error")
             await thread.send("❌ Upgrade failed with an unexpected error.")
-            if status_target is not None:
-                await status_target.add_reaction("❌")
+            await self._mark(status_target, _FAILED)
+
+    async def _run_stages(
+        self, thread: discord.Thread, status_target: discord.Message | None
+    ) -> None:
+        config = self.config
+        if config.upgrade_approval:
+            await self._wait_for_approval(
+                status_target,
+                thread,
+                prompt=(
+                    f"📦 New release of **{config.package_name}** detected. "
+                    "React ✅ on this message to start the upgrade."
+                ),
+            )
+
+        steps = (
+            (
+                "upgrade",
+                config.upgrade_command or ["uv", "lock", "--upgrade-package", config.package_name],
+            ),
+            ("sync", config.sync_command or ["uv", "sync"]),
+        )
+        for step_name, command in steps:
+            if not await self._run_step(thread, step_name, command):
+                await self._mark(status_target, _FAILED)
+                return
+
+        if not config.restart_command:
+            await self._mark(status_target, _OK)
+            await thread.send("✅ Upgrade complete (no restart configured).")
+            return
+
+        if config.restart_approval:
+            await self._wait_for_approval(status_target, thread)
+        # Taken before draining: by the time the drain is over, the turns that
+        # deserve a restart notice are no longer listed as running.
+        interrupted = self._collect_active_thread_ids()
+        await self._drain(thread)
+        await self._mark_sessions_for_resume(interrupted, thread)
+        await self._restart(status_target, thread)
+
+    @staticmethod
+    async def _mark(status_target: discord.Message | None, emoji: str) -> None:
+        if status_target is not None:
+            await status_target.add_reaction(emoji)
+
+    async def _run_step(self, thread: discord.Thread, step_name: str, command: list[str]) -> bool:
+        """Run one configured command, echoing it and its output into *thread*.
+
+        Returns whether it exited 0. A step that outlasts ``step_timeout``
+        raises the timeout to the caller; the process is not stopped.
+        """
+        await thread.send(f"⚙️ `{' '.join(command)}`")
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=self.config.working_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        captured, _ = await asyncio.wait_for(
+            process.communicate(), timeout=self.config.step_timeout
+        )
+        output = (captured or b"").decode("utf-8", errors="replace").strip()
+        if output:
+            await thread.send(f"```\n{output[:1800]}\n```")
+
+        if process.returncode != 0:
+            await thread.send(f"❌ `{step_name}` failed (exit code {process.returncode}).")
+            return False
+        return True
+
+    # -- restart: who is busy, waiting for them, telling them --------------
+
+    def _other_cogs(self) -> list[object]:
+        return [cog for cog in self.bot.cogs.values() if cog is not self]
 
     def _collect_active_thread_ids(self) -> frozenset[int]:
-        """Return the IDs of threads with currently-running Claude sessions.
+        """The threads with a turn running, read off whichever cogs track runners.
 
-        Iterates all Cogs looking for ``_active_runners`` dicts (duck-typed to
-        avoid a hard import dependency on ``ClaudeChatCog``).  Call this
-        *before* :meth:`_drain` so you capture sessions that are mid-run.
+        Duck-typed on an ``_active_runners`` dict so that no cog class has to
+        be imported here.
         """
-        thread_ids: set[int] = set()
-        for cog in self.bot.cogs.values():
-            if cog is self:
-                continue
-            active_runners = getattr(cog, "_active_runners", None)
-            if isinstance(active_runners, dict):
-                thread_ids.update(active_runners.keys())
-        return frozenset(thread_ids)
+        busy: set[int] = set()
+        for cog in self._other_cogs():
+            runners = getattr(cog, "_active_runners", None)
+            if isinstance(runners, dict):
+                busy.update(runners)
+        return frozenset(busy)
 
     async def _mark_sessions_for_resume(
-        self,
-        thread_ids: frozenset[int],
-        status_thread: discord.Thread,
+        self, thread_ids: frozenset[int], status_thread: discord.Thread
     ) -> None:
         """Record *thread_ids* in the pending-resumes table for a restart notice.
 
-        Called just before the restart command so that Claude sessions which
+        Called just before the restart command fires, so that the threads which
         were active at upgrade time get a quiet restart notice on the next bot
-        startup.  No-op when ``bot.resume_repo`` is not configured.
-
+        start-up.
         #406: we do **not** re-prompt Claude on restart — the ``claude`` process
         survives the upgrade restart and the observers self-restore, so
         ``on_ready`` only posts a quiet notice (it never re-runs Claude).
@@ -385,24 +386,16 @@ class AutoUpgradeCog(commands.Cog):
         ``session_id`` is auto-resolved from ``bot.session_repo`` when available
         (kept for diagnostics / future use).
         """
-        if not thread_ids:
-            return
-
         resume_repo = getattr(self.bot, "resume_repo", None)
-        if resume_repo is None:
+        if not thread_ids or resume_repo is None:
             return
-
         session_repo = getattr(self.bot, "session_repo", None)
-        marked = 0
 
+        marked = 0
         for tid in thread_ids:
             try:
-                session_id: str | None = None
-                if session_repo is not None:
-                    record = await session_repo.get(tid)
-                    if record is not None:
-                        session_id = record.session_id
-
+                record = await session_repo.get(tid) if session_repo is not None else None
+                session_id = record.session_id if record is not None else None
                 # resume_prompt is intentionally None (#406): on_ready posts a
                 # quiet restart notice, it never re-runs Claude with a prompt.
                 await resume_repo.mark(
@@ -422,41 +415,43 @@ class AutoUpgradeCog(commands.Cog):
             )
 
     def _auto_drain_check(self) -> bool:
-        """Check all DrainAware Cogs registered on the bot.
-
-        Returns True when every DrainAware Cog has ``active_count == 0``.
-        If no DrainAware Cogs are found, returns True (safe to restart).
-        """
+        """Whether every other :class:`DrainAware` cog reports nothing running."""
         return all(
-            cog.active_count == 0
-            for cog in self.bot.cogs.values()
-            if isinstance(cog, DrainAware) and cog is not self
+            cog.active_count == 0 for cog in self._other_cogs() if isinstance(cog, DrainAware)
         )
 
     async def _drain(self, thread: discord.Thread) -> None:
-        """Wait until drain_check returns True or drain_timeout elapses.
+        """Hold the restart until nothing is running, or until ``drain_timeout``.
 
-        If an explicit drain_check was provided, uses that.
-        Otherwise, auto-discovers all DrainAware Cogs on the bot.
-        Posts status updates to the Discord thread while waiting.
+        Running out of time is announced and the restart goes ahead.
         """
-        check = self._drain_check or self._auto_drain_check
-        if check():
+        is_idle = self._auto_drain_check if self._drain_check is None else self._drain_check
+        if is_idle():
             return
 
         await thread.send(
-            f"⏳ Upgrade ready — waiting for active sessions to finish "
+            "⏳ Upgrade ready — waiting for active sessions to finish "
             f"(max {self._drain_timeout}s)..."
         )
-        elapsed = 0
-        while elapsed < self._drain_timeout:
-            await asyncio.sleep(self._drain_poll_interval)
-            elapsed += self._drain_poll_interval
-            if check():
-                await thread.send(f"✅ Sessions finished ({elapsed}s). Restarting now...")
+        async for waited in self._drain_polls():
+            if is_idle():
+                await thread.send(f"✅ Sessions finished ({waited}s). Restarting now...")
                 return
-
         await thread.send(f"⚠️ Drain timeout ({self._drain_timeout}s elapsed) — restarting anyway.")
+
+    async def _drain_polls(self) -> AsyncIterator[int]:
+        """Sleep one poll interval at a time, yielding the seconds waited so far.
+
+        The count is the sum of the intervals slept, not a clock reading, and
+        the polls stop once it reaches ``drain_timeout``.
+        """
+        waited = 0
+        while waited < self._drain_timeout:
+            await asyncio.sleep(self._drain_poll_interval)
+            waited += self._drain_poll_interval
+            yield waited
+
+    # -- approval ----------------------------------------------------------
 
     async def _wait_for_approval(
         self,
@@ -465,149 +460,130 @@ class AutoUpgradeCog(commands.Cog):
         *,
         prompt: str | None = None,
     ) -> None:
-        """Wait for a user to approve by reacting with ✅ or clicking a button.
+        """Ask for a go-ahead and return once someone gives it.
 
-        Posts a notification with a ✅ reaction in the upgrade thread, AND posts
-        a button message in the parent channel so users can approve without
-        scrolling up to find the thread. Either action grants approval.
-        Sends periodic reminders every ``_drain_timeout`` seconds while waiting.
+        The question goes into *thread* with a ✅ to react to, and — because a
+        thread is easy to miss — into its parent channel with a button. Either
+        one approves. There is no deadline; a reminder is posted every
+        ``drain_timeout`` seconds for as long as nobody answers.
 
-        Args:
-            status_target: Message to watch for reactions. When None (slash command
-                           flow), approval is collected via the thread message itself.
-            thread: The thread to post status messages in.
-            prompt: Custom prompt text. Defaults to a restart-approval message.
+        *status_target* is accepted for the callers' sake and not used: the
+        question lives in the thread.
         """
-        text = prompt or "📦 Update installed. React ✅ on this message to restart."
-        approval_msg = await thread.send(text)
-        await approval_msg.add_reaction("✅")
-
-        # Shared event — set by either the reaction loop or the button callback.
+        question = prompt or "📦 Update installed. React ✅ on this message to restart."
         approved = asyncio.Event()
 
-        # Post a button in the parent channel so approval is always one click
-        # away at the bottom of the channel (no need to scroll up to the thread).
-        channel_msg: discord.Message | None = None
+        # Both posts are out before anything waits, so the button already
+        # exists the first time this coroutine can be interrupted.
+        ask_msg = await self._ask_in_thread(thread, question)
+        button_msg = await self._offer_button(thread, question, approved)
+
+        # Whichever door is used first wins; the other wait is torn down so a
+        # button press does not sit behind a reaction wait that may never end.
+        await self._first_of(self._reaction_given(thread, ask_msg, approved), approved.wait())
+
+        if button_msg is not None:
+            with contextlib.suppress(discord.NotFound):
+                await button_msg.delete()
+        await thread.send("👍 Restart approved!")
+
+    @property
+    def _own_user_id(self) -> int | None:
+        return self.bot.user.id if self.bot.user else None
+
+    @staticmethod
+    async def _ask_in_thread(thread: discord.Thread, question: str) -> discord.Message:
+        """Post *question* with the ✅ people are asked to press already on it."""
+        ask_msg = await thread.send(question)
+        await ask_msg.add_reaction(_OK)
+        return ask_msg
+
+    async def _offer_button(
+        self, thread: discord.Thread, question: str, approved: asyncio.Event
+    ) -> discord.Message | None:
+        """Put an approve button in the thread's parent channel, if that can be done.
+
+        Returns the message carrying it, or ``None`` when there is no parent or
+        the post failed — the reaction in the thread still works then.
+        """
         parent = getattr(thread, "parent", None)
+        bot_id = self._own_user_id
         if parent is not None:
-            bot_id = self.bot.user.id if self.bot.user else None
             view = UpgradeApprovalView(
                 approved_event=approved,
                 bot_id=bot_id,
                 authorizer=getattr(self.bot, "authorizer", None),
             )
             try:
-                channel_msg = await parent.send(
-                    f"🔔 **Approval needed** — {text}\n"
+                return await parent.send(
+                    f"🔔 **Approval needed** — {question}\n"
                     "(React ✅ in the upgrade thread above, or click here ↓)",
                     view=view,
                 )
             except Exception:
                 logger.debug("Could not post approval button to parent channel", exc_info=True)
+        return None
 
-        # Task 1: watch for the ✅ reaction on the thread message.
-        async def _watch_reaction() -> None:
-            while not approved.is_set():
-                try:
-                    event = await self.bot.wait_for(
-                        "raw_reaction_add",
-                        check=lambda e: (
-                            e.message_id == approval_msg.id
-                            and str(e.emoji) == "✅"
-                            and (self.bot.user is None or e.user_id != self.bot.user.id)
-                        ),
-                        timeout=float(self._drain_timeout),
-                    )
-                    logger.info("Restart approved by user %s", event.user_id)
-                    approved.set()
-                except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
-                    if not approved.is_set():
-                        await thread.send(
-                            "⏳ Still waiting for restart approval... "
-                            "React ✅ above or click the button in the channel."
-                        )
-
-        # Task 2: resolve as soon as the button (or reaction) sets the event.
-        async def _watch_button() -> None:
-            await approved.wait()
-
-        reaction_task = asyncio.create_task(_watch_reaction())
-        button_task = asyncio.create_task(_watch_button())
-
-        done, pending = await asyncio.wait(
-            {reaction_task, button_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-        # Propagate unexpected exceptions from finished tasks.
-        for task in done:
-            task.result()
-
-        # Remove the channel button — it's no longer needed.
-        if channel_msg is not None:
-            with contextlib.suppress(discord.NotFound):
-                await channel_msg.delete()
-
-        await thread.send("👍 Restart approved!")
-
-    async def _restart(
-        self,
-        status_target: discord.Message | None,
-        thread: discord.Thread,
+    async def _reaction_given(
+        self, thread: discord.Thread, ask_msg: discord.Message, approved: asyncio.Event
     ) -> None:
-        """Execute the restart command (fire-and-forget).
+        """Return when someone other than the bot reacts ✅ to *ask_msg*, setting *approved*.
 
-        Uses create_subprocess_exec (not shell=True) — all args are from
-        UpgradeConfig, not user input. Safe by construction.
+        Each ``drain_timeout`` seconds without one, a reminder goes into *thread*.
+        """
+        bot_id = self._own_user_id
+
+        def approves(payload: discord.RawReactionActionEvent) -> bool:
+            if payload.message_id != ask_msg.id or str(payload.emoji) != _OK:
+                return False
+            return bot_id is None or payload.user_id != bot_id
+
+        while not approved.is_set():
+            try:
+                payload = await self.bot.wait_for(
+                    "raw_reaction_add", check=approves, timeout=float(self._drain_timeout)
+                )
+            except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 — distinct on 3.10
+                if not approved.is_set():
+                    await thread.send(
+                        "⏳ Still waiting for restart approval... "
+                        "React ✅ above or click the button in the channel."
+                    )
+            else:
+                logger.info("Restart approved by user %s", payload.user_id)
+                approved.set()
+
+    @staticmethod
+    async def _first_of(*contenders: Coroutine[Any, Any, object]) -> None:
+        """Run *contenders* together until one finishes, then cancel the rest.
+
+        A contender that failed (rather than being cancelled here) has its
+        exception raised to the caller.
+        """
+        tasks = [asyncio.create_task(contender) for contender in contenders]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, Exception):
+                raise outcome
+
+    async def _restart(self, status_target: discord.Message | None, thread: discord.Thread) -> None:
+        """Announce the restart and launch the restart command without waiting for it.
+
+        The caller has already made sure a ``restart_command`` is configured.
         """
         await thread.send("🔄 Restarting...")
-        if status_target is not None:
-            await status_target.add_reaction("✅")
+        await self._mark(status_target, _OK)
+        # A moment for the two messages above to leave before the process dies.
         await asyncio.sleep(1)
-        assert self.config.restart_command is not None  # Caller checks this
+
+        command = self.config.restart_command or []
         await asyncio.create_subprocess_exec(
-            *self.config.restart_command,
+            *command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-
-    async def _run_step(
-        self,
-        thread: discord.Thread,
-        step_name: str,
-        command: list[str],
-    ) -> bool:
-        """Run a single subprocess step, posting output to the thread.
-
-        All command args come from UpgradeConfig (server-side config),
-        not from user/webhook input. Uses create_subprocess_exec for safety.
-
-        Returns True on success, False on failure.
-        """
-        cmd_str = " ".join(command)
-        await thread.send(f"⚙️ `{cmd_str}`")
-
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=self.config.working_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self.config.step_timeout)
-        output = stdout.decode("utf-8", errors="replace").strip()
-
-        if output:
-            # Truncate to fit Discord message limit
-            truncated = output[:1800]
-            await thread.send(f"```\n{truncated}\n```")
-
-        if proc.returncode != 0:
-            await thread.send(f"❌ `{step_name}` failed (exit code {proc.returncode}).")
-            return False
-
-        return True

@@ -96,14 +96,18 @@ class RunConfig:
         settings_repo: KV store for the persisted per-model context-window total
                        (#370). When provided, a learned window survives restarts
                        and the /context probe stops re-running every session.
-        stop_view: StopView instance to bump after each major message, keeping
-                   the Stop button at the bottom of the thread.
-        session_dir_manager: SessionDirManager for automatic session dir cleanup.
-                            When provided, the directory for this thread is
-                            removed (if clean) after the session ends.
-        tmux_manager: TmuxSessionManager for tmux session lifecycle.
-                      When provided, the tmux session for this thread is
-                      killed after the session ends.
+        stop_view: The turn's StopView. Read by nothing here since #1316 (it
+                   was re-posted under each tool embed, and those are gone);
+                   the caller that built it disables it when the turn ends.
+                   Kept so existing callers keep working.
+        session_dir_manager: Read by nothing here: the end-of-turn directory
+                            cleanup that used it lost its last caller long
+                            before #1316 removed it (#1115). Workspaces are
+                            removed by ``/workspace-delete`` and the startup
+                            sweep. Kept so existing callers keep working.
+        tmux_manager: Read by nothing here, for the same reason — a thread's
+                      tmux window outlives its turns. Kept so existing callers
+                      keep working.
     """
 
     thread: discord.Thread
@@ -130,7 +134,7 @@ class RunConfig:
     # restart. None when no session_dir_manager.
     working_dir: str | None = None
     # #466: allowlist predicate forwarded to interactive Views so button
-    # clicks (permission / plan / elicitation / ask) are gated to the same
+    # clicks (ask menus, Stop, Reopen) are gated to the same
     # allowed users as messages. None ⇒ the unconfigured rule ⇒ the app owner
     # only (#713), never everyone.
     authorizer: Authorizer | None = None

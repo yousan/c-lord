@@ -114,10 +114,8 @@ Si le bot redémarre en cours de session, les sessions Claude interrompues repre
 
 ### Chat Interactif
 - **Thread = Session** — Mappage 1:1 entre fil Discord et session Claude Code
-- **Statut en temps réel** — Réactions emoji : 🧠 réflexion, 🛠️ lecture de fichiers, 💻 édition, 🌐 recherche web
-- **Texte en streaming** — Le texte intermédiaire de l'assistant apparaît pendant que Claude travaille
-- **Embeds de résultats d'outils** — Résultats en direct avec temps écoulé augmentant toutes les 10s
-- **Pensée étendue** — Raisonnement affiché sous forme d'embeds avec spoiler (cliquer pour révéler)
+- **Statut en temps réel** — Réaction emoji sur votre message : 🟢 en cours pendant que Claude travaille, 🟡 en attente quand c'est votre tour (❌ en cas d'erreur, ⏳ / ⚠️ après 10 s / 30 s de silence)
+- **Activité des outils** — Pas de message par outil : elle est lue dans le transcript de Claude Code. Un tour devenu silencieux affiche une ligne de progression (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), et les appels d'outils et phrases de progression du tour sont joints à la réponse dans `progress.txt` (#723)
 - **Persistance de session** — Reprend les conversations entre messages via `--resume`
 - **Exécution de skills** — Commande `/skill` avec autocomplétion, arguments optionnels, reprise dans le fil
 - **Hot reload** — Les nouveaux skills ajoutés à `~/.claude/skills/` sont détectés automatiquement (actualisation toutes les 60s, sans redémarrage)
@@ -126,14 +124,11 @@ Si le bot redémarre en cours de session, les sessions Claude interrompues repre
 - **Support des pièces jointes** — Fichiers texte ajoutés automatiquement au prompt (jusqu'à 5 × 50 Ko) ; images téléchargées et transmises via `--image` (jusqu'à 4 × 5 Mo)
 - **Notifications de timeout** — Embed avec temps écoulé et guide de reprise en cas de timeout
 - **Questions interactives** — `AskUserQuestion` s'affiche en Boutons Discord ou Menu de Sélection ; la session reprend avec votre réponse ; les boutons survivent aux redémarrages du bot
-- **Plan Mode** — Quand Claude appelle `ExitPlanMode`, un embed Discord affiche le plan complet avec des boutons Approuver/Annuler ; Claude continue seulement après approbation ; annulation automatique après 5 minutes
-- **Demandes de permission d'outil** — Quand Claude a besoin d'une permission pour exécuter un outil, Discord affiche des boutons Autoriser/Refuser avec le nom et l'entrée de l'outil ; refus automatique après 2 minutes
-- **MCP Elicitation** — Les serveurs MCP peuvent demander une saisie utilisateur via Discord (mode formulaire : jusqu'à 5 champs Modal du schéma JSON ; mode URL : bouton URL + confirmation) ; délai de 5 minutes
-- **Progression en direct de TodoWrite** — Quand Claude appelle `TodoWrite`, un seul embed Discord est publié et édité en place à chaque mise à jour ; affiche ✅ terminé, 🔄 actif (avec étiquette `activeForm`), ⬜ en attente
+- **Plan Mode** — Quand Claude appelle `ExitPlanMode`, le menu d'approbation affiché par Claude Code est relayé vers Discord de la même façon qu'`AskUserQuestion` : les choix apparaissent en boutons, et Claude continue avec celui que vous choisissez (#251)
+- **Demandes de permission d'outil** — Non affichées sur Discord : c-lord accepte l'invite de permission de Claude Code dans le panneau pour que le tour continue. Ce que Claude peut faire dépend du mode de permission / des réglages de la session, pas d'un bouton par outil
 - **Tableau de bord des fils** — Embed épinglé en direct montrant quels fils sont actifs vs. en attente ; le propriétaire est @mentionné quand une saisie est nécessaire
-- **Utilisation de tokens** — Taux de succès du cache et nombre de tokens affichés dans l'embed de session terminée
-- **Utilisation du contexte** — Pourcentage de la fenêtre de contexte (tokens d'entrée + cache, hors sortie) et capacité restante jusqu'à l'auto-compactage affichés dans l'embed de session terminée ; ⚠️ avertissement au-dessus de 83,5%
-- **Détection de compactage** — Notifie dans le fil quand la compaction du contexte se produit (type de déclencheur + nombre de tokens avant compactage)
+- **Utilisation du contexte** — Chaque tour se termine par une ligne de pied (`📊 7% context (69k/1.0M) · …`) : pourcentage de la fenêtre de contexte (tokens d'entrée + cache, hors sortie), modèle, versions et coût ; elle devient un avertissement ⚠️ au-dessus de 83,5 % (l'auto-compactage peut se déclencher au tour suivant)
+- **Avis de compactage** — Quand le contexte est compacté, le fil reçoit une ligne `🗜️ コンテキストを圧縮しました` (#628)
 - **Interruption de session** — Envoyer un nouveau message à un fil actif envoie SIGINT à la session en cours et recommence avec la nouvelle instruction ; pas de `/stop` manuel nécessaire
 - **Notification de blocage** — Message dans le fil après 30 s sans activité (réflexion étendue ou compression de contexte) ; réinitialise automatiquement quand Claude reprend
 
@@ -486,11 +481,7 @@ c_lord/
     ask_view.py            # Boutons/Menus de Sélection pour AskUserQuestion
     ask_handler.py         # collect_ask_answers() — UI + cycle de vie DB d'AskUserQuestion
     streaming_manager.py   # StreamingMessageManager — éditions de messages en place avec debounce
-    tool_timer.py          # LiveToolTimer — compteur de temps écoulé pour outils longs
     thread_dashboard.py    # Embed épinglé en direct affichant les états de session
-    plan_view.py           # Boutons Approuver/Annuler pour Plan Mode (ExitPlanMode)
-    permission_view.py     # Boutons Autoriser/Refuser pour les demandes de permission d'outil
-    elicitation_view.py    # Interface Discord pour MCP Elicitation (formulaire Modal ou bouton URL)
   session_sync.py          # Découverte et importation de sessions CLI
   session_dir.py           # Un clone git par fil (ne supprime jamais un répertoire avec des modifications non commitées)
   ext/

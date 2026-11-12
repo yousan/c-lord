@@ -8,9 +8,10 @@
 #723（「tool-use embed が出る」と書いてあったが 0 件）と同じ形の drift なので、
 文章ではなく **コードを根拠に** 検査する:
 
-- 表に載せてよい絵文字 = :class:`StatusManager` が実際に塗れるものだけ。🗜️ を塗る
-  ``set_compact()`` は ``StreamEvent.is_compact`` が真のときしか呼ばれず、それを
-  セットするコードは無い。誰かが ``is_compact=`` を配線したらこのテストは 🗜️ を許す。
+- 表に載せてよい絵文字 = :mod:`c_lord.discord_ui.status` が持つランプだけ。🗜️ を塗る
+  ``set_compact()`` は ``StreamEvent.is_compact`` をセットするコードが無く一度も
+  呼ばれなかったので、#1316 で定数ごと消した。ランプを増やした人は ``EMOJI_*`` を
+  足すことになり、このテストが利用者ガイドの表の更新を求める。
 - スレッド名のランプに触れる段落は、既定オフ／有効化の方法まで書くこと。
 """
 
@@ -21,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from c_lord.discord_ui import status
 from c_lord.discord_ui.status import (
-    EMOJI_COMPACT,
     EMOJI_ERROR,
     EMOJI_RUNNING,
     EMOJI_STALL_HARD,
@@ -31,7 +32,9 @@ from c_lord.discord_ui.status import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-PKG = ROOT / "c_lord"
+
+#: 文脈圧縮の目印。ランプ（リアクション）としては存在しない — スレッドに出る 1 行 (#628) の絵文字。
+COMPACT_EMOJI = "\U0001f5dc\ufe0f"
 
 USER_GUIDES = {
     "docs/USER_GUIDE.md": r"^### Status Indicators",
@@ -61,16 +64,9 @@ def _bare(emoji: str) -> str:
     return emoji.replace("\ufe0f", "")
 
 
-def _compact_is_reachable() -> bool:
-    """True once some code constructs a ``StreamEvent`` with ``is_compact=``."""
-    return any("is_compact=" in p.read_text(encoding="utf-8") for p in PKG.rglob("*.py"))
-
-
 def _reachable_lamps() -> set[str]:
-    lamps = {EMOJI_RUNNING, EMOJI_WAITING, EMOJI_ERROR, EMOJI_STALL_SOFT, EMOJI_STALL_HARD}
-    if _compact_is_reachable():
-        lamps.add(EMOJI_COMPACT)
-    return {_bare(e) for e in lamps}
+    """Every lamp the status module defines — nothing else can be painted."""
+    return {_bare(v) for k, v in vars(status).items() if k.startswith("EMOJI_")}
 
 
 def _section(doc: str, heading: str) -> str:
@@ -101,13 +97,15 @@ def _paragraphs(text: str) -> list[str]:
     return [p for p in re.split(r"\n\s*\n|\n(?=\s*(?:[-*]|\d+\.)\s|\|)", text) if p.strip()]
 
 
-def test_compact_lamp_is_still_unreachable() -> None:
-    """前提の確認: ``is_compact`` をセットするコードは無い (#753)。
+def test_the_lamps_are_the_five_the_guide_explains() -> None:
+    """前提の確認: 塗れるランプは 🟢🟡❌⏳⚠️ の 5 つで、🗜️ は無い (#753/#1316)。
 
-    これが落ちたら 🗜️ リアクションは再び出うる — 下のテストは自動で 🗜️ を許すが、
-    利用者ガイドに 🗜️ を戻すかどうかは、配線した人が決めること。
+    これが落ちたらランプが増減している — 利用者ガイドの表（下のテスト）も合わせること。
     """
-    assert not _compact_is_reachable()
+    expected = {EMOJI_RUNNING, EMOJI_WAITING, EMOJI_ERROR, EMOJI_STALL_SOFT, EMOJI_STALL_HARD}
+    assert _reachable_lamps() == {_bare(e) for e in expected}
+    assert _bare(COMPACT_EMOJI) not in _reachable_lamps()
+    assert not hasattr(status.StatusManager, "set_compact")
 
 
 @pytest.mark.parametrize("path", sorted(USER_GUIDES))
@@ -139,12 +137,10 @@ def test_thread_name_lamp_is_described_as_opt_in(path: str) -> None:
 @pytest.mark.parametrize("path", LAMP_DOCS)
 def test_compact_emoji_is_not_described_as_a_live_lamp(path: str) -> None:
     """🗜️ に触れる段落は「到達しない」か、生きているミラーの1行 (#628) を指す (#753)。"""
-    if _compact_is_reachable():
-        pytest.skip("is_compact is wired again — 🗜️ may appear as a lamp")
     doc = (ROOT / path).read_text(encoding="utf-8")
     offenders = [
         p.strip()[:120]
         for p in _paragraphs(doc)
-        if _bare(EMOJI_COMPACT) in _bare(p) and not re.search(r"unreachable|到達しない|#628", p)
+        if _bare(COMPACT_EMOJI) in _bare(p) and not re.search(r"unreachable|到達しない|#628", p)
     ]
     assert not offenders, f"{path}: 🗜️ を出る目印として書いている段落: {offenders}"
