@@ -14,9 +14,11 @@ allowed-tools: Bash, Read, Edit
 - 実行中ボットの版は `c-lord version` / `/version` で `v1.4.0-b<commit7>-<YYYYMMDD>` 形式（記事準拠）で確認できる。
 - リリースノートは `CHANGELOG.md` の該当セクションから自動抽出される。
 
-```
-v1.4.0 ──(PR merge: 自動 patch)──> v1.4.1 ──(自動)──> v1.4.2 ──(手動 minor)──> v1.5.0
-```
+流れを 1 行で書くと:
+
+    v1.4.0 ──(PR merge: 自動 patch)──> v1.4.1 ──(自動)──> v1.4.2 ──(手動 minor)──> v1.5.0
+
+つまり「リリースして」と頼まれて手を動かすのは minor / major のときだけで、普段の PR マージでは何もしない。
 
 ### 自動 patch bump が走らないケース
 
@@ -27,16 +29,16 @@ v1.4.0 ──(PR merge: 自動 patch)──> v1.4.1 ──(自動)──> v1.4.2
 
 bump させたくない PR は、squash コミット subject を `docs:` にするか `[skip-release]` を付ける。
 
----
-
 ## 手動リリース（minor / major、「v1.5.0としてリリースして」）
+
+以下は `1.5.0` を例にする。作業は本番 checkout ではなく、自分のセッションの clone で行ってよい
+（タグは origin に push されるので、どの clone から打っても同じ）。
 
 ### Step 1: main を最新化
 
-```bash
-cd /home/yousan/c-lord
-git checkout main && git pull
-```
+    git checkout main && git pull
+
+本番 checkout（`cd /home/yousan/c-lord`）で行う場合も同じコマンド。
 
 ### Step 2: CHANGELOG.md を更新（PR で）
 
@@ -61,10 +63,12 @@ PR をマージ（CHANGELOG をタグより先に main へ入れることで、�
 `scripts/release.sh` を使う。まず dry-run:
 
 ```bash
-git checkout main && git pull
+git checkout main && git pull                 # Step 2 のマージを取り込む
 ./scripts/release.sh --version 1.5.0          # dry-run（打たれるタグを表示）
 ./scripts/release.sh --version 1.5.0 --apply  # タグ作成 + push → release.yml が Release 作成
 ```
+
+dry-run の出力（`Latest tag` / `Next tag`）が意図どおりであることを見てから `--apply` を付ける。
 
 バージョンを明示せず、直近コミットの `[minor]`/`[major]`/`[release]` から自動算出も可能（指定なしは patch）:
 
@@ -79,9 +83,10 @@ git checkout main && git pull
 gh release view v1.5.0 --repo yousan/c-lord
 ```
 
----
+ノートに CHANGELOG の該当セクションが入っていること。動いている bot の版を上げるのは別の作業で、
+本番への反映は CLAUDE.md の「Prod redeploy」（`git pull` と `systemctl --user restart c-lord.service`）に従う。
 
-## 仕組み（裏側）
+## 裏側で何が起きているか
 
 ```
 普通の PR を main にマージ
@@ -96,13 +101,14 @@ gh release view v1.5.0 --repo yousan/c-lord
 
 > 注: `GITHUB_TOKEN` で打ったタグは別ワークフローを起動しない（GitHub の再帰防止）。そのため auto-version-bump.yml はタグと Release を同一ジョブで作る。release.sh が打つタグ（個人の認証）は release.yml を起動する。
 
----
+ビルド時には `hatch-vcs` が `c_lord/_version.py` を、`hatch_build.py` がコミット日を入れた
+`c_lord/_build_info.py` を生成する（どちらも `.gitignore` 済み — commit しない）。
+タグに届かない checkout（浅い clone など）では版が `0.0.0` にフォールバックするので、
+CI は `fetch-depth: 0` でタグごと取得している。
 
-## よくある失敗
+## うまくいかないとき
 
-| 状況 | 原因 | 対処 |
-|------|------|------|
-| Release のノートが空/簡素 | タグより先に CHANGELOG が main に入っていない | CHANGELOG を main へ入れてからタグを打ち直す |
-| タグが既に存在するエラー | 同じバージョンで再実行 | `git push --delete origin v1.5.0` してから再実行 |
-| docs PR なのに patch が上がった | subject が `docs:` 始まりでなかった | subject を `docs:` にするか `[skip-release]` を付ける |
-| 版が `0.0.0` に見える | タグが1つも無い（ブートストラップ前） | 最初の `v1.4.0` タグを打つ（`release.sh` が seed する） |
+- **Release のノートが空/簡素** — タグより先に CHANGELOG が main に入っていない。CHANGELOG を main へ入れてからタグを打ち直す
+- **タグが既に存在するエラー** — 同じバージョンで再実行した。`git push --delete origin v1.5.0` してから再実行
+- **docs PR なのに patch が上がった** — subject が `docs:` 始まりでなかった。subject を `docs:` にするか `[skip-release]` を付ける
+- **版が `0.0.0` に見える** — タグが1つも無い（ブートストラップ前）。最初の `v1.4.0` タグを打つ（`release.sh` が seed する）
