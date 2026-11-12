@@ -1,184 +1,300 @@
-# Design Decisions
+# Design Decisions — 設計判断の記録
 
-This document captures the "why" behind key architectural choices. Each decision includes the alternatives considered and the reasoning for the chosen approach.
+c-lord の設計で「何を決めたか」と「なぜそう決めたか」を、検討した代案と一緒に残す文書。
+決定は番号と名前で参照されるので（Issue、仕様、`CLAUDE.md` から）、**番号と見出しの名前は変えない**。
 
-## 1. CLI Subprocess, Not Direct API
+§1〜§11 は、このプロジェクトが始まった時点（2026-02、`claude -p` を毎回起動する構成）に下した判断で、
+その後の変更で実装が置き換わったものがある。それぞれに **「決めたこと」「理由」** を当時のまま残し、
+実装が変わったものには **「いま」** として現在の姿と、置き換えた Issue を書き添えてある。
+§12 以降は、その都度の出来事と一緒に書き足してきた記録。
 
-**Decision:** Invoke `claude -p --output-format stream-json` as a subprocess rather than calling the Anthropic API directly.
+いまの構成の全体像は [`ARCHITECTURE.md`](ARCHITECTURE.md)、実装に直結する決定の一覧は `CLAUDE.md` の
+"Key Design Decisions"。
 
-**Alternatives considered:**
-- Direct Anthropic API (HTTP/SDK) — full control over requests, lower latency
-- Claude Code as a library import — tighter integration, shared memory
+## 1. CLI Subprocess, Not Direct API — API を直接叩かず、Claude Code CLI を動かす
 
-**Why CLI:**
-- **Inherits everything for free**: CLAUDE.md, skills, tools, memory, MCP servers, hooks — all the features that make Claude Code powerful work automatically because we spawn the real CLI
-- **No feature tracking burden**: When Claude Code adds new features, they work immediately through the bridge without any code changes
-- **Proven stability**: The CLI handles all the complex tool orchestration, permission management, and error recovery. Reimplementing this via direct API would be thousands of lines of fragile code
-- **Claude Code is the product**: We're building a UI for Claude Code, not an alternative to it
+**決めたこと:** Anthropic の API を自分で呼ぶのではなく、本物の `claude` コマンドを子プロセスとして動かす。
+当初の形は、メッセージごとに `claude -p --output-format stream-json` を起動し、その出力を読むものだった。
 
-**Trade-offs accepted:**
-- Higher latency (subprocess spawn overhead ~200ms)
-- Larger resource footprint (one OS process per session)
-- Parsing stream-json instead of getting structured responses directly
+**検討した代案:**
 
-## 2. Thread = Session (1:1 Mapping)
+- API を直接呼ぶ（HTTP / SDK）。リクエストを細かく制御でき、遅延も小さい
+- Claude Code をライブラリとして import する。結合は密になり、メモリも共有できる
 
-**Decision:** Each Discord thread maps to exactly one Claude Code session via `--resume`.
+**理由:**
 
-**Alternatives considered:**
-- Single shared session across all threads — simpler, but no conversation isolation
-- Session per user — better isolation, but can't have parallel conversations
-- Session per channel — too coarse, mixes different topics
+- **Claude Code の機能がそのまま手に入る。** CLAUDE.md、skills、tools、memory、MCP サーバ、hooks —
+  本物の CLI を動かすので、何も作らなくても全部効く
+- **機能追従の負担が無い。** Claude Code に新機能が入れば、c-lord のコードを変えなくても使える
+- **難しい部分は CLI が既に解いている。** ツールの連携、権限の管理、エラーからの回復を API の上に
+  作り直せば、壊れやすいコードが何千行も要る
+- **作っているのは Claude Code の UI であって、Claude Code の代わりではない**
 
-**Why thread = session:**
-- **Natural UX**: Discord users already understand threads as "one conversation about one thing"
-- **Visual history**: Scroll up in a thread to see the full conversation — no separate history viewer needed
-- **Session resume**: `--resume session_id` continues exactly where you left off, including Claude Code's internal state (opened files, tool history, etc.)
-- **Parallel work**: Different threads = different projects = different Claude Code sessions running concurrently
+**受け入れたもの（当時）:** 起動のたびのオーバーヘッド（約 200ms）、セッションごとに OS プロセスが 1 つ要ること、
+構造化された応答ではなく stream-json を解析すること。
 
-**Implementation:** SQLite `sessions` table with `thread_id` as primary key, `session_id` as the Claude Code session identifier. Simple UPSERT on save.
+**いま:** 「API ではなく CLI」は変わっていない（`CLAUDE.md` の "What Does NOT Belong Here"）。変わったのは動かし方で、
+`claude -p` を毎回起動するのをやめ、**対話モードの `claude` をスレッドごとの tmux ウィンドウに常駐させて、
+入力は `send-keys` で打ち込み、回答は Claude Code 自身が書く jsonl transcript から読む**（#53 → #71 → #712。
+§15・§18 と `CLAUDE.md` Key Design Decisions 1）。stream-json の解析は無くなった。
+代わりに受け入れているのは、スレッドごとに常駐プロセスを持つこと（放置されたものはスリープ・停止・上限で
+回収する — `docs/specs/workspace-vocabulary.md`）と、CLI の TUI と transcript の形式に依存すること
+（CLI 2.1.278 の変更で全スレッドが無言になった #773 がその実例）。
 
-## 3. Shared Run Helper (_run_helper.py)
+## 2. Thread = Session (1:1 Mapping) — スレッド 1 本がセッション 1 つ
 
-**Decision:** Extract Claude CLI execution logic into a shared function used by both `ClaudeChatCog` and `SkillCommandCog`.
+**決めたこと:** Discord のスレッド 1 本を、Claude Code のセッションちょうど 1 つに対応させ、`--resume` で続ける。
 
-**Alternatives considered:**
-- Duplicate the streaming logic in each Cog — simpler initially, but maintenance nightmare
-- Base class inheritance — too rigid, Cogs have different `on_message` vs slash command patterns
-- Event-based pub/sub — over-engineered for two consumers
+**検討した代案:**
 
-**Why shared function:**
-- **DRY without coupling**: Both Cogs call `run_claude_in_thread()` but remain independent in how they receive input (message listener vs slash command)
-- **Single place to fix bugs**: Status emoji logic, chunking, error handling — all in one place
+- 全スレッドで 1 つのセッションを共有する。単純だが、会話が分かれない
+- 利用者ごとに 1 セッション。分離はできるが、同じ人が並行して別の話をできない
+- チャンネルごとに 1 セッション。粗すぎて、別の話題が混ざる
+
+**理由:**
+
+- **利用者の感覚に合う。** Discord のスレッドは、もともと「1 つのことについての 1 つの会話」として使われている
+- **履歴がそのまま見える。** スレッドをさかのぼれば会話の全体が読める。別の履歴ビューアが要らない
+- **続きから再開できる。** `--resume <session_id>` は、開いていたファイルやツールの履歴といった
+  Claude Code 側の状態ごと、止めたところから続ける
+- **並行して作業できる。** スレッドが違えば別の案件で、別のセッションが同時に走る
+
+**実装:** SQLite の `sessions` テーブル。`thread_id` が主キー、`session_id` が Claude Code のセッション識別子で、
+保存は UPSERT。
+
+**いま:** 対応関係はそのまま、スレッド 1 本に **tmux ウィンドウ 1 つ**と**作業ディレクトリ（git clone）1 つ**が加わった。
+session id は Claude Code が決めたものを後から拾うのではなく、c-lord が `--session-id <uuid>` で名付けて
+`.clord-session` に控え、再開は `--resume <控えた uuid>` で行う（#773）。保存期間を過ぎた行は消さずに
+「片付け済み」の印を付けて残す（#818）。
+
+## 3. Shared Run Helper (_run_helper.py) — Claude を走らせる処理は 1 か所に
+
+**決めたこと:** Claude CLI を実行する処理を共有の関数に切り出し、`ClaudeChatCog` と `SkillCommandCog` の両方から使う。
+
+**検討した代案:**
+
+- それぞれの Cog に同じ処理を書く。最初は簡単だが、直すたびに 2 か所になる
+- 基底クラスを継承させる。硬すぎる — 片方は `on_message`、片方はスラッシュコマンドで、入口の形が違う
+- イベントの pub/sub にする。使う側が 2 つしかないのに大げさ
+
+**理由:**
+
+- **重複は無くすが、結合はさせない。** どちらの Cog も同じ関数を呼ぶだけで、入力の受け取り方
+  （メッセージのリスナーか、スラッシュコマンドか）は互いに独立のまま
+- **直す場所が 1 つ。** ステータスの絵文字、エラーの扱いなど、ターンに付随する処理がここに集まる
 - **Easy to extend**: New Cogs that need Claude execution just call the same function (e.g. a consumer docs-sync Cog can implement its own streaming logic on top of the shared function for different requirements)
 
-## 4. Emoji Reactions for Status
+**いま:** 入口は `run_claude_with_config(RunConfig)`。当時の `run_claude_in_thread()` は、同じ処理を位置引数で呼ぶ
+互換用の形として残っている。使う側は `WebhookTriggerCog` と `SchedulerCog` にも広がった。
+受け持つのは 1 ターンの進行（ランプ、質問メニューの橋渡し、エラーの表示、セッションの保存）で、
+**回答の本文は投稿しない** — それは transcript ミラーの仕事になった（#712）。返信の分割（§5）もミラー側にある。
 
-**Decision:** Use Discord message reactions (🧠🛠️💻🌐✅❌) on the user's original message to show Claude's current activity.
+## 4. Emoji Reactions for Status — 状態は絵文字のリアクションで示す
 
-**Alternatives considered:**
-- Editing a "status message" in the thread — more visible but hits Discord rate limits fast
-- Typing indicator — limited to "is typing", can't show what's happening
-- Embed updates — rich info but very noisy in the thread
+**決めたこと:** Claude がいま何をしているかを、利用者の元のメッセージに付けるリアクションで示す。
+当初は活動の種類ごとに絵文字を出し分けた（🧠🛠️💻🌐 と、終わったときの ✅ / ❌）。
 
-**Why reactions:**
-- **Non-intrusive**: Doesn't clutter the thread with status updates
-- **Glanceable**: One emoji tells you what's happening without reading text
-- **Low API cost**: Adding/removing reactions is lightweight compared to message edits
-- **Mobile-friendly**: Reactions are prominently visible in Discord mobile
+**検討した代案:**
 
-**Implementation details:**
-- Debounced at 700ms to avoid rate limits during rapid tool switches
-- Only one status emoji at a time (old removed before new added)
-- Stall detection: ⏳ after 10s of no activity, ⚠️ after 30s
-- Cleanup on completion — reactions removed after brief display of ✅/❌
+- スレッドに「状況メッセージ」を置いて編集し続ける。目立つが、Discord のレート制限にすぐ当たる
+- 入力中インジケータ。「入力中」しか出せず、何が起きているかは伝えられない
+- embed を更新し続ける。情報は多いが、スレッドがうるさくなる
 
-## 5. Fence-Aware Message Chunking
+**理由:**
 
-**Decision:** Never split a Discord message inside a code fence. If forced to split, properly close the fence and reopen it in the next chunk.
+- **邪魔にならない。** 状況の更新でスレッドが埋まらない
+- **ひと目で分かる。** 文章を読まなくても、絵文字 1 つで状況が伝わる
+- **API の負担が軽い。** リアクションの付け外しは、メッセージの編集より安い
+- **モバイルでも見える。** Discord のモバイルアプリはリアクションを目立つ位置に出す
 
-**Alternatives considered:**
-- Naive split at 2000 chars — breaks code blocks, ugly rendering
-- Split only at paragraph boundaries — may produce very uneven chunks
-- Render to image — overkill, not searchable
+**当時の実装:** ツールが次々切り替わってもレート制限に当たらないよう 700ms のデバウンスを入れ、
+絵文字は常に 1 つだけ（前のものを外してから次を付ける）。動きが無ければ 10 秒で ⏳、30 秒で ⚠️（§11）。
+終わったら ✅ / ❌ を少し見せてから外した。
 
-**Why fence-aware:**
-- **Claude Code outputs lots of code**: A bridge for a coding tool must handle code blocks correctly
-- **Broken fences look terrible**: Half a code block renders as monospace plain text, confusing users
-- **Proper reopening**: `\`\`\`python\n...` is closed with `\`\`\`` and reopened in the next chunk with `\`\`\`python\n`, preserving syntax highlighting
+**いま（#246）:** リアクションで示す方針は同じで、中身を**ターンごとのランプ 1 つ**に絞った。
+🟢 実行中（考えている間もツールの間も変えない）→ 🟡 あなたの番（ターン完了）。❌ エラーと ⏳ / ⚠️ 停滞は、
+その状態の間だけの一時的な上書き。1 ターンに数回しか変わらないのでデバウンスは外し、すぐ反映する。
+ツールごとの絵文字は無くなり、ツールの様子は transcript ミラー由来の進捗行と `progress.txt` で見える
+（ランナーはツールのイベントを出さない — #723）。
+同じ 🟢 / 🟡 をスレッド名にも出す機能は、名前変更のレート制限（10 分に約 2 回）を使い切るので既定でオフ
+（#329。`CLORD_THREAD_LAMP=1` で有効 — `docs/specs/thread-lamp.md`）。
 
-**Split preference order:**
-1. Paragraph break (blank line) — cleanest visual break
-2. Line break — keeps lines intact
-3. Hard split at limit — last resort, fence repair kicks in
+## 5. Fence-Aware Message Chunking — コードフェンスの途中では切らない
 
-## 6. Installable Package, Not Monolith
+**決めたこと:** Discord のメッセージを、コードフェンスの内側では決して分割しない。どうしても切るときは、
+フェンスを正しく閉じ、次のメッセージで開き直す。
+
+**検討した代案:**
+
+- 2000 文字で機械的に切る。コードブロックが壊れ、表示が崩れる
+- 段落の境界でだけ切る。長さがひどく不揃いになることがある
+- 画像にして送る。やりすぎで、検索もできない
+
+**理由:**
+
+- **Claude Code の出力はコードだらけ。** コーディングの道具の橋渡しなら、コードブロックを正しく扱えなければならない
+- **壊れたフェンスは読めない。** コードブロックの後ろ半分が等幅の地の文として出て、読む人を混乱させる
+- **開き直せば色も保てる。** ` ```python ` で始まったブロックは ` ``` ` で閉じ、次のメッセージを ` ```python ` で
+  始め直すので、シンタックスハイライトが続く
+
+**切る場所の優先順（当初の設計）:** (1) 段落の切れ目（空行）— 見た目が一番自然、(2) 改行 — 行を壊さない、
+(3) 上限での強制分割 — 最後の手段で、このときフェンスの修復が働く。
+
+**いま:** 実装は `c_lord/discord_ui/reply_chunker.py` の `chunk_discord_content()` で、transcript ミラーが
+回答を投稿するときに使う（当初の `chunker.py` は #53 で削除）。行の境界で切り、1 行が上限を超えるときだけ
+行の途中で切る。開いているフェンスは閉じて、次の断片で言語指定ごと開き直す。
+利用者から見た動きは `docs/specs/long-reply-split.md`。
+
+## 6. Installable Package, Not Monolith — 単体の bot ではなく、入れて使うパッケージ
 
 **Decision:** Ship `c_lord` as a proper Python package installable via `uv add git+...` or `pip install git+...`.
 
-**Alternatives considered:**
-- Monolithic bot — easier to start, harder to customize
-- Docker image — isolated but heavyweight for a Python script
-- Copy-paste template — no upgrade path
+**検討した代案:**
 
-**Why package:**
-- **Separation of concerns**: The framework handles Discord↔CLI bridging. The consumer handles project-specific config, secrets, and custom Cogs
+- 1 つにまとまった bot として配る。始めるのは楽だが、手を入れにくい
+- Docker イメージ。隔離はできるが、Python のスクリプト 1 つには重い
+- コピーして使うテンプレート。更新を取り込む道が無い
+
+**理由:**
+
+- **役割が分かれる。** Discord と CLI の橋渡しはフレームワークが持ち、案件ごとの設定・秘密・独自の Cog は
+  利用側が持つ
 - **Upgrade path**: `uv lock --upgrade-package c-lord && uv sync` gets you the latest framework without touching your custom code
-- **No conflict**: Your bot's `pyproject.toml` pins the framework version. Multiple bots can use different versions
-- **Real-world validation**: Consumer bots demonstrate this works — they import `ClaudeChatCog`, `ClaudeRunner`, `SkillCommandCog`, and add their own Cogs (reminders, watchdog, docs-sync, auto-upgrade) without touching the framework
+- **ぶつからない。** 利用側の `pyproject.toml` がフレームワークの版を固定するので、複数の bot が
+  それぞれ別の版を使える
+- **実際に成り立っている。** 利用側の bot は c-lord の Cog を import し、自分の Cog（リマインダ、監視、
+  docs-sync、自動アップグレード）を、フレームワークに手を入れずに足している
 
-## 7. No Custom AI Logic
+**いま:** 利用側が呼ぶのは `setup_bridge()` の 1 回で、Cog の登録と配線は c-lord が済ませる
+（`CLAUDE.md` の Zero-Config Principle — パッケージを更新するだけで新機能が届くこと）。
+実行の設定は `ClaudeConfig` で渡す（当時の `ClaudeRunner` は §9 のとおり無くなった）。
 
-**Decision:** The bridge has zero AI logic. No prompt engineering, no tool definitions, no memory management, no system prompts.
+## 7. No Custom AI Logic — AI のロジックを持たない
 
-**Alternatives considered:**
-- Add a system prompt to shape Claude's Discord responses — tempting but wrong
-- Define custom tools for Discord-specific actions — scope creep
-- Build a memory/context system — duplicating Claude Code's built-in memory
+**決めたこと:** c-lord は AI のロジックを一切持たない。プロンプトの作り込みも、ツールの定義も、
+メモリの管理も、system prompt も置かない。
 
-**Why no AI logic:**
-- **Claude Code already handles all of this**: CLAUDE.md defines behavior, skills define capabilities, memory provides context, tools provide actions
-- **Less to maintain**: Every piece of AI logic we add is something we need to keep updated as Claude Code evolves
-- **Predictable behavior**: What you see in the terminal is what you get in Discord. No hidden system prompts changing Claude's behavior
-- **Single source of truth**: Your CLAUDE.md is the only configuration needed. No bridge-specific config files, no "Discord mode" settings
+**検討した代案:**
 
-## 8. SQLite for Session Storage
+- Discord 向けの応答になるよう system prompt を足す。やりたくなるが、筋が違う
+- Discord 固有の操作のための独自ツールを定義する。守備範囲が広がり続ける
+- メモリ / コンテキストの仕組みを作る。Claude Code に既にあるものの二重化になる
 
-**Decision:** Use SQLite (via aiosqlite) for the thread-to-session mapping, with one connection per operation.
+**理由:**
 
-**Alternatives considered:**
-- In-memory dict — simpler but lost on restart
-- Redis — overkill for simple key-value with one user
-- PostgreSQL — way overkill
-- JSON file — no concurrent access safety
+- **どれも Claude Code が既に持っている。** 振る舞いは CLAUDE.md、能力は skills、文脈は memory、行動は tools が決める
+- **保守するものが減る。** AI のロジックを 1 つ足すたびに、Claude Code の進化に合わせて直し続けるものが 1 つ増える
+- **挙動が読める。** ターミナルで見えるものが、そのまま Discord に出る。Claude の振る舞いを変える隠れた
+  system prompt は無い
+- **設定の置き場所が 1 つ。** 必要な設定は利用者自身の CLAUDE.md だけ。c-lord 用の設定ファイルも
+  「Discord モード」も無い
 
-**Why SQLite:**
-- **Persistent across restarts**: Session mappings survive bot restarts, so you can continue conversations
-- **Zero infrastructure**: No external database server needed
-- **aiosqlite**: Async wrapper prevents blocking the event loop
-- **Simple schema**: One table, one primary key. No joins, no migrations framework needed
-- **Good enough performance**: Single-user bot with dozens of sessions — SQLite handles this trivially
+**いま:** この決定はそのまま生きていて、理念（`docs/PHILOSOPHY.md` の「やらないこと」）と、
+ループ機能の線引き（§17、`docs/LOOP_ENGINEERING.md`）の土台になっている。
+その後 c-lord がセッションに持ち込むようになったものは 2 つある — 別チャンネルを読むための
+`discord-read` スキル（#259）と、貼られた Discord リンクの本文の差し込み（§16）。
+どこまでを許すかの判断は §16 に書いてある。
 
-**One connection per operation:** Rather than maintaining a connection pool, each repository method opens and closes its own connection. This is slightly less efficient but eliminates connection lifecycle management and works perfectly for the low query volume of this application.
+## 8. SQLite for Session Storage — セッションの保存は SQLite
 
-## 9. Clone Pattern for Runner Instances
+**決めたこと:** スレッドとセッションの対応を SQLite（aiosqlite 経由）に保存し、接続は操作のたびに開く。
 
-**Decision:** `ClaudeRunner.clone()` creates a fresh instance with the same config but no active subprocess.
+**検討した代案:**
 
-**Alternatives considered:**
-- Reuse the same runner instance — sharing subprocess state between sessions is dangerous
-- Create new `ClaudeRunner` manually — duplicates config everywhere
-- Factory pattern — over-engineered for what's essentially a copy constructor
+- メモリ上の dict。単純だが、再起動で消える
+- Redis。利用者 1 人の key-value には大げさ
+- PostgreSQL。さらに大げさ
+- JSON ファイル。同時アクセスに対する安全性が無い
 
-**Why clone:**
-- **Safety**: Each session gets its own subprocess. No shared state, no race conditions
-- **Simplicity**: `runner.clone()` copies all config fields. One line of code
-- **Trackability**: `_active_runners[thread_id] = runner` maps each thread to its runner for `/clear` to kill the right subprocess
+**理由:**
 
-## 10. Separate Webhook and Chat Message Paths
+- **再起動をまたいで残る。** 対応が残るので、bot を再起動しても会話を続けられる
+- **用意するものが無い。** 外部のデータベースサーバが要らない
+- **イベントループを止めない。** aiosqlite が非同期に包む
+- **スキーマが単純。** テーブル 1 つ、主キー 1 つ。JOIN も、マイグレーションの枠組みも要らない
+- **性能は十分。** 利用者 1 人、セッションは数十 — SQLite には何でもない量
 
-**Decision:** Webhook messages (`message.webhook_id` present) and regular user messages (`message.author.bot` check) are handled by completely separate Cogs with no overlap.
+**操作ごとに接続を開く:** 接続プールを持たず、リポジトリの各メソッドが自分で接続を開いて閉じる。
+効率は少し落ちるが、接続の寿命を管理する必要が無くなり、このアプリケーションの少ない問い合わせ量には
+これで足りる。
 
-**Alternatives considered:**
-- Single Cog handling both — simpler code structure but muddled responsibility
-- Middleware pattern — Discord.py doesn't have middleware, would be non-idiomatic
+**いま:** SQLite と「操作ごとに接続」はそのまま。テーブルは 1 つではなくなった — `sessions` のほかに、
+設定、チャンネル / スレッドとリポジトリの bind、回答待ちの質問、再起動後に再開するセッション、
+橋渡し済みのメニュー、モデル設定、開発環境の対応、AI Lounge などがあり、定期タスクは別ファイル
+（`data/tasks.db` の `scheduled_tasks`）に置く。マイグレーションの枠組みは今も入れておらず、
+`database/models.py` の `init_db()` と各リポジトリの `init_db()` が、起動のたびに不足しているテーブルと列を足す。
 
-**Why separate:**
-- **ClaudeChatCog**: Filters on `message.author.bot == False` (skips all bots including webhooks)
-- **Webhook Cogs** (like docs-sync): Filter on `message.webhook_id` being present (only webhooks)
-- **No conflict**: These filters are mutually exclusive — a message can't be both a non-bot user message and a webhook message
-- **Different security models**: User messages go through `allowed_user_ids` check. Webhook messages check for fixed trigger strings
-- **Different behaviors**: User messages create interactive Claude sessions. Webhook messages trigger predefined automated workflows
+## 9. Clone Pattern for Runner Instances — ランナーはセッションごとに別のインスタンス
 
-## 11. Stall Detection in Status Manager
+**決めたこと（当時）:** `ClaudeRunner.clone()` で、設定は同じだが動いている子プロセスを持たない、
+新しいインスタンスを作る。
 
-**Decision:** If no tool activity is detected for 10 seconds, show ⏳. After 30 seconds, show ⚠️.
+**検討した代案:**
 
-**Why:**
-- **Extended thinking**: Claude Code sometimes thinks for 10-30+ seconds before acting. Without stall detection, the user sees 🧠 forever and wonders if the bot is frozen
-- **Network issues**: If the subprocess hangs or the stream stalls, stall indicators help distinguish "thinking" from "broken"
-- **Soft vs hard**: Two levels let users know the difference between "this is taking a while" and "something might be wrong"
-- **Non-blocking**: The stall monitor runs as an asyncio task alongside the event stream, not blocking any I/O
+- 同じランナーを使い回す。子プロセスの状態をセッション間で共有することになり、危ない
+- `ClaudeRunner` を毎回手で組み立てる。設定があちこちに重複する
+- ファクトリにする。実質コピーコンストラクタでしかないものに対して大げさ
+
+**理由:**
+
+- **安全。** セッションごとに自分の子プロセスを持つ。共有する状態が無い
+- **単純。** `runner.clone()` が設定を全部写す。コードは 1 行
+- **追える。** `_active_runners[thread_id] = runner` でスレッドとランナーが対応するので、
+  `/clear` が正しい子プロセスを止められる
+
+**いま:** `ClaudeRunner` も `clone()` も無い。設定と実行が分かれたためで、設定は `ClaudeConfig`
+（dataclass）が持ち、実行は**スレッドごとの `TmuxClaudeRunner`** がターンのたびにその設定から作られる。
+「セッション間で実行状態を共有しない」「スレッド id からランナーを引ける（`_active_runners`）」という
+ねらいは同じまま残っている。`/clear` は子プロセスを止めるのではなく、Claude Code 自身の `/clear` を
+ペインに打つようになった（#803）。
+
+## 10. Separate Webhook and Chat Message Paths — webhook と人の発言は別の経路
+
+**決めたこと:** webhook のメッセージ（`message.webhook_id` がある）と、人の通常のメッセージは、
+別々の Cog が扱い、重なりを持たせない。
+
+**検討した代案:**
+
+- 1 つの Cog で両方を扱う。コードの構造は単純だが、責任が混ざる
+- ミドルウェアの形にする。discord.py にその仕組みは無く、流儀に合わない
+
+**理由（当時）:**
+
+- **`ClaudeChatCog`** は `message.author.bot` が偽のものだけを通す（webhook を含む bot をすべて飛ばす）
+- **webhook 用の Cog**（docs-sync など）は `message.webhook_id` があるものだけを通す
+- **ぶつからない。** この 2 つの条件は排他的で、1 つのメッセージが両方に当てはまることは無い
+- **守り方が違う。** 人の発言は `allowed_user_ids` で確かめ、webhook は決め打ちのトリガー文字列と照合する
+- **することが違う。** 人の発言は対話のセッションを始め、webhook は決められた自動処理を起動する
+
+**いま:** 「決め打ちのトリガーで自動処理を起動する Cog（`WebhookTriggerCog`、`AutoUpgradeCog`）を、
+会話の Cog と分ける」ことは変わっていない。変わったのは排他の線の引き方で、
+**`ClaudeChatCog` も webhook のメッセージを受け取る**。webhook の URL を持っていること自体を認可とみなし
+（#507/#508、`c_lord/command_gate.py`）、スレッドに投稿された webhook のメッセージは人の発言と同じく
+会話を進め、チャンネルではテキストコマンド（`!clord` など）として働く。CI からの起動、E2E テスト、
+Claude から Claude への依頼がこれで成り立っている。重ならないようにする仕組みは別に持つ:
+トリガー用の Cog が自分のものと認めた webhook メッセージには `ClaudeChatCog` は手を出さず（#862）、
+c-lord 自身がサブエージェントの声として使う webhook は命令として決して受け取らない（#971）。
+webhook 以外の bot は、`CLORD_TRUSTED_BOT_IDS` に載せたものだけを通す。
+
+## 11. Stall Detection in Status Manager — 動きが止まったことを示す
+
+**決めたこと:** 活動が 10 秒検出されなければ ⏳ を、30 秒で ⚠️ を出す。
+
+**理由:**
+
+- **長く考えることがある。** Claude Code は動き出す前に 10〜30 秒以上考えることがある。停滞の表示が無いと、
+  利用者には同じ絵文字がずっと見えるだけで、bot が固まったのかどうか分からない
+- **通信の問題と見分ける。** 子プロセスやストリームが止まったとき、「考えている」と「壊れている」を
+  区別する手がかりになる
+- **2 段階にする。** 「時間がかかっている」と「何かおかしいかもしれない」を分けて伝える
+- **本体を止めない。** 監視は asyncio のタスクとして、イベントの流れと並行に動く。I/O を塞がない
+
+**いま:** しきい値は同じ（`discord_ui/status.py` の `STALL_SOFT_SECONDS = 10`、`STALL_HARD_SECONDS = 30`）。
+「活動」の出どころが変わった。当初はランナーが出すツールのイベントで計っていたが、そのイベントが無くなって
+（#53/#723）からは何もタイマーを戻さず、30 秒を超えるターンがすべて ⚠️ になっていた。いまは transcript ミラーが
+jsonl に見た動き（ツールの呼び出しと結果、思考、メッセージ）を `c_lord/turn_activity.py` 経由でランプに伝え、
+結果待ちのツール呼び出しがある間は「動いている」と扱う（#769/#905）。
+長い沈黙には、ランプとは別に、スレッドに出る進捗行（90 秒の沈黙で `⚙️ 作業中 …`、#539）もある。
 
 ## 12. DoD & merge gate (single source of truth)
 

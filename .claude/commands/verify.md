@@ -1,9 +1,10 @@
-Run the full verification pipeline before committing:
+コミット前の検査を順に流してください（`verify` スキルと同じ内容。CI は `.github/workflows/ci.yml`）。
 
-1. Run `uv run ruff check c_lord/` — fix any lint errors
-2. Run `uv run ruff format c_lord/` — ensure formatting
-3. Run `uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing` — all tests must pass
-4. Run a security scan: search for `shell=True`, hardcoded secrets, and unvalidated user input in the codebase
-5. Verify the public API imports work: `python -c "from c_lord import ClaudeRunner, ClaudeChatCog"`
+1. `uv run ruff check c_lord/` — lint。指摘は直す
+2. `uv run ruff format --check c_lord/` — 差分があれば `uv run ruff format c_lord/` で整形する
+3. `uv run pyright c_lord/` — 型
+4. `uv run pytest tests/ -v --cov=c_lord --cov-report=term-missing` — 全部通ること
+5. セキュリティ: `shell=True`、文字列リテラルの秘密、検証していない入力が外部コマンドに渡る箇所を探す（詳しくは `security-audit` スキル）
+6. 公開 API: `uv run python -c "from c_lord import setup_bridge, ClaudeConfig, ClaudeChatCog"`
 
-Report results for each step. If any step fails, fix the issue and re-run that step before proceeding.
+段ごとに結果を報告してください。落ちた段は直してその段からやり直し、通るまで次へ進まないこと。
