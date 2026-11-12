@@ -33,7 +33,7 @@ package), not a personal bot. This file is the condensed form of `CLAUDE.md`, wh
 - `c_lord/database/` — SQLite persistence (aiosqlite) behind repository classes
 - `c_lord/discord_ui/` — status reactions, reply splitting, embeds, buttons
 - `c_lord/ext/api_server.py` — REST API control plane
-- `tests/` — pytest suite
+- `tests/` — the pytest suite (`tests/e2e/` needs a live bot and is skipped by default)
 
 ## Tests come first (TDD is enforced)
 

@@ -65,9 +65,9 @@ without a test. Green CI is not "done": behaviour changes are also verified on s
 - `c_lord/database/` — SQLite repositories
 - `c_lord/discord_ui/` — status reactions, reply splitting, embeds, buttons
 - `c_lord/ext/api_server.py` — REST API control plane
-- `tests/` — pytest suite
+- `tests/` — the pytest suite (`tests/e2e/` needs a live bot and is skipped by default)
 
-## Commands
+## Commands to run
 
 ```bash
 uv run pytest tests/ -v --cov=c_lord
