@@ -1,6 +1,71 @@
-# <<REDACTED 7 lines>>
+"""Value types for what a Claude Code session reports and asks.
+
+Nothing here talks to Discord or to the CLI: these are the shapes the runner,
+the event processor and the transcript mirror hand to one another.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
-# <<REDACTED 57 lines>>
+
+if TYPE_CHECKING:
+    import asyncio
+
+    import discord
+
+
+class MessageType(Enum):
+    """The kind of record a stream event was built from."""
+
+    SYSTEM = "system"
+    ASSISTANT = "assistant"
+    USER = "user"
+    RESULT = "result"
+    PROGRESS = "progress"
+
+
+class ContentBlockType(Enum):
+    """The kind of block inside an assistant or user message."""
+
+    TEXT = "text"
+    TOOL_USE = "tool_use"
+    TOOL_RESULT = "tool_result"
+    THINKING = "thinking"
+
+
+class ToolCategory(Enum):
+    """What a tool call is for, as far as presentation cares."""
+
+    READ = "read"
+    EDIT = "edit"
+    COMMAND = "command"
+    WEB = "web"
+    THINK = "think"
+    ASK = "ask"
+    TASK = "task"
+    PLAN = "plan"
+    OTHER = "other"
+
+
+def _categorise(category: ToolCategory, *tool_names: str) -> dict[str, ToolCategory]:
+    return dict.fromkeys(tool_names, category)
+
+
+#: Tool name → category, for the tools c-lord knows by name.
+TOOL_CATEGORIES: dict[str, ToolCategory] = {
+    **_categorise(ToolCategory.READ, "Read", "Glob", "Grep", "LS"),
+    **_categorise(ToolCategory.EDIT, "Write", "Edit", "NotebookEdit"),
+    **_categorise(ToolCategory.COMMAND, "Bash"),
+    **_categorise(ToolCategory.WEB, "WebFetch", "WebSearch"),
+    **_categorise(ToolCategory.OTHER, "Task"),
+    **_categorise(ToolCategory.ASK, "AskUserQuestion"),
+    **_categorise(ToolCategory.TASK, "TodoWrite"),
+    **_categorise(ToolCategory.PLAN, "ExitPlanMode"),
+}
+
+
 #: How the open TUI menu lets a free-text answer be typed (#650).  The two
 #: layouts Claude Code draws take *different* keystrokes, and sending the wrong
 #: ones answers the tool with "(No answer provided)" — losing what the user
@@ -18,7 +83,22 @@ FREE_TEXT_NONE = "none"
 FreeTextMode = Literal["row", "notes", "none"]
 
 
-# <<REDACTED 16 lines>>
+@dataclass
+class AskOption:
+    """One choice on a question menu."""
+
+    label: str
+    description: str = ""
+
+
+@dataclass
+class AskQuestion:
+    """A question Claude put to the user, with the choices it offered."""
+
+    question: str
+    header: str = ""
+    multi_select: bool = False
+    options: list[AskOption] = field(default_factory=list)
     # Whether to offer the free-text "✏️ Other" affordance in AskView.
     # True for AskUserQuestion (which has a "Type something." row to type onto).
     # Plan-approval menus (#251) set this False: their free-text option ("Tell
@@ -36,7 +116,8 @@ FreeTextMode = Literal["row", "notes", "none"]
     # zero decision context. Empty when no clean prose block sits above the
     # menu (tool blocks / chrome are never carried — see _extract_pane_context).
     context: str = ""
-# <<REDACTED 2 lines>>
+
+
 def ask_question_to_dict(question: AskQuestion) -> dict[str, Any]:
     """Serialise *question* for the ``pending_asks`` restart ledger (#671).
 
@@ -83,7 +164,79 @@ def ask_question_from_dict(raw: dict[str, Any]) -> AskQuestion:
     )
 
 
-# <<REDACTED 69 lines>>
+@dataclass
+class TodoItem:
+    """One line of Claude's todo list."""
+
+    content: str
+    status: str  # "pending" | "in_progress" | "completed"
+    active_form: str = ""
+
+
+@dataclass
+class PermissionRequest:
+    """Claude asking whether it may run a tool."""
+
+    request_id: str
+    tool_name: str
+    tool_input: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ElicitationRequest:
+    """An MCP server asking the user for input."""
+
+    request_id: str
+    server_name: str
+    mode: str  # "form-mode" | "url-mode"
+    message: str = ""
+    url: str = ""
+    schema: dict[str, Any] = field(default_factory=dict)
+
+
+#: Bash commands longer than this are cut (with an ellipsis) in ``display_name``.
+_COMMAND_DISPLAY_WIDTH = 60
+
+#: ``display_name`` for the tools whose label is "<verb>: <one input value>".
+#: The keys are tried in order; the last element is used when none is present.
+_TOOL_LABELS: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "Read": ("Reading", ("file_path",), "unknown"),
+    "Write": ("Writing", ("file_path",), "unknown"),
+    "Edit": ("Editing", ("file_path",), "unknown"),
+    "Glob": ("Searching", ("pattern", "glob"), ""),
+    "Grep": ("Searching", ("pattern", "glob"), ""),
+    "WebSearch": ("Searching web", ("query",), ""),
+    "WebFetch": ("Fetching", ("url",), ""),
+    "Task": ("Spawning agent", ("description",), ""),
+}
+
+
+@dataclass
+class ToolUseEvent:
+    """A tool call Claude made."""
+
+    tool_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+    category: ToolCategory
+
+    @property
+    def display_name(self) -> str:
+        """One line saying what this call is doing."""
+        if self.tool_name == "Bash":
+            command = self.tool_input.get("command", "")
+            if len(command) > _COMMAND_DISPLAY_WIDTH:
+                command = command[: _COMMAND_DISPLAY_WIDTH - 3] + "..."
+            return f"Running: {command}"
+
+        label = _TOOL_LABELS.get(self.tool_name)
+        if label is None:
+            return f"Using: {self.tool_name}"
+        verb, keys, fallback = label
+        subject = next((self.tool_input[k] for k in keys if k in self.tool_input), fallback)
+        return f"{verb}: {subject}"
+
+
 class UsageLimit(NamedTuple):
     """A plan limit Claude reported instead of answering (#631).
 
@@ -100,19 +253,49 @@ class UsageLimit(NamedTuple):
     line: str
 
 
-# <<REDACTED 14 lines>>
+@dataclass
+class StreamEvent:
+    """One thing a running session reported, with only the relevant fields set."""
+
+    message_type: MessageType
+    raw: dict = field(default_factory=dict)
+    session_id: str | None = None
+    text: str | None = None
+    tool_use: ToolUseEvent | None = None
+    tool_result_id: str | None = None
+    tool_result_content: str | None = None
+    thinking: str | None = None
+    has_redacted_thinking: bool = False
+    ask_questions: list[AskQuestion] | None = None
     # AskUserQuestion menu parsed from the tmux pane (jsonl/tmux mode, #166).
     # Distinct from ``ask_questions`` (SDK-mode resume-via-prompt): a pane_ask is
     # answered in-place by sending menu keystrokes back to the still-open TUI.
     pane_ask: AskQuestion | None = None
-    # <<REDACTED 4 lines>>
+    todo_list: list[TodoItem] | None = None
+    is_plan_approval: bool = False
+    permission_request: PermissionRequest | None = None
+    elicitation: ElicitationRequest | None = None
     unknown_tui_prompt: str | None = None
-    # <<REDACTED 5 lines>>
+    is_compact: bool = False
+    compact_trigger: str | None = None
+    compact_pre_tokens: int | None = None
+    is_complete: bool = False
+    is_partial: bool = False
     # #631: the plan limit that ended this turn, when one did. Structured
     # rather than sniffed back out of ``error`` — the reset time is the one
     # fact the reader needs and it must survive to the embed intact.
     usage_limit: UsageLimit | None = None
-    # <<REDACTED 11 lines>>
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    context_window: int | None = None
+    error: str | None = None
+
+
+def _parse_ask_questions(tool_input: dict[str, Any]) -> list[AskQuestion]:
     """Parse AskUserQuestion tool input into a list of AskQuestion objects.
 
     The tool input is also where the menu's TUI *layout* is decided (#650):
@@ -124,21 +307,41 @@ class UsageLimit(NamedTuple):
     answer keystrokes go to the wrong affordance and the user's typed sentence
     is answered as "(No answer provided)".
     """
-    # <<REDACTED 3 lines>>
+    questions: list[AskQuestion] = []
+    for q in tool_input.get("questions", []):
         raw_options = q.get("options", [])
-        # <<REDACTED 5 lines>>
+        options = [
+            AskOption(label=o.get("label", ""), description=o.get("description", ""))
             for o in raw_options
             if o.get("label")
         ]
         multi_select = bool(q.get("multiSelect", False))
         has_preview = any(o.get("preview") is not None for o in raw_options)
-        # <<REDACTED 4 lines>>
+        questions.append(
+            AskQuestion(
+                question=q.get("question", ""),
+                header=q.get("header", ""),
                 multi_select=multi_select,
                 options=options,
                 free_text_mode=(
                     FREE_TEXT_NOTES if has_preview and not multi_select else FREE_TEXT_ROW
                 ),
-            # <<REDACTED 21 lines>>
+            )
+        )
+    return questions
 
 
-# <<REDACTED 19 lines>>
+@dataclass
+class SessionState:
+    """What one run keeps track of while its events are being handled."""
+
+    session_id: str | None = None
+    thread_id: int = 0
+    accumulated_text: str = ""
+    partial_text: str = ""
+    # tool_use id → the Discord message showing that call
+    active_tools: dict[str, discord.Message] = field(default_factory=dict)
+    # tool_use id → the task refreshing that call's elapsed time
+    active_timers: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    # the message showing the todo list, once one has been posted
+    todo_message: discord.Message | None = None
