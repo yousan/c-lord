@@ -505,11 +505,7 @@ c_lord/
     ask_view.py            # AskUserQuestion 的按钮/下拉菜单
     ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB 生命周期
     streaming_manager.py   # StreamingMessageManager — 防抖就地消息编辑
-    tool_timer.py          # LiveToolTimer — 长运行工具的耗时计数器
     thread_dashboard.py    # 显示会话状态的实时置顶 embed
-    plan_view.py           # Plan Mode 批准/取消按钮（ExitPlanMode）
-    permission_view.py     # 工具权限请求允许/拒绝按钮
-    elicitation_view.py    # MCP Elicitation 的 Discord UI（Modal 表单或 URL 按钮）
   session_sync.py          # CLI 会话发现和导入
   session_dir.py           # 每个线程一个 git 克隆（从不删除有未提交更改的目录）
   ext/

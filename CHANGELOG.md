@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **本番で一度も呼ばれていなかった描画コードを消した**（#1316。利用者から見た動きは変わらない） — runner が出すイベントは SYSTEM と RESULT だけで、`StreamEvent` の `tool_use` / `thinking` / `todo_list` / `permission_request` / `elicitation` / `is_compact` をセットするコードが無かった（#723/#753）。それを描く側をまとめて削除: `c_lord.tool_use_embed` / `c_lord.session_complete_embed`、`c_lord.discord_ui.LiveToolTimer` / `TOOL_TIMER_INTERVAL`、モジュール `discord_ui/tool_timer.py` / `permission_view.py` / `plan_view.py` / `elicitation_view.py` / `progress_folder.py`、`embeds.py` の `tool_result_embed` / `thinking_embed` / `redacted_thinking_embed` / `todo_embed` / `plan_embed` / `permission_embed` / `elicitation_embed` / `CATEGORY_ICON` / `COLOR_THINKING`、`StatusManager.set_compact()` / `set_tool()` / `set_thinking()` と `EMOJI_COMPACT`、`StopView.bump()`、`EventProcessor.assistant_text_sent`。**c-lord を import してこれらの名前を使っているコードは ImportError / AttributeError になる**（`set_thinking()` は `set_running()` に置き換えられる）。
+
 ### Added
 - **ターンが終わったら外へ 1 件知らせる** — webhook で発注する側（OpenClaw のエージェント・CI など）は、C-lord のターン終わりを Discord のスレッドを読んで推測するしかなかった（実測 98 件: 気づくまで中央値 18 分・最大 62 分、終わっていたのに伝わらなかった件が 3 件）。`CLORD_EVENT_LOG=<path>` を設定すると JSONL を 1 行追記し、`CLORD_EVENT_WEBHOOK_URL` + `CLORD_EVENT_WEBHOOK_SECRET` を設定すると HMAC-SHA256 署名つきで POST する。種類は `completion` / `blocked` / `failure`（`notify_policy.Kind` と同じ）で、**最後の返事を投稿し終えたあと**に出す。背景のサブエージェントが残ったままターンが終わったときは、残りが無くなったターンの終わりまで `completion` を保留する。**どちらも既定は無効で、宛先はサーバの環境変数でしか決まらない**（Discord や発注文から指定させない）。未設定なら動きは変わらない。形・署名の検証・受け手の例は `docs/specs/turn-end-events.md` (#917)
 

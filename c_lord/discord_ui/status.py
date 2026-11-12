@@ -2,8 +2,9 @@
 
 Shows Claude's per-turn status as a single reaction on the user's trigger
 message: 🟢 *running* while the turn is active, 🟡 *waiting* once it's the
-user's turn again. ❌ error, ⏳/⚠️ stall and 🗜️ compact are temporary
-overrides shown while that condition holds.
+user's turn again. ❌ error and ⏳/⚠️ stall are temporary overrides shown
+while that condition holds. (Context compaction is not a lamp: the thread
+gets a one-line notice from the transcript mirror instead — #628.)
 
 Reactions live in a different Discord rate-limit bucket than thread renames,
 so they stay responsive even under heavy use (#246). The thread-name lamp
@@ -21,7 +22,6 @@ from collections.abc import Awaitable, Callable
 
 import discord
 
-from ..claude.types import ToolCategory  # noqa: F401  — kept for set_tool signature
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..turn_activity import turn_activity
 
@@ -34,11 +34,10 @@ EMOJI_WAITING = "\U0001f7e1"  # 🟡 — turn finished, your move
 EMOJI_ERROR = "❌"  # ❌
 EMOJI_STALL_SOFT = "⏳"  # ⏳
 EMOJI_STALL_HARD = "⚠️"  # ⚠️
-EMOJI_COMPACT = "\U0001f5dc️"  # 🗜️
 
 # Lamps that say "this turn is not over" — what a final paint must not leave
 # behind (#871).
-_OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD, EMOJI_COMPACT)
+_OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD)
 
 # What a reaction call can fail with without the turn being in trouble (#904).
 _LAMP_FAILURES = DISCORD_CALL_FAILURES
@@ -109,21 +108,6 @@ class StatusManager:
         await self._set_reaction(EMOJI_RUNNING)
         await self._start_stall_timer()
 
-    async def set_thinking(self) -> None:
-        """Alias for :meth:`set_running` — work continues, lamp stays 🟢."""
-        await self.set_running()
-
-    async def set_tool(self, category: ToolCategory | None = None) -> None:
-        """Work continues on a tool — keep 🟢 and note activity.
-
-        ``category`` is accepted for backward compatibility but no longer maps
-        to a per-tool emoji (#246): the tool detail is already shown by the
-        per-tool embeds posted in the thread, so duplicating it on the reaction
-        only added churn (and reaction edits).
-        """
-        await self._set_reaction(EMOJI_RUNNING)
-        self._reset_stall_timer()
-
     async def set_done(self) -> None:
         """🟡 — the turn finished; it's the user's turn now."""
         await self.set_waiting()
@@ -132,11 +116,6 @@ class StatusManager:
         """🟡 — flip the lamp to *waiting for user input*."""
         await self._stop_stall_timer()
         await self._set_reaction(EMOJI_WAITING, final=True)
-
-    async def set_compact(self) -> None:
-        """🗜️ — context compaction in progress (temporary override)."""
-        await self._set_reaction(EMOJI_COMPACT)
-        self._reset_stall_timer()
 
     async def set_error(self) -> None:
         """❌ — the turn ended in an error (temporary override, left visible)."""

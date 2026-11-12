@@ -42,11 +42,11 @@ C-lord が「何のため・誰のどの痛みを解決するか」を定めた�
    - 残っている非等価性: reply 層の装飾 (quote-reply / cli-prefix / prompt-choice) が経路A にあって経路B にまだ無い (#237)。添付ファイルは #233 で解消済み — ミラーが harness の `SendUserFile` `tool_use` を jsonl から読んで自分で添付する (`docs/specs/user-file-delivery.md`)。
 2. **Thread = Session**: Each Discord thread maps 1:1 to a Claude Code session ID. Replies in a thread continue the same session via `--resume`.
 3. **Emoji reactions for status** (#246): The per-turn lamp is a single reaction on the user's trigger message — 🟢 running (kept through thinking/tools) → 🟡 waiting (turn done), with ❌ error / ⏳⚠️ stall as temporary overrides. Applied immediately (no debounce). Reactions use a different Discord rate-limit bucket than thread renames, so this replaced the per-turn thread-name lamp that saturated the ~2-renames-per-10-min limit (#241); the thread-name 🟢/🟡 is now a slow, poll-driven sidebar view that is **off by default** (#329 — opt in with `CLORD_THREAD_LAMP=1`). See `docs/specs/thread-lamp.md`.
-   - **🗜️ compact のリアクションは出ない** (#753): `StatusManager.set_compact()` と `EventProcessor._on_system` の compaction 分岐はコードに残っているが、`StreamEvent.is_compact` をセットする箇所が無い (`grep -rn "is_compact=" c_lord/` が 0 件) ので**到達しない**（実測: 2026-06-10〜09-18 のリアクション 1,493 個に 🗜️ は 0 件）。文脈圧縮が利用者に見えるのは、ミラーがスレッドに出す `🗜️ コンテキストを圧縮しました` の1行だけ (#628。minimal モードでも `progress.txt` に畳まずスレッドに出す — #914)。到達不能なコードは**まだ残している**（消すかどうかは別判断）。触る前に「では誰が `is_compact` をセットするのか」を確かめること。
-4. **ツールの実行状況は embed ではなく jsonl ミラー由来の 2 か所に出る** (#723): `tmux_runner.py` はいまも `capture-pane` を polling しているが、**yield するイベントは SYSTEM と RESULT の 2 種だけ**。SYSTEM は (a) session_id を DB に保存させる合成イベント、(b) TUI のメニューを Discord のボタンへ橋渡しする `pane_ask` (#166/#251)、(c) 未知の対話プロンプトを知らせる `unknown_tui_prompt` の 3 用途。RESULT はターン完了 / エラー / usage limit。**`tool_use` / `todo_list` / `permission_request` / `elicitation` をセットする箇所はコードのどこにも無い** (`grep -rn "tool_use=" c_lord/` が 0 件) ので、`tool_use_embed()` / `discord_ui/tool_timer.py` / `EventProcessor._handle_tool_use()` は**本番で一度も呼ばれていない**（実測: 2026-06-05〜2026-09-11 の bot メッセージ 10,607 通に tool-use embed は 0 件）。
+   - **🗜️ compact のリアクションは無い** (#753/#1316): かつて `StatusManager.set_compact()` と `EventProcessor._on_system` の compaction 分岐があったが、`StreamEvent.is_compact` をセットする箇所が無く一度も到達しない（実測: 2026-06-10〜09-18 のリアクション 1,493 個に 🗜️ は 0 件）ので、**#1316 で `set_compact()`・`EMOJI_COMPACT`・その分岐ごと消した**。文脈圧縮が利用者に見えるのは、ミラーがスレッドに出す `🗜️ コンテキストを圧縮しました` の1行だけ (#628。minimal モードでも `progress.txt` に畳まずスレッドに出す — #914)。
+4. **ツールの実行状況は embed ではなく jsonl ミラー由来の 2 か所に出る** (#723): `tmux_runner.py` はいまも `capture-pane` を polling しているが、**yield するイベントは SYSTEM と RESULT の 2 種だけ**。SYSTEM は (a) session_id を DB に保存させる合成イベント、(b) TUI のメニューを Discord のボタンへ橋渡しする `pane_ask` (#166/#251)、(c) 未知の対話プロンプトを知らせる `unknown_tui_prompt` の 3 用途。RESULT はターン完了 / エラー / usage limit。**`tool_use` / `todo_list` / `permission_request` / `elicitation` / `thinking` をセットする箇所はコードのどこにも無い**ので、それを描く側（`tool_use_embed()` ほかの embed builder、`discord_ui/tool_timer.py`、`permission_view.py` / `plan_view.py` / `elicitation_view.py`、`EventProcessor._handle_tool_use()` ほか）は本番で一度も呼ばれていなかった（実測: 2026-06-05〜2026-09-11 の bot メッセージ 10,607 通に tool-use embed は 0 件）。**#1316 でまとめて消した**。`EventProcessor` に残っているのは session_id の保存・`pane_ask` の橋渡し・未知プロンプトの警告・ターン終わりのランプとエラー embed・session-start embed の後片付けだけ。
    - **いまツールの様子が見えるのは 2 か所**、どちらも供給元は tmux イベントではなく **jsonl ミラー**: ターンが 90 秒沈黙したときに出る turn progress line (`-# ⚙️ 作業中 5:56 · 🔧 Bash: … · ツール 61 件`、`discord_ui/turn_progress.py`) と、返信に添付される `progress.txt` (`transcript/formatter.py` が `🔧 Bash: …` の形に畳む)。
    - **permission プロンプトは Discord に出ない** — `tmux_runner._accept_permission_prompt()` がペイン内で自動承認する。**plan 承認 (ExitPlanMode) と AskUserQuestion は同じ `pane_ask` の ask bridge** を通って Discord のボタンになる (#166/#251、`discord_ui/ask_handler.py`)。ステータス絵文字はターン開始と SYSTEM / RESULT から駆動される (決定 3)。
-   - 到達不能になった `tool_use_embed` / `tool_timer.py` / `_handle_tool_use` は**まだコードに残っている**（消すかどうかは別判断 — #723 の Out of scope）。触る前に「では誰が `tool_use` をセットするのか」を確かめること。
+   - `StreamEvent`（`claude/types.py`）には `tool_use` / `todo_list` / `permission_request` / `elicitation` / `is_compact` などの**誰もセットも参照もしないフィールドが残っている**（#1316 では `types.py` を触らなかった）。runner のイベントから embed を出す仕組みを戻すなら、まず「誰がそのフィールドをセットするのか」から作ること — ツールの様子は上の 2 か所（jsonl ミラー）に出すのが今の設計。
 5. **Installable package**: `c_lord` is a proper Python package. Consumers install via `uv add git+...` or `pip install git+...`, not by copying files.
 6. **Shared run helper**: `cogs/_run_helper.py` centralizes Claude CLI execution logic used by both ClaudeChatCog and SkillCommandCog.
 7. **REST API as the control plane**: Claude Code subprocesses communicate back to c-lord via REST API (`CLORD_API_URL` env var — `start_claude` puts it on the `claude` command line with the port the API **actually bound**, which need not be `CLORD_API_PORT`: an unpinned API walks past a taken port, #258. Between #712 and #258 no session received it at all), not via stdout markers or special output formats. This makes the interface explicit, testable, and usable by external systems (GitHub Actions, etc.). See `ext/api_server.py`.
@@ -212,10 +212,10 @@ c-lord で 1 つの「セッション」が辿る状態遷移:
 2. **session_dir セットアップ** — `session_dir.py` が `c-lord-sessions/<channel_id>/<thread_id>/` に repo を git clone (channel が `/clord-init` で repo に bind されている場合のみ)。同時に `coauthor.py` が `prepare-commit-msg` フックを (再)注入し、このターンの依頼者を `Co-authored-by` として記録する (#518)
 3. **tmux window 作成** — `channel_repo.py::resolve_tmux_manager(channel_id, thread_id=...)` で session を取得し (thread binding があればそちらの repo 由来、無ければ channel binding 由来)、新規 window (`w1`, `w2`, ...) を立てる
 4. **Claude CLI 起動 + transcript ミラー開始** — `claude/tmux_runner.py` が tmux window 内で `claude` を起動 (`send-keys`)。`claude_chat` が `TranscriptMirrorCog.start_for(thread_id, working_dir)` を呼び、そのスレッド用に JSONL の tail を張る — 最終回答はここを通って Discord に届く (#71/#712)。`session_dir.py` は `discord-read` skill (#259) を注入する（他チャンネルを読むための道具で、配信とは無関係）。
-5. **ツール embed / 状態 emoji** — `tmux_runner` は capture-pane を polling して SYSTEM / RESULT / tool-use / permission / plan / elicitation / todo events を yield。 `EventProcessor` がそれぞれの embed/reaction を Discord に post する。**最終回答テキストはここを通らない** — JSONL ミラー経由のみ。
-6. **応答完了** — `RESULT` event で `EventProcessor.finalize()` を呼び、reaction 更新 + registry から unregister
+5. **状態 emoji / メニューの橋渡し** — `tmux_runner` は capture-pane を polling して SYSTEM / RESULT の 2 種だけを yield する（決定 4）。`EventProcessor` が session_id の保存、`pane_ask` の Discord ボタン化、未知プロンプトの警告、ターン終わりのランプ・エラー embed を担う。**ツールの様子と最終回答テキストはここを通らない** — JSONL ミラー経由のみ。
+6. **応答完了** — `RESULT` event で `EventProcessor` がランプを 🟡 / ❌ にし（エラーなら embed を出し）、session-start embed を消す。`_run_helper` が registry から unregister する
 7. **継続** — 同じスレッドへの reply は session_id を `--resume` で渡して同一セッションを継続
-8. **クリーンアップ (任意)** — 実際の入口は `/workspace-delete`（`session_manage.py::_workspace_delete_impl` → `SessionDirManager.cleanup_for_thread`）と、起動時の 30 日掃除（`main.py` → `retire_swept_workspace`）。スレッド close 時の自動クリーンアップは未実装。`_run_helper.py` の `_cleanup_session_dir` / `_cleanup_tmux_session` は**どこからも呼ばれていない**（呼び出し元は 5babaf2e で消えた — #1115）。消すかどうかは別判断（到達しない `tool_use_embed` 等と同じ扱い）
+8. **クリーンアップ (任意)** — 実際の入口は `/workspace-delete`（`session_manage.py::_workspace_delete_impl` → `SessionDirManager.cleanup_for_thread`）と、起動時の 30 日掃除（`main.py` → `retire_swept_workspace`）。スレッド close 時の自動クリーンアップは未実装。`_run_helper.py` にあった `_cleanup_session_dir` / `_cleanup_tmux_session` は呼び出し元が 5babaf2e で消えたまま残っていた（#1115）ので **#1316 で消した**。`RunConfig.session_dir_manager` / `tmux_manager` / `stop_view` は引数として残っているが、`_run_helper` / `EventProcessor` は読まない
 
 **よくある問題と確認手順**:
 
@@ -307,8 +307,8 @@ c_lord/          # Installable Python package
     _run_helper.py       # Shared Claude CLI execution logic (DRY)
   claude/
     config.py            # ClaudeConfig dataclass (CLI settings)
-    tmux_runner.py       # tmux pane runner — yields SYSTEM/RESULT/tool-use/
-                         # permission/plan/elicitation/todo events ONLY.
+    tmux_runner.py       # tmux pane runner — yields SYSTEM/RESULT events ONLY
+                         # (#723). Tool activity is read from the jsonl.
                          # ASSISTANT text events are no longer yielded (#53).
     types.py             # Type definitions for SDK messages
   legacy_env.py          # Startup notice for removed env switches (#712)
@@ -323,7 +323,7 @@ c_lord/          # Installable Python package
     notification_repo.py # Scheduled notification CRUD (REST API)
     task_repo.py         # Scheduled task CRUD (SchedulerCog)
   discord_ui/
-    status.py            # Emoji reaction status manager (debounced)
+    status.py            # Emoji reaction status manager (applied immediately)
     embeds.py            # Discord embed builders
                          # NOTE: chunker.py / streaming_manager.py /
                          # tui_strip.py / progress_buffer.py were removed in

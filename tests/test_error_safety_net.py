@@ -160,20 +160,18 @@ class TestErrorReportingViewMixin:
 
     def test_all_real_views_inherit_the_mixin(self) -> None:
         from c_lord.discord_ui.ask_view import AskView
-        from c_lord.discord_ui.elicitation_view import (
-            ElicitationFormView,
-            ElicitationUrlView,
+        from c_lord.discord_ui.views import (
+            ReopenSessionView,
+            StatusShowAllView,
+            StopView,
+            TextAnsweredMenuView,
         )
-        from c_lord.discord_ui.permission_view import PermissionView
-        from c_lord.discord_ui.plan_view import PlanApprovalView
-        from c_lord.discord_ui.views import StopView
 
         for cls in (
             StopView,
-            PermissionView,
-            PlanApprovalView,
+            ReopenSessionView,
+            TextAnsweredMenuView,
+            StatusShowAllView,
             AskView,
-            ElicitationUrlView,
-            ElicitationFormView,
         ):
             assert issubclass(cls, ErrorReportingViewMixin), cls.__name__

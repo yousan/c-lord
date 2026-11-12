@@ -817,11 +817,7 @@ c_lord/
     embeds.py              # Discord embed builders
     ask_view.py            # Buttons/Select Menus for AskUserQuestion
     ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB lifecycle
-    tool_timer.py          # LiveToolTimer — elapsed time counter for long-running tools
     thread_dashboard.py    # Live pinned embed showing session states
-    plan_view.py           # Approve/Cancel buttons for Plan Mode (ExitPlanMode)
-    permission_view.py     # Allow/Deny buttons for tool permission requests
-    elicitation_view.py    # Discord UI for MCP elicitation (Modal form or URL button)
   session_dir.py           # One git clone per thread (never removes a dir with uncommitted changes)
   ext/
     api_server.py          # REST API (optional, requires aiohttp)

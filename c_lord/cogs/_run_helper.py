@@ -65,7 +65,6 @@ from ..discord_ui.embeds import (
     trust_stuck_embed,
     usage_limit_embed,
 )
-from ..discord_ui.tool_timer import TOOL_TIMER_INTERVAL, LiveToolTimer  # noqa: F401
 from ..transcript.mirror import note_run_ended
 from ..transcript.resolver import derive_project_dir, latest_session_jsonl
 from ..utils.logger import log_ctx
@@ -91,9 +90,6 @@ _context_window_cache: dict[str, tuple[str | None, int]] = {}
 # probes of different models are independent ON CONFLICT upserts, no read-
 # modify-write race.  Stored in the existing ``settings`` KV (no new table).
 _CONTEXT_WINDOW_KEY_PREFIX = "context_window:"
-
-# Max characters for tool result display (re-exported for backward compat).
-TOOL_RESULT_MAX_CHARS = 3000
 
 _TIMEOUT_PATTERN = re.compile(r"Timed out after (\d+) seconds")
 
@@ -181,13 +177,6 @@ def _failure_reason(config: RunConfig, outcome: str) -> str | None:
     return "error"
 
 
-def _truncate_result(content: str) -> str:
-    """Truncate tool result content for display (re-exported for backward compat)."""
-    if len(content) <= TOOL_RESULT_MAX_CHARS:
-        return content
-    return content[:TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-
-
 def _register_session(config: RunConfig) -> None:
     """Register this turn in the session registry, if one is configured.
 
@@ -198,59 +187,6 @@ def _register_session(config: RunConfig) -> None:
     if config.registry is None:
         return
     config.registry.register(config.thread.id, config.prompt[:100], config.runner.working_dir)
-
-
-async def _cleanup_session_dir(config: RunConfig) -> None:
-    """Remove the session directory for this thread if it is clean.
-
-    Runs git operations in a thread pool to avoid blocking the event loop.
-    Logs the outcome but never raises — cleanup failures are non-fatal.
-    """
-    assert config.session_dir_manager is not None  # caller ensures this
-
-    try:
-        result = await asyncio.to_thread(
-            config.session_dir_manager.cleanup_for_thread,
-            config.thread.id,
-        )
-        if result.removed:
-            logger.info(
-                "Cleaned up session dir for thread %d: %s",
-                config.thread.id,
-                result.path,
-            )
-        elif result.reason == "session directory does not exist":
-            # Normal case — session dir was never created
-            pass
-        else:
-            logger.warning(
-                "Could not clean up session dir for thread %d (%s): %s",
-                config.thread.id,
-                result.path,
-                result.reason,
-            )
-            # Notify the Discord thread if there are uncommitted changes
-            if result.kept_work:
-                with contextlib.suppress(Exception):
-                    await config.thread.send(
-                        f"⚠️ **Session directory not cleaned up** — `{result.path}` has "
-                        f"uncommitted changes. Please commit or stash them, then remove "
-                        f"the directory manually."
-                    )
-    except Exception:
-        logger.exception(
-            "Unexpected error during session dir cleanup for thread %d", config.thread.id
-        )
-
-
-async def _cleanup_tmux_session(config: RunConfig) -> None:
-    """Kill the tmux session for this thread. Non-fatal on failure."""
-    assert config.tmux_manager is not None  # caller ensures this
-
-    try:
-        await asyncio.to_thread(config.tmux_manager.kill_session, config.thread.id)
-    except Exception:
-        logger.exception("Unexpected error during tmux cleanup for thread %d", config.thread.id)
 
 
 async def _cleanup_image_tempfiles(image_paths: list[str]) -> None:

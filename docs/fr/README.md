@@ -486,11 +486,7 @@ c_lord/
     ask_view.py            # Boutons/Menus de Sélection pour AskUserQuestion
     ask_handler.py         # collect_ask_answers() — UI + cycle de vie DB d'AskUserQuestion
     streaming_manager.py   # StreamingMessageManager — éditions de messages en place avec debounce
-    tool_timer.py          # LiveToolTimer — compteur de temps écoulé pour outils longs
     thread_dashboard.py    # Embed épinglé en direct affichant les états de session
-    plan_view.py           # Boutons Approuver/Annuler pour Plan Mode (ExitPlanMode)
-    permission_view.py     # Boutons Autoriser/Refuser pour les demandes de permission d'outil
-    elicitation_view.py    # Interface Discord pour MCP Elicitation (formulaire Modal ou bouton URL)
   session_sync.py          # Découverte et importation de sessions CLI
   session_dir.py           # Un clone git par fil (ne supprime jamais un répertoire avec des modifications non commitées)
   ext/

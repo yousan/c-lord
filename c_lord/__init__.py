@@ -29,12 +29,7 @@ from .database.repository import SessionRepository
 from .database.settings_repo import SettingsRepository
 from .database.task_repo import TaskRepository as ScheduledTaskRepository
 from .database.thread_repo import ThreadRepository
-from .discord_ui.embeds import (
-    error_embed,
-    session_complete_embed,
-    session_start_embed,
-    tool_use_embed,
-)
+from .discord_ui.embeds import error_embed, session_start_embed
 from .discord_ui.status import StatusManager
 from .protocols import DrainAware
 from .session_dir import CleanupResult, SessionDirInfo, SessionDirManager
@@ -110,7 +105,5 @@ __all__ = [
     # UI
     "StatusManager",
     "error_embed",
-    "session_complete_embed",
     "session_start_embed",
-    "tool_use_embed",
 ]

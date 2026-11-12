@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from c_lord.claude.types import ToolCategory
 from c_lord.discord_ui.status import (
     EMOJI_ERROR,
     EMOJI_RUNNING,
@@ -42,7 +41,7 @@ class TestHardStall:
     async def test_hard_stall_paints_the_warning_lamp(self) -> None:
         msg = _make_message()
         sm = StatusManager(msg)
-        await sm.set_thinking()
+        await sm.set_running()
         loop = asyncio.get_running_loop()
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
         await asyncio.sleep(2.5)
@@ -54,7 +53,7 @@ class TestHardStall:
         """Staying stalled must not re-paint (and re-notify) every 2s tick."""
         msg = _make_message()
         sm = StatusManager(msg)
-        await sm.set_thinking()
+        await sm.set_running()
         loop = asyncio.get_running_loop()
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
         await asyncio.sleep(5)
@@ -66,13 +65,14 @@ class TestHardStall:
     async def test_the_lamp_comes_back_after_activity_and_another_stall(self) -> None:
         msg = _make_message()
         sm = StatusManager(msg)
-        await sm.set_thinking()
+        await sm.set_running()
         loop = asyncio.get_running_loop()
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
         await asyncio.sleep(2.5)
         assert sm._current_emoji == EMOJI_STALL_HARD
 
-        await sm.set_tool(ToolCategory.READ)  # activity → back to 🟢
+        sm._reset_stall_timer()  # activity → the monitor takes ⚠️ back to 🟢
+        await asyncio.sleep(2.2)
         assert sm._current_emoji == EMOJI_RUNNING
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
         await asyncio.sleep(2.5)
@@ -84,47 +84,12 @@ class TestHardStall:
         msg = _make_message()
         msg.add_reaction = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
         sm = StatusManager(msg)
-        await sm.set_thinking()
+        await sm.set_running()
         loop = asyncio.get_running_loop()
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
         await asyncio.sleep(2.5)
         assert sm._stall_task is not None
         assert not sm._stall_task.done()
-        await sm.cleanup()
-
-
-class TestCompactStatus:
-    """Tests for compact status emoji."""
-
-    @pytest.mark.asyncio
-    async def test_set_compact_changes_emoji(self) -> None:
-        from c_lord.discord_ui.status import EMOJI_COMPACT
-
-        msg = _make_message()
-        sm = StatusManager(msg)
-        await sm.set_thinking()
-        await sm.set_compact()
-        # Reactions apply immediately now (no debounce, #246).
-        assert sm._current_emoji == EMOJI_COMPACT
-        await sm.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_set_compact_resets_stall_timer(self) -> None:
-        """set_compact should reset the stall timer so ⚠️ doesn't appear during compaction."""
-        from c_lord.discord_ui.status import EMOJI_COMPACT
-
-        msg = _make_message()
-        sm = StatusManager(msg)
-        await sm.set_thinking()
-        # Simulate time passing
-        loop = asyncio.get_running_loop()
-        sm._last_activity = loop.time() - 25  # Almost at hard stall threshold
-        # Compact resets the timer
-        await sm.set_compact()
-        # Wait past what would have been the stall threshold
-        await asyncio.sleep(3)
-        # Still 🗜️ — the stall lamp must NOT have taken over.
-        assert sm._current_emoji == EMOJI_COMPACT
         await sm.cleanup()
 
 
@@ -143,24 +108,15 @@ class TestReactionLamp:
         await sm.cleanup()
 
     @pytest.mark.asyncio
-    async def test_thinking_is_green_alias(self) -> None:
-        msg = _make_message()
-        sm = StatusManager(msg)
-        await sm.set_thinking()
-        msg.add_reaction.assert_awaited_once_with(EMOJI_RUNNING)
-        assert sm._current_emoji == EMOJI_RUNNING
-        await sm.cleanup()
-
-    @pytest.mark.asyncio
     async def test_stays_green_while_working(self) -> None:
-        # AC3: while working (thinking / tools), the lamp stays 🟢 — never 🟡,
-        # and tools no longer paint a per-category emoji (🛠️/💻/🌐 removed).
+        # AC3: while working, the lamp stays 🟢 — never 🟡 — and painting 🟢
+        # again costs no reaction call.
         msg = _make_message()
         sm = StatusManager(msg)
         await sm.set_running()
-        await sm.set_tool(ToolCategory.WEB)
-        await sm.set_thinking()
-        await sm.set_tool(ToolCategory.EDIT)
+        await sm.set_running()
+        sm._reset_stall_timer()
+        await sm.set_running()
         # Only the initial 🟢 add — repeated work calls are no-ops on the reaction.
         msg.add_reaction.assert_awaited_once_with(EMOJI_RUNNING)
         assert sm._current_emoji == EMOJI_RUNNING

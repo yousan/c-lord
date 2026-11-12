@@ -552,11 +552,7 @@ c_lord/
     ask_view.py            # AskUserQuestion 用 Discord ボタン / Select Menu
     ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB ライフサイクル
     streaming_manager.py   # StreamingMessageManager — デバウンス付きインプレース編集
-    tool_timer.py          # LiveToolTimer — 長時間ツール実行の経過時間カウンター
     thread_dashboard.py    # スレッドのセッション状態を表示する live ピン embed
-    plan_view.py           # Plan Mode 承認ボタン（Approve/Cancel）
-    permission_view.py     # ツール実行許可ボタン（Allow/Deny）
-    elicitation_view.py    # MCP Elicitation 用 Discord UI（Modal フォームまたは URL ボタン）
   session_sync.py          # CLI セッションの検出とインポート
   session_dir.py           # スレッドごとに 1 つの git clone（未コミットの変更があるディレクトリは削除しない）
   ext/

@@ -88,8 +88,8 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **トリガ** | Plan Mode でプランが完成したとき（`ExitPlanMode` ツール呼び出し） |
 | **画面シグネチャ** | `Would you like to proceed?` / `❯ 1. Yes` / `  2. Yes, and auto-accept edits` / `  3. No, keep planning` |
 | **操作** | 数字 + Enter |
-| **JSONL** | ✅ `StreamEvent.is_plan_approval == True`（`ExitPlanMode` ツール呼び出しとして検出） |
-| **現在の c-lord 対応** | ✅ Discord UI で承認ボタン表示（`embeds.py` の plan embed + `StopView` / `PlanView`） |
+| **JSONL** | ⚠️ `StreamEvent.is_plan_approval` というフィールドはあるが、tmux runner は埋めない |
+| **現在の c-lord 対応** | ✅ AskUserQuestion と同じ **ペイン解析 → `pane_ask` の ask bridge** で Discord のボタンになる（#251、`discord_ui/ask_handler.py`）。`StreamEvent.is_plan_approval` をセットするコードは無く、それを描いていた `plan_view.py` / plan embed は #1316 で消した |
 
 ### 2-3. AskUserQuestion（Claude 生成の構造化選択）
 
@@ -109,8 +109,8 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **トリガ** | MCP サーバーが elicitation を要求したとき |
 | **画面シグネチャ** | form-mode: フィールド入力画面 / url-mode: URL 表示 |
 | **操作** | form-mode: 入力 + Enter / url-mode: ブラウザ操作後 Done |
-| **JSONL** | ✅ `StreamEvent.elicitation: ElicitationRequest`（`request_id`, `server_name`, `mode`, `schema` 等） |
-| **現在の c-lord 対応** | ✅ `ElicitationView` で Discord モーダル / URL ボタン表示済み |
+| **JSONL** | ⚠️ `StreamEvent.elicitation: ElicitationRequest` というフィールドはあるが、tmux runner は埋めない |
+| **現在の c-lord 対応** | ❌ 未対応。`elicitation_view.py` は到達しないまま残っていたので #1316 で消した（ペインに選択メニューとして出れば `unknown_tui_prompt` の警告が出る） |
 
 ### 2-5. Compaction / Context Low
 
@@ -119,8 +119,8 @@ JSONL transcript が始まる前に出るため、JSONL 経路では検出でき
 | **トリガ** | コンテキストウィンドウが閾値（約 95%）に達したとき |
 | **画面シグネチャ** | `Context window is almost full. Auto-compacting...` または対話型で `Compact now? (y/n)` |
 | **操作** | y/n（対話型の場合）。自動発動時は操作不要 |
-| **JSONL** | ✅ `StreamEvent.is_compact == True`（`compact_trigger`, `compact_pre_tokens` 等も取得可能） |
-| **現在の c-lord 対応** | ⚠️ `is_compact` の受信はあるが Discord 通知の実装は要確認 |
+| **JSONL** | ⚠️ `StreamEvent.is_compact` というフィールドはあるが、tmux runner は埋めない。圧縮は transcript（jsonl）の継続プロンプトとして現れる |
+| **現在の c-lord 対応** | ✅ transcript ミラーがスレッドに `🗜️ コンテキストを圧縮しました` の 1 行を出す（#628、`docs/specs/mirrored-events.md`）。リアクションは付かない（#753/#1316） |
 
 ---
 
@@ -261,10 +261,10 @@ JSONL に出ない。`tmux capture-pane` でしか検出できない。誤検知
 |-----------|-------|------------|------------|
 | Trust prompt | ❌ | ✅ 自動 Enter | `tmux_runner._handle_startup_prompts` |
 | Permission request | ✅ | ⚠️ TUI 自動 Enter のみ | `tmux_runner._accept_permission_prompt` |
-| Plan approval | ✅ | ✅ Discord UI | `discord_ui/plan_view.py`, `embeds.py` |
+| Plan approval | ❌（ペイン解析） | ✅ Discord UI | `discord_ui/ask_view.py`, `ask_handler.py`（`pane_ask`） |
 | AskUserQuestion | ✅ | ✅ Discord UI | `discord_ui/ask_view.py`, `ask_handler.py` |
-| Elicitation | ✅ | ✅ Discord UI | `discord_ui/elicitation_view.py` |
-| Compaction | ✅ | ⚠️ 受信のみ | `claude/types.py` (is_compact) |
+| Elicitation | ❌ | ❌ 未対応 | — |
+| Compaction | ✅（transcript） | ✅ スレッドに 1 行 | `transcript/formatter.py`（#628） |
 | Resume picker | ❌ | ✅ 回避（明示 ID） | `_run_helper.py` |
 | Update/restart | ❌ | ❌ 未対応 | — |
 | Model selection | ❌ | ❌ 未対応（起動時 --model で回避） | — |
@@ -300,7 +300,7 @@ JSONL に出ない。`tmux capture-pane` でしか検出できない。誤検知
 以下は手元実験 or Claude Code 公式ソース確認が必要：
 
 - [ ] `Do you want to make this edit?` は `permission_request` と同一フォーマットか、別フォーマットか
-- [ ] Compaction 発動時の Discord 通知は現在実装済みか（`is_compact` フィールドの EventProcessor 側処理を確認）
+- [x] Compaction 発動時の Discord 通知は現在実装済みか → 実装済み。transcript ミラーの 1 行（#628）。`EventProcessor` の `is_compact` 分岐は到達しなかったので #1316 で消した
 - [ ] `--permission-mode acceptEdits` では permission_request がどの操作に出るか（Write/Bash の差異）
 - [ ] 更新プロンプトの実際の文字列（バージョンにより変化する可能性）
 - [ ] Resume picker が出る条件の再現（DB にセッション ID が残っている状態）

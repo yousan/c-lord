@@ -10,21 +10,15 @@ run_claude_with_config() pipeline.
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import discord
 import pytest
 
 from c_lord.claude.types import (
     AskOption,
     AskQuestion,
-    ElicitationRequest,
     MessageType,
-    PermissionRequest,
     StreamEvent,
-    ToolCategory,
-    ToolUseEvent,
 )
 from c_lord.cogs.event_processor import EventProcessor
 from c_lord.cogs.run_config import RunConfig
@@ -33,18 +27,6 @@ from c_lord.cogs.run_config import RunConfig
 def _make_config(thread: MagicMock, runner: MagicMock, **kwargs) -> RunConfig:
     """Build a minimal RunConfig for tests."""
     return RunConfig(thread=thread, runner=runner, prompt="test prompt", **kwargs)
-
-
-def _make_tool_event(tool_id: str = "t1") -> StreamEvent:
-    return StreamEvent(
-        message_type=MessageType.ASSISTANT,
-        tool_use=ToolUseEvent(
-            tool_id=tool_id,
-            tool_name="Bash",
-            tool_input={"command": "echo hi"},
-            category=ToolCategory.COMMAND,
-        ),
-    )
 
 
 def _make_result_event(**kwargs) -> StreamEvent:
@@ -79,13 +61,6 @@ class TestEventProcessorProperties:
         config = _make_config(thread, runner)
         p = EventProcessor(config)
         assert p.should_drain is False
-
-    def test_assistant_text_sent_false_initially(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-        assert p.assistant_text_sent is False
 
 
 class TestOnSystem:
@@ -162,10 +137,9 @@ class TestOnSystem:
 
 
 class TestOnAssistantText:
-    """Issue #53: assistant text is no longer posted to Discord — Claude
-    pushes its final answer via the discord-reply skill. The processor
-    receives ASSISTANT text events but must NOT call ``thread.send`` for
-    them, and ``assistant_text_sent`` is hard-wired to False.
+    """Issue #53: assistant text is not posted from here — the transcript
+    mirror delivers Claude's answer (#712). An ASSISTANT text event must NOT
+    make the processor call ``thread.send``.
     """
 
     @pytest.mark.asyncio
@@ -195,131 +169,6 @@ class TestOnAssistantText:
             c for c in thread.send.call_args_list if c.args and isinstance(c.args[0], str)
         ]
         assert text_sends == []
-
-    @pytest.mark.asyncio
-    async def test_assistant_text_sent_stays_false(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-        await p.process(
-            StreamEvent(message_type=MessageType.ASSISTANT, text="Hello", is_partial=False)
-        )
-        assert p.assistant_text_sent is False
-
-
-class TestOnAssistantThinking:
-    """ASSISTANT thinking event handling."""
-
-    @pytest.mark.asyncio
-    async def test_complete_thinking_sends_embed(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        event = StreamEvent(
-            message_type=MessageType.ASSISTANT,
-            thinking="I am thinking...",
-            is_partial=False,
-        )
-        await p.process(event)
-
-        embed_sends = [c for c in thread.send.call_args_list if "embed" in c.kwargs]
-        assert len(embed_sends) == 1
-
-    @pytest.mark.asyncio
-    async def test_partial_thinking_does_not_send_embed(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        event = StreamEvent(message_type=MessageType.ASSISTANT, thinking="I am", is_partial=True)
-        await p.process(event)
-
-        thread.send.assert_not_called()
-
-
-class TestOnToolUse:
-    """ASSISTANT tool_use event handling."""
-
-    @pytest.mark.asyncio
-    async def test_tool_use_sends_embed(self, thread: MagicMock, runner: MagicMock) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        await p.process(_make_tool_event("t1"))
-
-        embed_sends = [c for c in thread.send.call_args_list if "embed" in c.kwargs]
-        assert len(embed_sends) == 1
-
-    @pytest.mark.asyncio
-    async def test_tool_use_tracked_in_state(self, thread: MagicMock, runner: MagicMock) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        await p.process(_make_tool_event("tool-xyz"))
-
-        assert "tool-xyz" in p._state.active_tools
-
-    @pytest.mark.asyncio
-    async def test_tool_use_starts_timer(self, thread: MagicMock, runner: MagicMock) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        await p.process(_make_tool_event("t-timer"))
-
-        assert "t-timer" in p._state.active_timers
-        # Clean up the timer task
-        task = p._state.active_timers["t-timer"]
-        task.cancel()
-        with pytest.raises((asyncio.CancelledError, Exception)):
-            await task
-
-
-class TestOnToolResult:
-    """USER (tool result) event handling."""
-
-    @pytest.mark.asyncio
-    async def test_timer_cancelled_on_result(self, thread: MagicMock, runner: MagicMock) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        # Plant a fake timer task
-        fake_task = MagicMock(spec=asyncio.Task)
-        fake_task.done.return_value = False
-        p._state.active_timers["t1"] = fake_task
-
-        result_event = StreamEvent(message_type=MessageType.USER, tool_result_id="t1")
-        await p.process(result_event)
-
-        fake_task.cancel.assert_called_once()
-        assert "t1" not in p._state.active_timers
-
-    @pytest.mark.asyncio
-    async def test_tool_embed_updated_with_result(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        # Plant a fake in-progress tool message
-        fake_embed = MagicMock(spec=discord.Embed)
-        fake_embed.title = "Running: echo hi"
-        fake_msg = MagicMock(spec=discord.Message)
-        fake_msg.embeds = [fake_embed]
-        fake_msg.edit = AsyncMock()
-        p._state.active_tools["t1"] = fake_msg
-
-        result_event = StreamEvent(
-            message_type=MessageType.USER,
-            tool_result_id="t1",
-            tool_result_content="output here",
-        )
-        await p.process(result_event)
-
-        fake_msg.edit.assert_called_once()
 
 
 class TestAskUserQuestion:
@@ -540,247 +389,6 @@ class TestOnComplete:
         repo.save.assert_called_once_with(thread.id, "s2", working_dir="/sessions/456")
 
 
-class TestConnectionErrorResilience:
-    """Discord/aiohttp connection errors must not crash the session.
-
-    ServerDisconnectedError (aiohttp.ClientError subclass) is raised when
-    the Discord HTTP session closes — e.g. during bot shutdown. It is NOT a
-    subclass of discord.HTTPException, so it was previously uncaught and
-    would propagate up to kill the entire session.
-    """
-
-    @pytest.mark.asyncio
-    async def test_tool_use_send_failure_does_not_raise(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        """If thread.send fails (connection closed), _handle_tool_use returns silently."""
-        thread.send.side_effect = Exception("Server disconnected")
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        # Should not raise — failure is logged and the handler returns early.
-        await p.process(_make_tool_event("t1"))
-
-        # Tool was not tracked because send failed
-        assert "t1" not in p._state.active_tools
-        assert "t1" not in p._state.active_timers
-
-    @pytest.mark.asyncio
-    async def test_tool_result_edit_failure_does_not_raise(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        """If tool embed edit raises a connection error, _on_tool_result suppresses it."""
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        fake_embed = MagicMock(spec=discord.Embed)
-        fake_embed.title = "Running: echo hi"
-        fake_msg = MagicMock(spec=discord.Message)
-        fake_msg.embeds = [fake_embed]
-        fake_msg.edit = AsyncMock(side_effect=Exception("Server disconnected"))
-        p._state.active_tools["t1"] = fake_msg
-
-        result_event = StreamEvent(
-            message_type=MessageType.USER,
-            tool_result_id="t1",
-            tool_result_content="output",
-        )
-        # Should not raise — failure is suppressed.
-        await p.process(result_event)
-
-
-class TestFinalize:
-    """finalize() cleanup."""
-
-    @pytest.mark.asyncio
-    async def test_finalize_cancels_active_timers(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        fake_task = MagicMock(spec=asyncio.Task)
-        fake_task.done.return_value = False
-        p._state.active_timers["t1"] = fake_task
-
-        await p.finalize()
-
-        fake_task.cancel.assert_called_once()
-        assert len(p._state.active_timers) == 0
-
-    @pytest.mark.asyncio
-    async def test_finalize_skips_done_tasks(self, thread: MagicMock, runner: MagicMock) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        fake_task = MagicMock(spec=asyncio.Task)
-        fake_task.done.return_value = True
-        p._state.active_timers["t1"] = fake_task
-
-        await p.finalize()
-
-        fake_task.cancel.assert_not_called()
-
-
-class TestCompactHandling:
-    """Tests for context compaction event handling."""
-
-    @pytest.mark.asyncio
-    async def test_compact_sends_notification(self) -> None:
-        thread = MagicMock()
-        thread.send = AsyncMock(return_value=MagicMock(embeds=[]))
-        runner = MagicMock()
-        runner.interrupt = AsyncMock()
-        status = MagicMock()
-        status.set_compact = AsyncMock()
-        status.set_thinking = AsyncMock()
-        status._reset_stall_timer = MagicMock()
-        config = _make_config(thread, runner, status=status)
-        processor = EventProcessor(config)
-
-        event = StreamEvent(
-            message_type=MessageType.SYSTEM,
-            is_compact=True,
-            compact_trigger="auto",
-            compact_pre_tokens=167745,
-        )
-        await processor.process(event)
-
-        status.set_compact.assert_awaited_once()
-        # Check that a message was sent to the thread
-        calls = [str(c) for c in thread.send.call_args_list]
-        assert any("compact" in c.lower() or "\U0001f5dc" in c for c in calls)
-
-    @pytest.mark.asyncio
-    async def test_progress_resets_stall_timer(self) -> None:
-        thread = MagicMock()
-        thread.send = AsyncMock(return_value=MagicMock(embeds=[]))
-        runner = MagicMock()
-        status = MagicMock()
-        status._reset_stall_timer = MagicMock()
-        config = _make_config(thread, runner, status=status)
-        processor = EventProcessor(config)
-
-        event = StreamEvent(message_type=MessageType.PROGRESS)
-        await processor.process(event)
-
-        status._reset_stall_timer.assert_called_once()
-
-
-def _mention_contents(thread: MagicMock) -> list[str]:
-    """Return the ``content`` of every thread.send call that carries an @mention.
-
-    A Discord push notification is only guaranteed when the *message content*
-    (not an embed) contains ``<@id>`` — so #480's fix is observable exactly as
-    "at least one send whose content mentions the notify user".
-    """
-    out: list[str] = []
-    for call in thread.send.call_args_list:
-        content = call.kwargs.get("content")
-        if content is None and call.args and isinstance(call.args[0], str):
-            content = call.args[0]
-        if isinstance(content, str) and "<@" in content:
-            out.append(content)
-    return out
-
-
-class TestInteractivePromptNotification:
-    """#480: question-mode prompts must @-mention the turn's poster.
-
-    Permission / plan / elicitation / AskUserQuestion pauses block the turn
-    awaiting the user's input, but historically posted a button embed with no
-    message-content mention — so users whose thread notifications are
-    "mentions only" got no push. These tests assert the notify user is pinged
-    via message content (embeds do not ping).
-    """
-
-    @pytest.mark.asyncio
-    async def test_permission_request_pings_notify_user(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner, notify_user_id=999)
-        p = EventProcessor(config)
-
-        await p.process(
-            StreamEvent(
-                message_type=MessageType.SYSTEM,
-                permission_request=PermissionRequest(
-                    request_id="r1", tool_name="Bash", tool_input={"command": "echo hi"}
-                ),
-            )
-        )
-
-        mentions = _mention_contents(thread)
-        assert any("<@999>" in m for m in mentions), (
-            f"permission prompt must ping notify user 999; sends={thread.send.call_args_list}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_plan_approval_pings_notify_user(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner, notify_user_id=999)
-        p = EventProcessor(config)
-
-        await p.process(
-            StreamEvent(
-                message_type=MessageType.ASSISTANT,
-                is_plan_approval=True,
-                is_partial=False,
-                text="# Plan\n1. do thing",
-            )
-        )
-
-        mentions = _mention_contents(thread)
-        assert any("<@999>" in m for m in mentions), (
-            f"plan approval must ping notify user 999; sends={thread.send.call_args_list}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_elicitation_pings_notify_user(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        config = _make_config(thread, runner, notify_user_id=999)
-        p = EventProcessor(config)
-
-        await p.process(
-            StreamEvent(
-                message_type=MessageType.SYSTEM,
-                elicitation=ElicitationRequest(
-                    request_id="e1",
-                    server_name="srv",
-                    mode="url-mode",
-                    message="Authorize",
-                    url="https://example.com/auth",
-                ),
-            )
-        )
-
-        mentions = _mention_contents(thread)
-        assert any("<@999>" in m for m in mentions), (
-            f"elicitation must ping notify user 999; sends={thread.send.call_args_list}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_mention_when_notify_user_unset(
-        self, thread: MagicMock, runner: MagicMock
-    ) -> None:
-        """With no notify user (e.g. automated turn, owner unset), never ping."""
-        config = _make_config(thread, runner)  # notify_user_id defaults to None
-        p = EventProcessor(config)
-
-        await p.process(
-            StreamEvent(
-                message_type=MessageType.SYSTEM,
-                permission_request=PermissionRequest(
-                    request_id="r1", tool_name="Bash", tool_input={"command": "echo hi"}
-                ),
-            )
-        )
-
-        assert _mention_contents(thread) == []
-
-
 class TestUsageLimitOutcome:
     """#631: a rate-limited RESULT reports the limit, not "send it again"."""
 
@@ -863,3 +471,98 @@ class TestUsageLimitOutcome:
         )
 
         assert usage_limit_notices.announced(thread.id) is False
+
+
+def _deletable_message() -> MagicMock:
+    m = MagicMock()
+    m.delete = AsyncMock()
+    m.edit = AsyncMock()
+    return m
+
+
+class TestSessionStartEmbedIsTakenAway:
+    """The session-start embed is bookkeeping: gone once the turn ends, and
+    never turned into a ``progress.txt`` of its own (#542).
+    """
+
+    @pytest.mark.asyncio
+    async def test_session_start_only_sends_no_file(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        sent: list[MagicMock] = []
+
+        async def fake_send(*args, **kwargs):
+            sent.append(_deletable_message())
+            return sent[-1]
+
+        thread.send = AsyncMock(side_effect=fake_send)
+
+        p = EventProcessor(_make_config(thread, runner))
+        await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
+        await p.process(_make_result_event(session_id="s1"))
+
+        file_sends = [c for c in thread.send.await_args_list if "file" in c.kwargs]
+        assert file_sends == [], f"an empty progress.txt was posted: {file_sends!r}"
+        sent[0].delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_embed_is_deleted_only_once(self, thread: MagicMock, runner: MagicMock) -> None:
+        start = _deletable_message()
+        thread.send = AsyncMock(return_value=start)
+
+        p = EventProcessor(_make_config(thread, runner))
+        await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
+        await p.process(_make_result_event(session_id="s1"))
+        await p.process(_make_result_event(session_id="s1"))
+
+        start.delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_delete_does_not_break_the_turn(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        start = _deletable_message()
+        start.delete = AsyncMock(side_effect=RuntimeError("Session is closed"))
+        thread.send = AsyncMock(return_value=start)
+
+        p = EventProcessor(_make_config(thread, runner))
+        await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
+        await p.process(_make_result_event(session_id="s1"))  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_resumed_turn_deletes_and_attaches_nothing(
+        self, thread: MagicMock, runner: MagicMock
+    ) -> None:
+        sent: list[MagicMock] = []
+
+        async def fake_send(*args, **kwargs):
+            sent.append(_deletable_message())
+            return sent[-1]
+
+        thread.send = AsyncMock(side_effect=fake_send)
+
+        p = EventProcessor(_make_config(thread, runner, session_id="resumed"))
+        await p.process(_make_result_event(session_id="resumed"))
+
+        for m in sent:
+            m.delete.assert_not_called()
+            assert [c for c in m.edit.await_args_list if "attachments" in c.kwargs] == []
+
+    @pytest.mark.asyncio
+    async def test_error_embed_is_left_in_place(self, thread: MagicMock, runner: MagicMock) -> None:
+        sent: list[MagicMock] = []
+
+        async def fake_send(*args, **kwargs):
+            sent.append(_deletable_message())
+            return sent[-1]
+
+        thread.send = AsyncMock(side_effect=fake_send)
+
+        p = EventProcessor(_make_config(thread, runner))
+        await p.process(StreamEvent(message_type=MessageType.SYSTEM, session_id="s1"))
+        await p.process(_make_result_event(session_id="s1", error="boom"))
+
+        start, error = sent[0], sent[1]
+        start.delete.assert_awaited_once()
+        error.delete.assert_not_called()
+        assert [c for c in error.edit.await_args_list if "attachments" in c.kwargs] == []
