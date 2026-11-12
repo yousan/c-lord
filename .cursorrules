@@ -1,41 +1,70 @@
 # C-lord — Cursor Rules
 
-Discord frontend for Claude Code CLI. Python 3.10+ with discord.py v2.
+A short version of `CLAUDE.md` for Cursor. When the two disagree, `CLAUDE.md` wins — read it before a
+non-trivial change (it also holds the Definition of Done and the staging-verification rules).
 
-## Architecture
+## What this is
 
-- CLI spawn approach: `claude -p --output-format stream-json` as async subprocess
-- Thread = Session: Discord thread maps 1:1 to Claude Code session
-- Cog pattern for modular features
-- Repository pattern for SQLite data access
+- A framework that lets people use Claude Code from Discord. An OSS library, not one person's bot:
+  no tokens, channel IDs or server-specific logic in this repo.
+- Zero-config for consumers: a new feature must arrive by upgrading the package. New constructor
+  parameters get a backward-compatible default (`= None`); new Cogs are registered in
+  `c_lord/setup.py::setup_bridge()`.
+- Python 3.10+, discord.py v2, features as Cogs, SQLite behind repository classes (aiosqlite).
 
-## Code Standards
+## How it works (so you do not rebuild what was removed)
 
-- Type hints required on ALL function signatures
-- `from __future__ import annotations` in EVERY file
-- ruff for linting/formatting (line-length: 100)
-- **TDD enforced**: Write tests FIRST (RED), implement (GREEN), refactor. No exceptions.
-- pytest with pytest-asyncio (auto mode) for testing
-- Logging via `logging.getLogger(__name__)`, never print()
-- Security audit mandatory before committing changes to runner/Cog code
+- One Discord thread = one Claude Code session = one tmux window. `claude` stays resident in the pane;
+  c-lord types the prompt in (`c_lord/tmux.py`, `c_lord/claude/tmux_runner.py`).
+- Claude's answer reaches Discord by tailing Claude Code's own jsonl transcript
+  (`c_lord/transcript/`, `TranscriptMirrorCog`). That is the only delivery path. Do not scrape the
+  pane for answer text and do not make Claude post its own reply.
+- The runner yields SYSTEM and RESULT events only. Tool activity is read from the jsonl.
+- The REST API (`c_lord/ext/api_server.py`) is the control plane, not a delivery path.
+- Resolve tmux per thread: `resolve_tmux_manager(channel_id, thread_id=...)`. Leaving `thread_id`
+  out silently picks the parent channel's session.
 
-## Security (Non-Negotiable)
+## Code rules
 
-- NEVER use shell=True in subprocess calls
-- ALWAYS use `create_subprocess_exec` with args as list
-- ALWAYS validate user input (session IDs: `^[a-f0-9\-]+$`, skill names: `^[\w-]+$`)
-- ALWAYS use `--` before user prompt in CLI args
-- Strip secrets from subprocess environment (`_STRIPPED_ENV_KEYS`)
-- Use `contextlib.suppress(discord.HTTPException)` for non-critical Discord calls
+- `from __future__ import annotations` in every file; type hints on every function signature.
+- ruff for lint and format, line length 100; imports sorted by ruff, type-only imports under
+  `TYPE_CHECKING`.
+- Log with `logging.getLogger(__name__)`, never `print()`. Prefix with `log_ctx()` whenever a
+  thread / session / task / channel is in scope. A message that was deliberately dropped is still
+  logged at INFO.
+- Wrap Discord calls that may fail harmlessly (reactions, edits) in
+  `contextlib.suppress(discord.HTTPException)`. Never swallow business-logic errors — log them.
+- A CLI failure becomes a `StreamEvent` with `error` set, not an exception.
+- Cogs that run Claude go through `c_lord/cogs/_run_helper.py`; do not copy that logic into a Cog.
 
-## File Layout
+## Security (not negotiable)
 
-- `c_lord/cogs/` — Discord Cogs (use `_run_helper.run_claude_in_thread()`)
-- `c_lord/claude/` — CLI runner, stream parser, types
+- No `shell=True`, ever. Spawn with `create_subprocess_exec` and an argument list.
+- Put `--` before the prompt (and before any user-supplied positional argument).
+- Validate before use: session IDs `^[a-f0-9\-]+$` before `--resume`, skill names `^[\w-]+$`.
+- Secrets stay out of tmux panes: add any new secret env var to `SENSITIVE_ENV_KEYS` in
+  `c_lord/tmux.py`.
+- `dangerously_skip_permissions` is never the default.
+- Every command and button asks the shared `Authorizer`; never a private copy of the rule.
+- Changing `tmux_runner.py`, `_run_helper.py` or any Cog requires the security audit
+  (`.claude/skills/security-audit/SKILL.md`) before committing.
+
+## Tests — TDD is enforced
+
+Write the failing test first (RED), make it pass with the least code (GREEN), then tidy up
+(REFACTOR). pytest with pytest-asyncio in auto mode; tests live in `tests/`. No implementation
+without a test. Green CI is not "done": behaviour changes are also verified on staging (`CLAUDE.md`).
+
+## Where things are
+
+- `c_lord/cogs/` — Discord Cogs; `_run_helper.py` drives one Claude turn
+- `c_lord/claude/` — tmux pane runner, config, value types
+- `c_lord/transcript/` — jsonl transcript mirror (answer delivery)
 - `c_lord/session_dir.py` — Git clone based session directory management
 - `c_lord/tmux.py` — Tmux session management wrapper
-- `c_lord/database/` — SQLite repository
-- `c_lord/discord_ui/` — Status, chunker, embeds
+- `c_lord/database/` — SQLite repositories
+- `c_lord/discord_ui/` — status reactions, reply splitting, embeds, buttons
+- `c_lord/ext/api_server.py` — REST API control plane
 - `tests/` — pytest suite
 
 ## Commands
@@ -44,4 +73,10 @@ Discord frontend for Claude Code CLI. Python 3.10+ with discord.py v2.
 uv run pytest tests/ -v --cov=c_lord
 uv run ruff check c_lord/
 uv run ruff format c_lord/
+uv run pyright c_lord/
 ```
+
+## Git
+
+Branch from `main` (`feature/…`, `fix/…`, `docs/…`); never push to `main` directly. Commits are
+`<type>: <description>` (feat, fix, refactor, docs, test, chore, security). Squash merge.
