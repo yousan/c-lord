@@ -1,30 +1,61 @@
-# <<REDACTED 3 lines>>
+"""The bot's built-in REST API: its control plane, served over HTTP with aiohttp.
+
+Scripts, CI jobs and the Claude sessions themselves use it to make the bot act —
+send or queue a notification, register a recurring task, read and write the AI
+Lounge, open a new session thread, mark a thread to be resumed after a restart,
+post into a thread.
+
+This is an optional extension: it needs aiohttp, which comes with::
+
     pip install c-lord[api]
-# <<REDACTED 6 lines>>
+
+Who can reach it:
+
+- The listening address is ``127.0.0.1`` unless the operator passes another
+  host, so by default nothing outside this machine can connect.
 - Every request must come from the bot's own Unix user (#457), or carry
   ``Authorization: Bearer <api_secret>`` when one is configured
-# <<REDACTED 4 lines>>
+  (``CLORD_API_SECRET``).
+"""
+
+from __future__ import annotations
+
 import hmac
 import io
-# <<REDACTED 2 lines>>
+import logging
+import os
 import sqlite3
 import stat
 import unicodedata
-# <<REDACTED 2 lines>>
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
-# <<REDACTED 3 lines>>
+
+from aiohttp import web
+
 from .. import api_endpoint
 from ..log_sampler import LogSampler
 from ..utils.logger import log_ctx
 from .peer_uid import resolve_peer_uid
 
-# <<REDACTED 12 lines>>
+if TYPE_CHECKING:
+    import discord
+    from discord.ext.commands import Bot
+
+    from ..database.lounge_repo import LoungeRepository
+    from ..database.notification_repo import NotificationRepository
+    from ..database.repository import SessionRepository
+    from ..database.resume_repo import PendingResumeRepository
+    from ..database.task_repo import TaskRepository
+
+logger = logging.getLogger(__name__)
+
 # How many ports from the requested one an ``auto_port`` server tries before it
 # lets the OS pick (#258). Twenty covers a host full of c-lord clones while
 # keeping their ports next to each other, where a person looks for them.
 AUTO_PORT_TRIES = 20
 
-# <<REDACTED 1 lines>>
+
 def _current_uid() -> int | None:
     """Our own UID, or ``None`` where the platform has no such notion."""
     getuid = getattr(os, "getuid", None)
@@ -49,7 +80,8 @@ async def _read_json_object(
     Valid JSON that is not an object (``[1]``, ``"text"``) used to reach
     ``data.get`` and come back as a 500 (#1037).
     """
-    # <<REDACTED 2 lines>>
+    try:
+        data = await request.json()
     except ValueError:
         # ``JSONDecodeError`` and also ``UnicodeDecodeError`` — a body that is
         # not UTF-8 is a ``ValueError`` but not a ``JSONDecodeError`` (#1082).
@@ -274,7 +306,8 @@ def _message_and_title(data: dict[str, Any]) -> tuple[str, str | None, web.Respo
     Anything else reached SQLite or ``discord.Embed`` unchecked — an integer
     past 64 bits, a list or an object was a 500 (found reviewing #1083).
     """
-    # <<REDACTED 2 lines>>
+    message = data.get("message")
+    if not message:
         return "", None, web.json_response({"error": "message is required"}, status=400)
     if not isinstance(message, str):
         return "", None, web.json_response({"error": "message must be a string"}, status=400)
@@ -292,33 +325,98 @@ _PATCHABLE_TASK_FIELDS = ("enabled", "prompt", "interval_seconds", "working_dir"
 _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
 
 
-# <<REDACTED 5 lines>>
+_SCHEDULED_AT_ERROR = "scheduled_at must be ISO 8601 format"
+_STORED_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+_DEFAULT_EMBED_COLOR = 0x00BFFF
+_LOUNGE_FIELDS = ("id", "label", "message", "posted_at")
+_LOUNGE_LIMIT_DEFAULT = "10"
+_LOUNGE_LIMIT_MAX = 50
+
+
+def _error(reason: str, status: int = 400) -> web.Response:
+    """The one shape every refusal of this API has: ``{"error": reason}``."""
+    return web.json_response({"error": reason}, status=status)
+
+
+def _is_present(value: object) -> bool:
+    """Whether a cache lookup found something (``None`` is the only miss)."""
+    return value is not None
+
+
+def _lounge_clock(posted_at: str) -> str:
+    """The ``HH:MM`` of a ``YYYY-MM-DD HH:MM:SS`` stamp; a shorter text as it is."""
+    return posted_at[11:16] if len(posted_at) >= 16 else posted_at
+
+
+def _lounge_row(row: Any) -> dict[str, Any]:
+    """A lounge message as the JSON object both lounge endpoints answer with."""
+    return {field: getattr(row, field) for field in _LOUNGE_FIELDS}
+
+
+class ApiServer:
+    """The HTTP control plane of one bot.
+
+    Building one only wires the aiohttp application (``app``); no socket is
+    opened until :meth:`start`. The repositories and ``session_dir_base`` are
+    plain attributes that may be assigned after construction — handlers read
+    them at request time.
+
+    Example::
+
         from c_lord.database.notification_repo import NotificationRepository
         from c_lord.ext.api_server import ApiServer
-# <<REDACTED 22 lines>>
+
+        api = ApiServer(NotificationRepository("notifications.db"), bot)
+        await api.start()
+        ...
+        await api.stop()
+    """
+
+    def __init__(
+        self,
+        repo: NotificationRepository,
+        bot: Bot,
+        default_channel_id: int | None = None,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        api_secret: str | None = None,
+        task_repo: TaskRepository | None = None,
+        lounge_repo: LoungeRepository | None = None,
+        lounge_channel_id: int | None = None,
+        resume_repo: PendingResumeRepository | None = None,
+        session_repo: SessionRepository | None = None,
         show_url_embeds: bool = False,
         owner_uid: int | None = None,
         allow_any_peer: bool = False,
         auto_port: bool = False,
-    # <<REDACTED 4 lines>>
+    ) -> None:
+        self.repo = repo
+        self.bot = bot
+        self.default_channel_id = default_channel_id
         # #372: when False (default) Discord URL/OGP link previews are
         # suppressed on /api/reply so a link in Claude's answer doesn't expand
         # into a tall preview card. Opt back in with CLORD_SHOW_URL_EMBEDS=true.
         self.show_url_embeds = show_url_embeds
-        # <<REDACTED 2 lines>>
+        self.host = host
+        self.port = port
         # #258: when the port was not chosen by anyone, a taken one is no
         # reason to run without an API — walk to the next free one. A port the
         # operator pinned is never walked past (their curl expects it there).
         self.auto_port = auto_port
-        # <<REDACTED 5 lines>>
+        self.api_secret = api_secret
+        self.task_repo = task_repo
+        self.lounge_repo = lounge_repo
+        self.resume_repo = resume_repo
+        self.session_repo = session_repo
         # Where c-lord clones session dirs; ``/api/reply``'s progress_file may
         # only point under it (#1039). Wired by ``BridgeComponents``.
         self.session_dir_base: str | None = None
-        # <<REDACTED 2 lines>>
+        if lounge_channel_id is None:
             from ..coordination.env import coordination_channel_id_from_env
 
             lounge_channel_id = coordination_channel_id_from_env()  # #1194
-        # <<REDACTED 2 lines>>
+        self.lounge_channel_id = lounge_channel_id
+
         # #457: the UID this bot runs as. Only that user (and root, which can
         # read the bot's .env anyway) may drive the control plane. Resolved at
         # construction so a test can move it instead of becoming another user.
@@ -326,10 +424,32 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         self.allow_any_peer = allow_any_peer
         self._denial_log = LogSampler()
 
-        # <<REDACTED 1 lines>>
+        self.app = web.Application()
         # Unconditional: without a secret this used to be no middleware at all,
         # which is how every user on the host reached /api/spawn (#457).
-        # <<REDACTED 20 lines>>
+        self.app.middlewares.append(self._auth_middleware)
+        self._setup_routes()
+        self._runner: web.AppRunner | None = None
+
+    def _setup_routes(self) -> None:
+        """Attach every endpoint to ``app``. ``add_get`` also answers HEAD."""
+        router = self.app.router
+        router.add_get("/api/health", self.health)
+        # Notifications: one now, or one queued for later
+        router.add_post("/api/notify", self.notify)
+        router.add_post("/api/schedule", self.schedule)
+        router.add_get("/api/scheduled", self.list_scheduled)
+        router.add_delete("/api/scheduled/{id}", self.cancel_scheduled)
+        # Recurring tasks run by SchedulerCog
+        router.add_post("/api/tasks", self.create_task)
+        router.add_get("/api/tasks", self.list_tasks)
+        router.add_delete("/api/tasks/{id}", self.delete_task)
+        router.add_patch("/api/tasks/{id}", self.patch_task)
+        # AI Lounge
+        router.add_get("/api/lounge", self.get_lounge)
+        router.add_post("/api/lounge", self.post_lounge)
+        # A new session thread without a human message
+        router.add_post("/api/spawn", self.spawn)
         # Thread message route (CLI input forwarding)
         self.app.router.add_post("/api/threads/{thread_id}/messages", self.post_thread_message)
         # #955: staging's release puts its verification windows to sleep
@@ -338,17 +458,26 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         self.app.router.add_post("/api/reply", self.reply)
         # Issue #63: Skill-based interactive choice prompt
         self.app.router.add_post("/api/prompt-choice", self.prompt_choice)
-        # <<REDACTED 9 lines>>
+        # Resume this thread once the bot is back from a restart
+        self.app.router.add_post("/api/mark-resume", self.mark_resume)
+
+    @web.middleware
+    async def _auth_middleware(
+        self,
+        request: web.Request,
+        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    ) -> web.StreamResponse:
         """Refuse anything that is neither our own Unix user nor holding the secret."""
         denial = self._authorize(request)
         if denial is not None:
             return denial
-        # <<REDACTED 2 lines>>
+        return await handler(request)
+
     def _authorize(self, request: web.Request) -> web.Response | None:
         """``None`` to let the request through, otherwise the refusal to send.
 
         Two independent ways in, because they answer different questions:
-# <<REDACTED 1 lines>>
+
         * **Same UID** — the caller already *is* the bot's user, so it can read
           ``.env``, the session dirs and the secret itself. Demanding a header
           from it would protect nothing and would break the control plane
@@ -360,11 +489,12 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         ``/api/health`` is gated too. It used to answer 200 unconditionally,
         which turned a port scan into an inventory of every c-lord on the host.
         """
-        # <<REDACTED 1 lines>>
+        auth_header = request.headers.get("Authorization", "")
         if self.api_secret and auth_header.startswith("Bearer "):
             if self._token_matches(auth_header[7:]):
                 return None
-            # <<REDACTED 2 lines>>
+            return _error("Invalid token", 401)
+
         uid = self._peer_uid(request)
         # root is not a distinct trust level here: it can read the bot's .env,
         # ptrace the process, or just become the bot's user.
@@ -412,17 +542,21 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
             transport.get_extra_info("peername"),
             transport.get_extra_info("sockname"),
         )
-# <<REDACTED 5 lines>>
+
+    async def start(self) -> None:
+        """Begin listening. A port that cannot be bound raises, with nothing left running."""
+        self._runner = web.AppRunner(self.app)
+        await self._runner.setup()
         try:
             self.port = await self._bind()
         except (OSError, OverflowError):  # OverflowError: a port past 65535 (#1237)
-            # <<REDACTED 1 lines>>
+            await self._runner.cleanup()
             self._runner = None
             raise
         # #258: Claude in each session is told this address — the port that was
         # actually bound, which after a walk is not the one asked for.
         api_endpoint.advertise(self.host, self.port)
-        # <<REDACTED 1 lines>>
+        logger.info("REST API started: http://%s:%d", self.host, self.port)
         # #457: who may drive the control plane is never left implicit — an
         # opened gate says so at every start, not only in the docs.
         log = (
@@ -450,7 +584,7 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         # clear-text-logging heuristic (py/clear-text-logging-sensitive-data).
         note = "or holding CLORD_API_SECRET" if self.api_secret else "no secret configured"
         return f"serving uid={self.owner_uid} only, {note}"
-# <<REDACTED 1 lines>>
+
     async def _bind(self) -> int:
         """Listen on ``self.port`` — or, for ``auto_port``, the next free one (#258).
 
@@ -486,7 +620,7 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         assert error is not None
         raise error
 
-    # <<REDACTED 1 lines>>
+    async def stop(self) -> None:
         """Stop the API server. Safe to call more than once, even concurrently (#877)."""
         api_endpoint.clear()
         # Taken before the await: ``AppRunner.cleanup()`` yields between checking
@@ -495,49 +629,140 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         runner, self._runner = self._runner, None
         if runner:
             await runner.cleanup()
-# <<REDACTED 12 lines>>
+
+    # ------------------------------------------------------------------
+    # Liveness
+    # ------------------------------------------------------------------
+
+    async def health(self, request: web.Request) -> web.Response:
+        """GET /api/health — ``{"status": "ok", "timestamp": <local time, ISO 8601>}``."""
+        return web.json_response({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+    # ------------------------------------------------------------------
+    # Notifications (/api/notify, /api/schedule, /api/scheduled)
+    # ------------------------------------------------------------------
+
+    async def notify(self, request: web.Request) -> web.Response:
+        """POST /api/notify — send one embed right away.
+
+        Body (JSON): ``message`` (required), ``title``, ``channel_id`` (falls
+        back to the default channel), ``color``.
+
+        Returns (200): ``{"status": "sent"}``
+        """
         data, err = await _read_json_object(request)
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         message, title, err = _message_and_title(data)
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         explicit_channel, color, err = _optional_channel_and_color(data)
         if err is not None:
             return err
         channel_id = explicit_channel or self.default_channel_id
-        # <<REDACTED 13 lines>>
+        if not channel_id:
+            return _error("No channel specified")
+        channel, failure = await self._lookup_channel(channel_id, trust_cached=bool)
+        if failure is not None:
+            return _error(str(failure), 500)
+        if not hasattr(channel, "send"):
+            return _error("Channel is not messageable")
+
         embed = self._build_embed(message=message, title=title, color=color)
-        # <<REDACTED 6 lines>>
+        await channel.send(embed=embed)
+        return web.json_response({"status": "sent"})
+
+    async def schedule(self, request: web.Request) -> web.Response:
+        """POST /api/schedule — queue a notification for a later time.
+
+        Body (JSON): ``message`` and ``scheduled_at`` (ISO 8601) are required;
+        ``title``, ``channel_id`` and ``color`` are optional. Nothing is sent
+        here — the row waits in the database for the scheduler.
+
+        Returns (200): ``{"status": "scheduled", "id": <row id>}``
+        """
         data, err = await _read_json_object(request)
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         message, title, err = _message_and_title(data)
         if err is not None:
             return err
-        # <<REDACTED 3 lines>>
+
+        scheduled_at = data.get("scheduled_at")
+        if not scheduled_at:
+            return _error("scheduled_at is required")
         if not isinstance(scheduled_at, str):
             # ``fromisoformat`` raised TypeError on a number or ``true`` — a 500 (#1083).
-            # <<REDACTED 4 lines>>
+            return _error(_SCHEDULED_AT_ERROR)
+
         channel_id, color, err = _optional_channel_and_color(data)
         if err is not None:
             return err
-# <<REDACTED 13 lines>>
+
+        try:
+            when = datetime.fromisoformat(scheduled_at)
+        except ValueError:
+            return _error(_SCHEDULED_AT_ERROR)
+
+        # Stored to the second, as written: an offset is dropped, not converted.
+        notification_id = await self.repo.create(
+            message=message,
+            scheduled_at=when.strftime(_STORED_TIME_FORMAT),
             title=title,
             color=0x00BFFF if color is None else color,
-            # <<REDACTED 1 lines>>
+            source="api",
             channel_id=channel_id,
-        # <<REDACTED 11 lines>>
+        )
+        return web.json_response({"status": "scheduled", "id": notification_id})
+
+    async def list_scheduled(self, request: web.Request) -> web.Response:
+        """GET /api/scheduled — the notifications still waiting to be sent."""
+        return web.json_response({"notifications": await self.repo.get_pending()})
+
+    async def cancel_scheduled(self, request: web.Request) -> web.Response:
+        """DELETE /api/scheduled/{id} — withdraw a notification that has not gone out."""
         notification_id = _as_int(request.match_info.get("id"))
         if notification_id is None:
-            # <<REDACTED 36 lines>>
+            return _error("Invalid ID")
+        if not await self.repo.cancel(notification_id):
+            return _error("Not found or already processed", 404)
+        return web.json_response({"status": "cancelled"})
+
+    # ------------------------------------------------------------------
+    # Recurring tasks (/api/tasks) — executed by SchedulerCog
+    # ------------------------------------------------------------------
+
+    def _require_task_repo(self) -> web.Response | None:
+        """The 503 for a bot without a task store, or ``None`` when there is one."""
+        if self.task_repo is None:
+            return _error("SchedulerCog not configured (task_repo is None)", 503)
+        return None
+
+    async def create_task(self, request: web.Request) -> web.Response:
+        """POST /api/tasks — register a prompt to run every ``interval_seconds``.
+
+        Body (JSON): ``name``, ``prompt``, ``interval_seconds`` and
+        ``channel_id`` are required; ``working_dir`` and ``run_immediately``
+        (default true) are optional.
+
+        Returns (201): ``{"status": "created", "id": <task id>}``; 409 when the
+        name is taken.
+        """
+        unavailable = self._require_task_repo()
+        if unavailable is not None:
+            return unavailable
+
         data, err = await _read_json_object(request)
         if err is not None:
             return err
-# <<REDACTED 4 lines>>
+
+        for field in ("name", "prompt", "interval_seconds", "channel_id"):
+            if not data.get(field):
+                return _error(f"{field} is required")
+
         for field in ("name", "prompt"):
             # #1208: ``["x"]`` was saved through ``str()`` as the prompt ``['x']``.
             text, err = _text(data, field)
@@ -546,15 +771,15 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
             if _is_blank(text):
                 # #1238: ``"   "`` was saved and woke Claude with no instruction
                 # on every run; /api/spawn already strips before this check.
-                # <<REDACTED 1 lines>>
+                return _error(f"{field} is required")
         run_immediately = data.get("run_immediately", True)
         if not isinstance(run_immediately, bool):
             return _not_a_boolean("run_immediately")
-# <<REDACTED 1 lines>>
+
         working_dir, err = _text(data, "working_dir")
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         numbers: dict[str, int] = {}
         for field in ("interval_seconds", "channel_id"):
             number = _task_int(data[field])
@@ -567,30 +792,66 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
             # #1064: PATCH refuses it too — one rule for both.
             return web.json_response({"error": _INTERVAL_ERROR}, status=400)
 
-        # <<REDACTED 4 lines>>
+        try:
+            task_id = await self.task_repo.create(  # type: ignore[union-attr]
+                name=data["name"],
+                prompt=data["prompt"],
                 interval_seconds=numbers["interval_seconds"],
                 channel_id=numbers["channel_id"],
                 working_dir=working_dir,
                 run_immediately=run_immediately,
-            # <<REDACTED 1 lines>>
+            )
         except sqlite3.IntegrityError as exc:
             # The UNIQUE constraint on name.
-            # <<REDACTED 17 lines>>
+            logger.warning("Failed to create task: %s", exc)
+            return _error("Task name already exists", 409)
+        logger.info("Task registered via API: id=%s, name=%s", task_id, data["name"])
+        return web.json_response({"status": "created", "id": task_id}, status=201)
+
+    async def list_tasks(self, request: web.Request) -> web.Response:
+        """GET /api/tasks — every registered task, enabled or not."""
+        unavailable = self._require_task_repo()
+        if unavailable is not None:
+            return unavailable
+        tasks = await self.task_repo.get_all()  # type: ignore[union-attr]
+        return web.json_response({"tasks": tasks})
+
+    async def delete_task(self, request: web.Request) -> web.Response:
+        """DELETE /api/tasks/{id} — remove a task for good."""
+        unavailable = self._require_task_repo()
+        if unavailable is not None:
+            return unavailable
+
         task_id = _as_int(request.match_info.get("id"))
         if task_id is None:
-            # <<REDACTED 11 lines>>
+            return _error("Invalid ID")
+        if not await self.task_repo.delete(task_id):  # type: ignore[union-attr]
+            return _error("Task not found", 404)
+        return web.json_response({"status": "deleted"})
+
+    async def patch_task(self, request: web.Request) -> web.Response:
+        """PATCH /api/tasks/{id} — change ``enabled``, ``prompt``, ``interval_seconds``
+        and / or ``working_dir``. Either every given value is applied or none is.
+
+        Returns (200): ``{"status": "updated"}``
+        """
+        unavailable = self._require_task_repo()
+        if unavailable is not None:
+            return unavailable
+
         task_id = _as_int(request.match_info.get("id"))
         if task_id is None:
-            # <<REDACTED 2 lines>>
+            return _error("Invalid ID")
+
         data, err = await _read_json_object(request)
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         # Check every value before writing any: a 400 used to arrive after
         # ``enabled`` had already been saved (#1064).
         if "enabled" in data and not isinstance(data["enabled"], bool):
             return _not_a_boolean("enabled")
-        # <<REDACTED 1 lines>>
+        patch_kwargs: dict[str, Any] = {}
         if data.get("prompt") is not None:
             prompt, err = _text(data, "prompt")  # #1208: no more str(["x"]) -> "['x']"
             if err is not None:
@@ -599,9 +860,9 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
                 # #1229: POST refuses an empty prompt; PATCH saved it with a 200,
                 # and every run after that woke Claude with no instruction.
                 # #1238: whitespace only is empty too, as for POST and /api/spawn.
-                # <<REDACTED 1 lines>>
+                return _error("prompt is required")
             patch_kwargs["prompt"] = prompt
-        # <<REDACTED 1 lines>>
+        if "interval_seconds" in data:
             interval = _task_int(data["interval_seconds"])
             if interval is None or interval < 1:
                 # #1064: 0 / negative / false were saved with a 200.
@@ -613,75 +874,236 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
             if not isinstance(data["working_dir"], str):
                 return web.json_response({"error": "working_dir must be a string"}, status=400)
             patch_kwargs["working_dir"] = data["working_dir"]
-# <<REDACTED 1 lines>>
+
         if await self.task_repo.get(task_id) is None:  # type: ignore[union-attr]
-            # <<REDACTED 1 lines>>
+            return _error("Task not found", 404)
         if "enabled" not in data and not patch_kwargs:
             # #1066: "nothing to update" is not "no such task" — a caller told 404
             # for a typo (``enable``) went off to re-create a task that exists.
-            # <<REDACTED 2 lines>>
+            return web.json_response(
+                {
                     "error": "No field to update. Accepted fields: "
                     + ", ".join(_PATCHABLE_TASK_FIELDS)
                 },
                 status=400,
             )
-# <<REDACTED 1 lines>>
+
         if "enabled" in data:
             await self.task_repo.set_enabled(task_id, enabled=data["enabled"])  # type: ignore[union-attr]
         if patch_kwargs:
             await self.task_repo.update(task_id, **patch_kwargs)  # type: ignore[union-attr]
-        # <<REDACTED 58 lines>>
+        return web.json_response({"status": "updated"})
+
+    # ------------------------------------------------------------------
+    # AI Lounge (/api/lounge)
+    # ------------------------------------------------------------------
+
+    def _require_lounge_repo(self) -> web.Response | None:
+        """The 503 for a bot without a lounge store, or ``None`` when there is one."""
+        if self.lounge_repo is None:
+            return _error("AI Lounge not configured (lounge_repo is None)", 503)
+        return None
+
+    async def get_lounge(self, request: web.Request) -> web.Response:
+        """GET /api/lounge?limit=N — the latest lounge messages (N: 1 to 50, default 10).
+
+        Returns (200): ``{"messages": [{"id", "label", "message", "posted_at"}, ...]}``
+        """
+        unavailable = self._require_lounge_repo()
+        if unavailable is not None:
+            return unavailable
+        try:
+            asked = int(request.query.get("limit", _LOUNGE_LIMIT_DEFAULT))
+        except ValueError:
+            return _error("limit must be an integer")
+        limit = min(max(asked, 1), _LOUNGE_LIMIT_MAX)
+        rows = await self.lounge_repo.get_recent(limit=limit)  # type: ignore[union-attr]
+        return web.json_response({"messages": [_lounge_row(row) for row in rows]})
+
+    async def post_lounge(self, request: web.Request) -> web.Response:
+        """POST /api/lounge — leave a message in the lounge.
+
+        Body (JSON): ``message`` (required), ``label`` (who is speaking;
+        ``"AI"`` when left out). The saved message is also shown in the lounge's
+        Discord channel when one is configured.
+
+        Returns (201): ``{"status": "posted"}`` plus the saved message's fields.
+        """
+        unavailable = self._require_lounge_repo()
+        if unavailable is not None:
+            return unavailable
+
         data, err = await _read_json_object(request)
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         raw_message, err = _text(data, "message")
         if err is not None:
             return err
         message = (raw_message or "").strip()
         # #1288: invisible-only text was posted to the lounge — the #1258 test.
         if _is_blank(message):
-            # <<REDACTED 2 lines>>
+            return _error("message is required")
+
         raw_label, err = _text(data, "label")  # #1208
         if err is not None:
             return err
         label = (raw_label or "").strip() or "AI"
-# <<REDACTED 33 lines>>
+
+        saved = await self.lounge_repo.post(message=message, label=label)  # type: ignore[union-attr]
+        if self.lounge_channel_id:
+            await self._send_lounge_to_discord(saved.label, saved.message, saved.posted_at)
+        return web.json_response({"status": "posted", **_lounge_row(saved)}, status=201)
+
+    async def _send_lounge_to_discord(self, label: str, message: str, posted_at: str) -> None:
+        """Show a saved lounge message in the lounge channel. Never raises.
+
+        The message is already stored when this runs, so a Discord failure is
+        logged and the caller still answers 201.
+        """
+        try:
+            line = f"**[{label}]** {message} *({_lounge_clock(posted_at)})*"
+            channel, failure = await self._lookup_channel(
+                self.lounge_channel_id  # type: ignore[arg-type]
+            )
+            if failure is not None:
+                raise failure
+            if hasattr(channel, "send"):
+                await channel.send(line)
+        except Exception:
+            logger.warning("Failed to forward lounge message to Discord", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Session spawn (/api/spawn)
+    # ------------------------------------------------------------------
+
+    async def spawn(self, request: web.Request) -> web.Response:
+        """POST /api/spawn — open a new thread and start a Claude session in it.
+
+        Body (JSON):
+            prompt: What Claude is asked to do (required).
+            channel_id: The text channel to open the thread in (optional;
+                the default channel when left out).
             thread_name: Custom thread title (optional; defaults to a
                 readable topic derived from *prompt* — #721: one line, no
                 markdown or URLs, ``…`` when it had to be cut short).
-# <<REDACTED 4 lines>>
+
+        Returns (201):
+            ``{"status": "spawned", "thread_id": "<id as text>", "thread_name": "..."}``
+        """
         data, err = await _read_json_object(request)
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         raw_prompt, err = _text(data, "prompt")
         if err is not None:
             return err
         prompt = (raw_prompt or "").strip()
         if _is_blank(prompt):
-            # <<REDACTED 6 lines>>
+            return _error("prompt is required")
+
+        raw_channel_id = data.get("channel_id") or self.default_channel_id
+        if not raw_channel_id:
+            return _error("No channel specified")
         channel_id = _as_int(raw_channel_id)
         if channel_id is None:
-            # <<REDACTED 2 lines>>
+            return _error("channel_id must be an integer")
+
         raw_thread_name, err = _text(data, "thread_name")  # #1183 (review)
         if err is not None:
             return err
-# <<REDACTED 26 lines>>
+
+        # Asked before any Discord call: without the cog nothing can be started.
+        cog: Any = self.bot.cogs.get("ClaudeChatCog")
+        if cog is None:
+            return _error("ClaudeChatCog is not loaded", 503)
+
+        channel, failure = await self._lookup_channel(channel_id)
+        if failure is not None:
+            return _error(str(failure), 500)
+
+        import discord
+
+        if not isinstance(channel, discord.TextChannel):
+            return _error("Channel must be a text channel that supports threads")
+
         thread_name: str | None = raw_thread_name or None
-# <<REDACTED 51 lines>>
+        try:
+            thread = await cog.spawn_session(channel, prompt, thread_name=thread_name)
+        except Exception as exc:
+            logger.exception("spawn_session failed: %s", exc)
+            return _error(str(exc), 500)
+
+        logger.info("Spawned new Claude session in thread %s (%s)", thread.id, thread.name)
+        return web.json_response(
+            {"status": "spawned", "thread_id": str(thread.id), "thread_name": thread.name},
+            status=201,
+        )
+
+    # ------------------------------------------------------------------
+    # Resume after restart (/api/mark-resume)
+    # ------------------------------------------------------------------
+
+    def _require_resume_repo(self) -> web.Response | None:
+        """The 503 for a bot without a resume store, or ``None`` when there is one."""
+        if self.resume_repo is None:
+            return _error("PendingResumeRepository not configured (resume_repo is None)", 503)
+        return None
+
+    async def _recorded_session_id(self, thread_id: int) -> str | None:
+        """The session id on record for this thread, if the bot knows one.
+
+        Best effort: without a session store, without a record, or when the
+        lookup fails (logged), the answer is ``None`` and the caller goes on.
+        """
+        if self.session_repo is None:
+            return None
+        try:
+            record = await self.session_repo.get(thread_id)
+            if record is None:
+                return None
+            found = record.session_id
+            logger.debug("mark-resume: auto-resolved session_id=%s for thread %s", found, thread_id)
+            return found
+        except Exception:
+            logger.warning(
+                "mark-resume: failed to auto-resolve session_id for thread %s",
+                thread_id,
+                exc_info=True,
+            )
+            return None
+
+    async def mark_resume(self, request: web.Request) -> web.Response:
+        """POST /api/mark-resume — have this thread picked up again after the bot restarts.
+
+        Body (JSON):
+            thread_id: The thread to resume (required).
+            session_id: The Claude session to continue (optional; looked up
+                from the thread's session record when left out).
+            reason: Why the restart happens (optional; ``"self_restart"``).
+            resume_prompt: What to tell Claude on resume (optional).
+
+        Returns (201): ``{"status": "marked", "id": <row id>}``
+        """
+        unavailable = self._require_resume_repo()
+        if unavailable is not None:
+            return unavailable
+
         data, err = await _read_json_object(request)
         if err is not None:
             return err
-# <<REDACTED 1 lines>>
+
         _, err = _text(data, "reason")  # #1208: ``str()`` saved ["x"] as "['x']"
         if err is not None:
             return err
 
-        # <<REDACTED 4 lines>>
+        raw_thread_id = data.get("thread_id")
+        if not raw_thread_id:
+            return _error("thread_id is required")
         thread_id = _as_int(raw_thread_id)
         if thread_id is None:
-            # <<REDACTED 2 lines>>
+            return _error("thread_id must be an integer")
+
         raw_session_id, err = _text(data, "session_id")
         if err is not None:
             return err
@@ -689,9 +1111,20 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         if err is not None:
             return err
         session_id: str | None = raw_session_id or None
-        # <<REDACTED 1 lines>>
+        reason = data.get("reason") or "self_restart"
         resume_prompt: str | None = raw_resume_prompt or None
-# <<REDACTED 33 lines>>
+
+        if session_id is None:
+            session_id = await self._recorded_session_id(thread_id)
+
+        row_id = await self.resume_repo.mark(  # type: ignore[union-attr]
+            thread_id, session_id=session_id, reason=reason, resume_prompt=resume_prompt
+        )
+        logger.info(
+            "Thread %s marked for resume (reason=%s, session_id=%s)", thread_id, reason, session_id
+        )
+        return web.json_response({"status": "marked", "id": row_id}, status=201)
+
     # ------------------------------------------------------------------
     # Thread sleep endpoint (/api/threads/{thread_id}/sleep) — #955
     # ------------------------------------------------------------------
@@ -716,7 +1149,8 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         """
         thread_id = _as_int(request.match_info.get("thread_id"))
         if thread_id is None:
-            # <<REDACTED 2 lines>>
+            return _error("thread_id must be an integer")
+
         from ..workspace_notice import WorkspaceReason
 
         cog = self.bot.cogs.get("SessionManageCog")
@@ -728,7 +1162,7 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         if channel is None:
             try:
                 channel = await self.bot.fetch_channel(thread_id)
-            # <<REDACTED 1 lines>>
+            except Exception as exc:
                 logger.info(
                     "%s sleep: thread is not reachable (%s)", log_ctx(thread_id=thread_id), exc
                 )
@@ -741,9 +1175,10 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
             slept = await impl(
                 channel=channel, reason=WorkspaceReason.MANUAL, unkillable_is_absent=True
             )
-        # <<REDACTED 1 lines>>
+        except Exception as exc:
             logger.exception("%s sleep: failed", log_ctx(thread_id=thread_id))
-            # <<REDACTED 2 lines>>
+            return _error(str(exc), 500)
+
         # #1214: three answers, not two. ``False`` is "could not close it, the
         # window may still be there" (#1192); folding it into ``not_resident``
         # told ``staging.sh release`` the bot had no window, so nobody noticed it.
@@ -841,10 +1276,11 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
 
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:
-            # <<REDACTED 1 lines>>
+            return _error("thread_id is required")
         thread_id = _as_int(thread_id_raw)
         if thread_id is None:
-            # <<REDACTED 2 lines>>
+            return _error("thread_id must be an integer")
+
         raw_content, err = _text(data, "content")
         if err is not None:
             return err
@@ -878,7 +1314,7 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
                     self.session_dir_base or "unknown",
                 )
             elif isinstance(opened, str):
-                # <<REDACTED 1 lines>>
+                return web.json_response(
                     {"error": f"progress_file not found: {progress_file}"},
                     status=400,
                 )
@@ -950,7 +1386,7 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
 
         reference = None
         if reply_to_trigger_enabled() and self.session_repo is not None:
-            # <<REDACTED 1 lines>>
+            record = await self.session_repo.get(thread_id)
             trigger_id = getattr(record, "trigger_message_id", None) if record else None
             if trigger_id is not None:
                 reference = discord.MessageReference(
@@ -986,7 +1422,8 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
 
         if progress_ignored:
             return web.json_response({"status": "sent", "progress_file": "ignored"})
-        # <<REDACTED 2 lines>>
+        return web.json_response({"status": "sent"})
+
     async def prompt_choice(self, request: web.Request) -> web.Response:
         """POST /api/prompt-choice — Skill-based interactive choice (#63).
 
@@ -1010,10 +1447,11 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
 
         thread_id_raw = data.get("thread_id")
         if thread_id_raw is None:
-            # <<REDACTED 1 lines>>
+            return _error("thread_id is required")
         thread_id = _as_int(thread_id_raw)
         if thread_id is None:
-            # <<REDACTED 2 lines>>
+            return _error("thread_id must be an integer")
+
         raw_question, err = _text(data, "question")
         if err is not None:
             return err
@@ -1034,7 +1472,7 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
             raw_label, raw_desc = ch.get("label"), ch.get("description")
             for key, value in (("label", raw_label), ("description", raw_desc)):
                 if value is not None and not isinstance(value, str):
-                    # <<REDACTED 1 lines>>
+                    return web.json_response(
                         {"error": f"choices[{i}].{key} must be a string"}, status=400
                     )
             label = (raw_label or "").strip()
@@ -1066,7 +1504,48 @@ _INTERVAL_ERROR = "interval_seconds must be an integer of 1 or more"
         content = "\n".join(lines)
 
         await raw.send(content=content)  # type: ignore[union-attr]
-        # <<REDACTED 29 lines>>
+        return web.json_response({"status": "sent"})
+
+    # ------------------------------------------------------------------
+    # Shared by the handlers above
+    # ------------------------------------------------------------------
+
+    async def _lookup_channel(
+        self,
+        channel_id: int,
+        *,
+        trust_cached: Callable[[Any], bool] = _is_present,
+    ) -> tuple[Any, Exception | None]:
+        """The channel with this id — from the cache, else asked of Discord.
+
+        ``trust_cached`` decides whether what the cache gave is an answer:
+        by default anything but ``None`` is; ``/api/notify`` passes ``bool``
+        and asks Discord for anything falsy.
+
+        Returns ``(channel, None)``, or ``(None, error)`` when Discord refused;
+        what to answer for that differs per endpoint.
+        """
+        cached = self.bot.get_channel(channel_id)
+        if trust_cached(cached):
+            return cached, None
+        try:
+            return await self.bot.fetch_channel(channel_id), None
+        except Exception as exc:
+            return None, exc
+
+    @staticmethod
+    def _build_embed(
+        message: str, title: str | None = None, color: int | None = None
+    ) -> discord.Embed:
+        """The embed a notification is sent as; no title or no (or zero) colour gets a default."""
+        import discord
+
+        return discord.Embed(
+            title=title or "Notification",
+            description=message,
+            color=color or _DEFAULT_EMBED_COLOR,
+            timestamp=datetime.now(),
+        )
 
 
 def _bound_port(site: web.TCPSite) -> int | None:
