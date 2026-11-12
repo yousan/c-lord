@@ -29,6 +29,18 @@ def _make_message() -> MagicMock:
     return msg
 
 
+async def _until(condition, *, timeout: float = 10.0) -> None:
+    """Wait for ``condition()`` — bounded, so a slow runner waits longer, not fails.
+
+    The stall monitor ticks every 2 s; a fixed sleep just past one tick leaves
+    no margin on a loaded CI machine. Returns at the timeout too: the caller's
+    own assert then reports what the lamp actually was.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+
+
 class TestHardStall:
     """#473: a 30s stall paints ⚠️ on the trigger message — and posts nothing.
 
@@ -68,14 +80,14 @@ class TestHardStall:
         await sm.set_running()
         loop = asyncio.get_running_loop()
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
 
         sm._reset_stall_timer()  # activity → the monitor takes ⚠️ back to 🟢
-        await asyncio.sleep(2.2)
+        await _until(lambda: sm._current_emoji == EMOJI_RUNNING)
         assert sm._current_emoji == EMOJI_RUNNING
         sm._last_activity = loop.time() - STALL_HARD_SECONDS - 1
-        await asyncio.sleep(2.5)
+        await _until(lambda: sm._current_emoji == EMOJI_STALL_HARD)
         assert sm._current_emoji == EMOJI_STALL_HARD
         await sm.cleanup()
 

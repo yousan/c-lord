@@ -205,13 +205,12 @@ class EventProcessor:
             await self._config.runner.interrupt()
 
     async def _on_complete(self, event: StreamEvent) -> None:
-        """Handle RESULT events — update status, save session_id.
+        """Handle RESULT events — the turn is over.
 
-        Final response text used to flow through this method into Discord
-        via chunk_message + thread.send. Since #53 Claude posts its own
-        final answer via the ``discord-reply`` skill (REST API), so we no
-        longer post ``event.text`` here. Only the side-effects c-lord still
-        owns are kept: error embed, status reaction, session_id persistence.
+        Sets the lamp (🟡 / ❌), posts the error embed when the turn failed and
+        records why on ``RunConfig.outcome``, removes the session-start embed,
+        and saves the session id. Claude's answer is not posted here: the
+        transcript mirror delivers it from the jsonl (#712).
         """
         from ._run_helper import _make_error_embed
 

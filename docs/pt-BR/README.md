@@ -115,9 +115,7 @@ Se o bot reiniciar no meio de uma sessão, as sessões do Claude interrompidas s
 ### Chat Interativo
 - **Thread = Session** — Mapeamento 1:1 entre thread do Discord e sessão do Claude Code
 - **Status em tempo real** — Reação emoji na sua mensagem: 🟢 em execução enquanto Claude trabalha, 🟡 aguardando quando é a sua vez (❌ em erro, ⚠️ se travar). As reações continuam ágeis sob uso intenso; a lâmpada no nome da thread é a visão lateral mais lenta e eventualmente consistente (#246)
-- **Texto em streaming** — Texto intermediário do assistente aparece enquanto o Claude trabalha
-- **Embeds de resultados de ferramentas** — Resultados ao vivo com tempo decorrido aumentando a cada 10s
-- **Pensamento estendido** — Raciocínio exibido como embeds com spoiler (clique para revelar)
+- **Atividade das ferramentas** — Sem mensagem por ferramenta: é lida do transcript do próprio Claude Code. Um turno que fica em silêncio mostra uma linha de progresso (`⚙️ 作業中 5:56 · 🔧 Bash(…) · ツール 61 件`), e as chamadas de ferramentas e frases de progresso do turno são anexadas à resposta como `progress.txt` (#723)
 - **Persistência de sessão** — Retoma conversas entre mensagens via `--resume`
 - **Execução de skills** — Comando `/skill` com autocomplete, argumentos opcionais, retomada dentro da thread
 - **Hot reload** — Novos skills adicionados a `~/.claude/skills/` são detectados automaticamente (atualização a cada 60s, sem reinício)
@@ -126,14 +124,11 @@ Se o bot reiniciar no meio de uma sessão, as sessões do Claude interrompidas s
 - **Suporte a anexos** — Arquivos de texto adicionados automaticamente ao prompt (até 5 × 50 KB); imagens baixadas e passadas via `--image` (até 4 × 5 MB)
 - **Notificações de timeout** — Embed com tempo decorrido e guia de retomada ao atingir timeout
 - **Perguntas interativas** — `AskUserQuestion` renderiza como Botões do Discord ou Menu de Seleção; a sessão retoma com sua resposta; botões sobrevivem a reinícios do bot
-- **Plan Mode** — Quando Claude chama `ExitPlanMode`, um embed do Discord exibe o plano completo com botões Aprovar/Cancelar; Claude prossegue somente após aprovação; cancelamento automático após 5 minutos
-- **Solicitações de permissão de ferramenta** — Quando Claude precisa de permissão para executar uma ferramenta, o Discord exibe botões Permitir/Negar com o nome e a entrada da ferramenta; negação automática após 2 minutos
-- **MCP Elicitation** — Servidores MCP podem solicitar entrada do usuário via Discord (modo formulário: até 5 campos Modal do esquema JSON; modo URL: botão URL + confirmação); timeout de 5 minutos
-- **Progresso em tempo real do TodoWrite** — Quando Claude chama `TodoWrite`, um único embed do Discord é postado e editado in-place a cada atualização; mostra ✅ concluído, 🔄 ativo (com rótulo `activeForm`), ⬜ pendente
+- **Plan Mode** — Quando Claude chama `ExitPlanMode`, o menu de aprovação que o Claude Code mostra é levado ao Discord da mesma forma que `AskUserQuestion`: as opções aparecem como botões, e Claude prossegue com a que você escolher (#251)
+- **Solicitações de permissão de ferramenta** — Não aparecem no Discord: o c-lord aceita o prompt de permissão do Claude Code no painel para o turno continuar. O que Claude pode fazer é decidido pelo modo de permissão / configurações da sessão, não por um botão por ferramenta
 - **Painel de threads** — Embed fixado ao vivo mostrando quais threads estão ativas vs. aguardando; owner é @mencionado quando input é necessário
-- **Uso de tokens** — Taxa de acerto de cache e contagem de tokens exibidos no embed de sessão completa
-- **Uso de contexto** — Percentual da janela de contexto (tokens de entrada + cache, excluindo saída) e capacidade restante até o auto-compact exibidos no embed de sessão concluída; ⚠️ aviso quando acima de 83,5%
-- **Detecção de compactação** — Notifica na thread quando a compactação de contexto ocorre (tipo de gatilho + contagem de tokens antes da compactação)
+- **Uso de contexto** — Cada turno termina com uma linha de rodapé (`📊 7% context (69k/1.0M) · …`): percentual da janela de contexto (tokens de entrada + cache, excluindo saída), modelo, versões e custo; vira um aviso ⚠️ acima de 83,5% (o auto-compact pode rodar no próximo turno)
+- **Aviso de compactação** — Quando o contexto é compactado, a thread recebe uma linha `🗜️ コンテキストを圧縮しました` (#628)
 - **Interrupção de sessão** — Enviar uma nova mensagem a uma thread ativa envia SIGINT à sessão em execução e reinicia com a nova instrução; sem necessidade de `/stop` manual
 - **Notificação de travamento** — Mensagem na thread após 30 s sem atividade (pensamento estendido ou compressão de contexto); reinicia automaticamente quando Claude retoma
 
