@@ -1,48 +1,68 @@
-.PHONY: setup check-setup format check test ci tmux
+# c-lord — developer shortcuts.
+#
+# Everything here is a thin name for a command you could type yourself; the
+# source of truth for what "passing" means is .github/workflows/ci.yml, and
+# `make ci` runs the same four checks in the same order.
+#
+#   make help         list the targets
+#   make setup        once per clone: point git at the committed hooks
+#   make ci           what CI runs (lint, format check, types, tests)
 
-# One-time setup after cloning: install uv (if needed) and register the committed git hooks.
-setup:
-	@if ! command -v uv &>/dev/null; then \
+SRC   := c_lord/
+TESTS := tests/
+HOOKS := .githooks
+
+.DEFAULT_GOAL := help
+.PHONY: help setup check-setup need-uv format lint format-check types check test ci tmux
+
+help:  ## List the targets
+	@awk -F':.*## ' '/^[a-z-]+:.*## /{printf "  make %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+# --- one-time setup ---------------------------------------------------------
+
+need-uv:
+	@command -v uv >/dev/null 2>&1 || { \
 		echo "❌ 'uv' is not installed. Install: https://docs.astral.sh/uv/getting-started/installation/"; \
-		exit 1; \
-	fi
-	git config core.hooksPath .githooks
-	@echo "✅ Git hooks configured (.githooks/pre-commit active)"
+		exit 1; }
 
-# Verify that one-time setup has been completed (hooks configured + uv present).
-check-setup:
-	@if ! command -v uv &>/dev/null; then \
-		echo "❌ 'uv' is not installed. Run: make setup"; \
-		exit 1; \
-	fi
-	@if [ "$$(git config core.hooksPath)" != ".githooks" ]; then \
+setup: need-uv  ## Once per clone: use the hooks in .githooks/
+	git config core.hooksPath $(HOOKS)
+	@echo "✅ Git hooks configured ($(HOOKS)/pre-commit active)"
+
+check-setup: need-uv  ## Fail unless `make setup` has been run in this clone
+	@[ "$$(git config core.hooksPath)" = "$(HOOKS)" ] || { \
 		echo "❌ Git hooks not configured. Run: make setup"; \
-		exit 1; \
-	fi
+		exit 1; }
 	@echo "✅ Development setup OK (uv present, hooks configured)"
 
-# Auto-format all Python source files.
-format:
-	uv run ruff format claude_discord/ tests/
+# --- the checks CI runs -----------------------------------------------------
 
-# Lint check (no auto-fix) — same as CI.
-check:
-	uv run ruff format --check claude_discord/ tests/
-	uv run ruff check claude_discord/ tests/
+lint:  ## ruff check (no fixes)
+	uv run ruff check $(SRC)
 
-# Run the full test suite.
-test:
-	uv run pytest tests/
+format-check:  ## ruff format, report only
+	uv run ruff format --check $(SRC)
 
-# Full CI simulation: format check + lint + tests.
-ci: check test
+types:  ## pyright
+	uv run pyright $(SRC)
 
-# Attach to the running c-lord tmux session.
-# Session name: $CLORD_TMUX_SESSION_NAME env var, or basename of $PWD.
-tmux:
-	@SESSION=$${CLORD_TMUX_SESSION_NAME:-$$(basename "$$PWD")}; \
-	if ! tmux has-session -t "$$SESSION" 2>/dev/null; then \
-		echo "Creating tmux session '$$SESSION' ..."; \
-		tmux new-session -d -s "$$SESSION" -n admin; \
-	fi; \
-	exec tmux attach -t "$$SESSION"
+check: lint format-check types  ## Everything static: lint + format check + types
+
+test:  ## The test suite (e2e and live-LLM tests stay deselected, as in CI)
+	uv run pytest $(TESTS)
+
+ci: check test  ## The whole CI job, locally
+
+format:  ## Rewrite the package's files with ruff format
+	uv run ruff format $(SRC)
+
+# --- convenience ------------------------------------------------------------
+
+# Session name: $CLORD_TMUX_SESSION_NAME, else this directory's name. A missing
+# session is created with one window called "admin" before attaching.
+tmux:  ## Attach to this clone's tmux session (creating it if absent)
+	@name=$${CLORD_TMUX_SESSION_NAME:-$$(basename "$$PWD")}; \
+	tmux has-session -t "$$name" 2>/dev/null || { \
+		echo "Creating tmux session '$$name' ..."; \
+		tmux new-session -d -s "$$name" -n admin; }; \
+	exec tmux attach -t "$$name"
