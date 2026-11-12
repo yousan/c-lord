@@ -545,7 +545,7 @@ c_lord/
     chunker.py             # フェンス・テーブル対応メッセージ分割
     embeds.py              # Discord embed ビルダー
     ask_view.py            # AskUserQuestion 用 Discord ボタン / Select Menu
-    ask_handler.py         # collect_ask_answers() — AskUserQuestion UI + DB ライフサイクル
+    ask_handler.py         # bridge_pane_ask() — AskUserQuestion UI + DB ライフサイクル
     streaming_manager.py   # StreamingMessageManager — デバウンス付きインプレース編集
     thread_dashboard.py    # スレッドのセッション状態を表示する live ピン embed
   session_sync.py          # CLI セッションの検出とインポート

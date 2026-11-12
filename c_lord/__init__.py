@@ -1,11 +1,10 @@
 """c-lord — Discord frontend for Claude Code CLI.
 
-Built entirely by Claude Code itself. See README.md for details.
+Written end to end by Claude Code itself; README.md tells the story.
 
-Quick start::
+Everything an instance needs is importable from the package root::
 
     from c_lord import ClaudeChatCog, ClaudeConfig, SessionRepository
-
 """
 
 from .claude.config import ClaudeConfig
@@ -57,39 +56,44 @@ def _resolve_dist_version() -> str:
 
 __version__ = _resolve_dist_version()
 
+# The order below is what ``from c_lord import *`` and editor completion show;
+# new names go at the end of their group.
 __all__ = [
+    # which build this is
     "__version__",
     "resolve_version",
     "runtime_version",
-    # Core
+    # running Claude Code
     "ClaudeConfig",
     "TmuxClaudeRunner",
+    # chat, and the channel/thread → repository bindings
     "ClaudeChatCog",
     "ChannelRepoCog",
     "ChannelRepository",
     "ThreadRepository",
+    # one run and the sessions alive right now
     "RunConfig",
     "EventProcessor",
-    # Concurrency
     "ActiveSession",
     "SessionRegistry",
+    # commands
     "SessionCleanupCog",
     "SessionManageCog",
     "SkillCommandCog",
     "VersionCog",
+    # session storage
     "SessionRepository",
     "SettingsRepository",
-    # Webhook & Automation
+    # automation: webhooks, self-upgrade, schedules, notifications
     "WebhookTriggerCog",
     "WebhookTrigger",
     "AutoUpgradeCog",
     "UpgradeConfig",
-    # Scheduling
     "SchedulerCog",
     "ScheduledTaskRepository",
     "DrainAware",
     "NotificationRepository",
-    # Types
+    # what a runner yields
     "MessageType",
     "StreamEvent",
     "ToolCategory",
@@ -99,10 +103,10 @@ __all__ = [
     "SessionDirInfo",
     "CleanupResult",
     "TmuxSessionManager",
-    # Setup
+    # wiring it all up in one call
     "setup_bridge",
     "BridgeComponents",
-    # UI
+    # Discord presentation
     "StatusManager",
     "error_embed",
     "session_start_embed",

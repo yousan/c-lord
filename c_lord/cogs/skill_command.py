@@ -1,16 +1,15 @@
-"""Skill command Cog.
+"""``/skill`` (and its text twin ``!skill``): run a Claude Code skill by name.
 
-Provides a /skill slash command with autocomplete that lists all available
-Claude Code skills from ~/.claude/skills/ and executes the selected one.
+The skills are whatever lives under ``~/.claude/skills/``. The slash command
+offers them with autocomplete and has Claude type ``/<name> <args>``:
 
-Usage:
-    /skill [name: goodmorning]                → runs /goodmorning in Claude Code
-    /skill [name: todoist] [args: filter "today"]  → runs /todoist filter "today"
+    /skill name:goodmorning                  →  /goodmorning
+    /skill name:todoist args:filter "today"  →  /todoist filter "today"
 
-When used inside an existing thread (under the claude channel), the skill
-resumes the thread's session instead of creating a new thread.
-
-Skills are lazily reloaded every 60 seconds so new skills appear without restart.
+Used inside a thread of the Claude channel, the skill runs in that thread's
+session; anywhere else, a new thread is opened for it. The list of skills is
+re-read lazily, at most every ``SKILL_RELOAD_INTERVAL`` seconds, so a skill
+added on disk shows up without restarting the bot.
 """
 
 from __future__ import annotations
@@ -51,58 +50,99 @@ if TYPE_CHECKING:
     from ..tmux import TmuxSessionManager
 
 logger = logging.getLogger(__name__)
-
 # Callbacks the shared skill core uses to stay agnostic of slash vs text entry.
 Responder = Callable[..., Awaitable[None]]
 Acknowledger = Callable[[], Awaitable[None]]
 
-# YAML frontmatter pattern to extract name/description from SKILL.md
-_FRONTMATTER_RE = re.compile(r"^---[ \t]*\n(?P<body>.*?)^---", re.DOTALL | re.MULTILINE)
-_FIELD_RE = re.compile(r"^(?P<key>\w[\w-]*):\s*(?P<value>.+)$", re.MULTILINE)
-
-# How often to re-scan the skills directory (seconds)
+# Seconds between two readings of the skills directory.
 SKILL_RELOAD_INTERVAL = 60.0
+
+# Discord's ceilings: choices offered at once, and the length of one's label.
+_MAX_CHOICES = 25
+_CHOICE_LABEL_LIMIT = 100
+# How much of a skill's description a choice shows before it is cut.
+_CHOICE_DESCRIPTION_CHARS = 60
+# Discord's ceiling on a thread name.
+_THREAD_NAME_LIMIT = 100
+
+# The opening and closing fence of a SKILL.md frontmatter block.
+_FENCE = "---"
+# One ``key: value`` entry of a frontmatter block. The key starts its line; the
+# whitespace skipped after the colon may run over line ends, so a key with
+# nothing after it takes the next non-blank line as its value.
+_FRONTMATTER_ENTRY = re.compile(r"^(\w[\w-]*):\s*(.+)$", re.MULTILINE)
+# What a skill name may look like. It is typed into Claude's prompt, so this
+# check is a security boundary — keep it strict.
+_SKILL_NAME = re.compile(r"^[\w-]+$")
+
+
+def _frontmatter_block(text: str) -> str | None:
+    """The text between the ``---`` fences opening *text*, or ``None``.
+
+    The first line must be the fence itself (spaces or tabs may trail it), and
+    the block runs up to the next line that begins with a fence.
+    """
+    opening, newline, rest = text.partition("\n")
+    if not newline or not opening.startswith(_FENCE) or opening[len(_FENCE) :].strip(" \t"):
+        return None
+    block: list[str] = []
+    for line in rest.split("\n"):
+        if line.startswith(_FENCE):
+            return "\n".join(block)
+        block.append(line)
+    return None
 
 
 def _parse_skill_meta(skill_dir: Path) -> dict[str, str] | None:
-    """Read SKILL.md frontmatter and return {name, description} or None."""
+    """``{"name", "description"}`` from *skill_dir*'s ``SKILL.md`` frontmatter.
+
+    ``None`` when there is no ``SKILL.md``, no frontmatter in it, or it cannot
+    be read. A missing ``name`` falls back to the directory's name.
+    """
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.exists():
         return None
     try:
         text = skill_md.read_text(encoding="utf-8")
-        m = _FRONTMATTER_RE.match(text)
-        if not m:
-            return None
-        fields = dict(_FIELD_RE.findall(m.group("body")))
-        name = fields.get("name", skill_dir.name).strip()
-        description = fields.get("description", "").strip()
-        return {"name": name, "description": description}
     except OSError:
         logger.warning("Failed to read %s", skill_md)
         return None
 
+    block = _frontmatter_block(text)
+    if block is None:
+        return None
+    # dict() keeps the last of several entries with the same key.
+    entries = dict(_FRONTMATTER_ENTRY.findall(block))
+    return {
+        "name": entries.get("name", skill_dir.name).strip(),
+        "description": entries.get("description", "").strip(),
+    }
+
 
 def _load_skills(skills_dir: Path) -> list[dict[str, str]]:
-    """Scan skills_dir and return sorted list of {name, description}."""
-    skills: list[dict[str, str]] = []
+    """Every skill found directly under *skills_dir*, in directory-name order."""
     if not skills_dir.is_dir():
         logger.warning("Skills directory not found: %s", skills_dir)
-        return skills
-
-    for entry in sorted(skills_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        meta = _parse_skill_meta(entry)
-        if meta:
-            skills.append(meta)
-
+        return []
+    candidates = (entry for entry in sorted(skills_dir.iterdir()) if entry.is_dir())
+    skills = [meta for meta in map(_parse_skill_meta, candidates) if meta]
     logger.info("Loaded %d skills from %s", len(skills), skills_dir)
     return skills
 
 
+def _choice_label(skill: dict[str, str]) -> str:
+    """How *skill* reads in the autocomplete list: its name, then a short description."""
+    name, description = skill["name"], skill["description"]
+    if not description:
+        return name
+    shown = description[:_CHOICE_DESCRIPTION_CHARS]
+    if len(description) > _CHOICE_DESCRIPTION_CHARS:
+        shown += "…"
+    return f"{name} — {shown}"
+
+
 class SkillCommandCog(commands.Cog):
-    """Cog that exposes Claude Code skills as a /skill slash command."""
+    """The ``/skill`` slash command, its autocomplete, and the ``!skill`` text twin."""
 
     def __init__(
         self,
@@ -131,11 +171,10 @@ class SkillCommandCog(commands.Cog):
         # uses, so the owner resolved at startup applies to /skill too.
         self._authorizer = authorizer or Authorizer(allowed_user_ids, allowed_role_name)
         self._registry = registry or getattr(bot, "session_registry", None)
-
-        # Default to ~/.claude/skills/
-        if skills_dir is None:
-            skills_dir = Path.home() / ".claude" / "skills"
-        self._skills_dir = Path(skills_dir)
+        self._skills_dir = (
+            Path.home() / ".claude" / "skills" if skills_dir is None else Path(skills_dir)
+        )
+        # Read once now; ``_maybe_reload_skills`` keeps it fresh afterwards.
         self._skills = _load_skills(self._skills_dir)
         self._last_loaded: float = time.monotonic()
 
@@ -167,11 +206,15 @@ class SkillCommandCog(commands.Cog):
         return None
 
     def _maybe_reload_skills(self) -> None:
-        """Reload skills from disk if SKILL_RELOAD_INTERVAL has elapsed."""
+        """Read the skills directory again once the last reading has aged out."""
         now = time.monotonic()
-        if now - self._last_loaded >= SKILL_RELOAD_INTERVAL:
-            self._skills = _load_skills(self._skills_dir)
-            self._last_loaded = now
+        if self._skills_fresh_at(now):
+            return
+        self._skills, self._last_loaded = _load_skills(self._skills_dir), now
+
+    def _skills_fresh_at(self, now: float) -> bool:
+        """Whether the list read at ``_last_loaded`` still counts at *now*."""
+        return now - self._last_loaded < SKILL_RELOAD_INTERVAL
 
     def _is_authorized(self, member: discord.Member | discord.User | int) -> bool:
         """Check if a member/user is authorized.
@@ -187,29 +230,26 @@ class SkillCommandCog(commands.Cog):
         return self._authorizer.is_allowed(member)
 
     async def _skill_name_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
+        self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """Return up to 25 matching skill names for autocomplete."""
-        self._maybe_reload_skills()
+        """Choices for ``/skill name:`` — skills whose name or description contains *current*.
 
-        current_lower = current.lower()
-        matches = [
-            s
-            for s in self._skills
-            if current_lower in s["name"].lower() or current_lower in s["description"].lower()
+        Defined above ``run_skill``, whose decorator refers to it by name.
+        """
+        self._maybe_reload_skills()
+        needle = current.lower()
+        matching = [
+            skill
+            for skill in self._skills
+            if needle in skill["name"].lower() or needle in skill["description"].lower()
         ]
-        choices = []
-        for s in matches[:25]:
-            label = s["name"]
-            if s["description"]:
-                short_desc = s["description"][:60]
-                if len(s["description"]) > 60:
-                    short_desc += "…"
-                label = f"{s['name']} — {short_desc}"
-            choices.append(app_commands.Choice(name=label[:100], value=s["name"]))
-        return choices
+        return [
+            app_commands.Choice(
+                name=_choice_label(skill)[:_CHOICE_LABEL_LIMIT],
+                value=skill["name"],
+            )
+            for skill in matching[:_MAX_CHOICES]
+        ]
 
     def _earlier_triggers_forgetter(
         self, thread_id: int, mirror_cog: object, prior: set[int | None]
@@ -348,7 +388,7 @@ class SkillCommandCog(commands.Cog):
         return turn, True
 
     def _is_claude_thread(self, channel: discord.abc.GuildChannel | discord.Thread) -> bool:
-        """Check if the channel is a thread under the configured claude channel."""
+        """Whether *channel* is a thread of the Claude channel."""
         return isinstance(channel, discord.Thread) and channel.parent_id == self.claude_channel_id
 
     async def _prepare_workspace(
@@ -448,28 +488,23 @@ class SkillCommandCog(commands.Cog):
             await respond("You don't have permission to use this command.", ephemeral=True)
             return
 
-        # Validate skill name — only alphanumeric, hyphens, underscores
-        if not re.match(r"^[\w-]+$", name):
+        # ``match`` with ``$``, not ``fullmatch``: the long-standing check.
+        if not _SKILL_NAME.match(name):
             await respond(f"Invalid skill name: `{name}`", ephemeral=True)
             return
 
-        # Lazy reload before matching
         self._maybe_reload_skills()
-
-        matched = next((s for s in self._skills if s["name"] == name), None)
-        if not matched:
+        if not any(skill["name"] == name for skill in self._skills):
             await respond(
                 f"Skill `{name}` not found. Use `/skill` with autocomplete.",
                 ephemeral=True,
             )
             return
-
-        # Build the prompt: /name [args]
         prompt = f"/{name} {args}" if args else f"/{name}"
 
         await ack()
 
-        # In-thread mode: if invoked inside a thread under the claude channel, resume it
+        # Inside a thread of the Claude channel: run in that thread's session.
         if isinstance(channel, discord.Thread) and self._is_claude_thread(channel):
             # #811: another c-lord's thread — running here would take it over.
             foreign = await foreign_owner_notice_for(self.bot, self.repo, channel)
@@ -484,11 +519,8 @@ class SkillCommandCog(commands.Cog):
                 await respond("⚠️ tmux is not configured for this channel.", ephemeral=True)
                 return
 
-            session_id = None
             record = await self.repo.get(channel.id)
-            if record:
-                session_id = record.session_id
-
+            session_id: str | None = record.session_id if record else None
             # #1234 (W57): what is on record *now*, before the workspace is
             # prepared — memory, row and pending (#1262: the memory too, since the
             # row may still be waiting for that message's write). These are
@@ -502,7 +534,7 @@ class SkillCommandCog(commands.Cog):
                 self.repo.pending_trigger(channel.id),
             }
 
-            display = f"`/{name} {args}`" if args else f"`/{name}`"
+            display = f"`{prompt}`"
             await respond(f"Running {display} in this thread…")
 
             # #927: before the workspace — a restart for a new pair closes the
@@ -551,12 +583,11 @@ class SkillCommandCog(commands.Cog):
                 )
             return
 
-        # New-thread mode: create a thread in the claude channel
+        # Anywhere else: open a new thread in the Claude channel and run there.
         claude_channel = self.bot.get_channel(self.claude_channel_id)
         if not isinstance(claude_channel, discord.TextChannel):
             await respond("Claude channel not found.", ephemeral=True)
             return
-
         # Resolve per-channel managers
         sdm = await self._resolve_session_dir_manager(claude_channel.id)
         # New-thread mode: no thread exists yet (#600 audit).
@@ -571,18 +602,17 @@ class SkillCommandCog(commands.Cog):
             )
             return
 
-        thread_name = f"/{name} {args}" if args else f"/{name}"
-        # Discord thread names are max 100 chars
+        # The thread is named after what Claude is asked to type.
+        thread_name = prompt[:_THREAD_NAME_LIMIT]
         archive_minutes = await resolve_auto_archive_duration(
             getattr(self.bot, "settings_repo", None)
         )
         thread = await claude_channel.create_thread(
-            name=thread_name[:100],
+            name=thread_name,
             type=discord.ChannelType.public_thread,
             auto_archive_duration=archive_minutes,
         )
-
-        display = f"`/{name} {args}`" if args else f"`/{name}`"
+        display = f"`{prompt}`"
         await respond(f"Running {display} → {thread.mention}")
 
         # #927: a new thread has no running Claude, so this never restarts.
@@ -626,7 +656,7 @@ class SkillCommandCog(commands.Cog):
         name: str,
         args: str | None = None,
     ) -> None:
-        """Run a Claude Code skill by name, optionally with arguments."""
+        """Slash entry point: hand the request to the shared skill core."""
         # Before defer, validation errors go on the initial response (instant,
         # ephemeral). After defer, everything goes through followup — and an
         # ephemeral one stays ephemeral (#748, see slash_io).

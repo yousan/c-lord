@@ -480,7 +480,7 @@ c_lord/
     chunker.py             # División de mensajes con conocimiento de bloques y tablas
     embeds.py              # Constructores de embeds de Discord
     ask_view.py            # Botones/Menús de Selección para AskUserQuestion
-    ask_handler.py         # collect_ask_answers() — UI + ciclo de vida DB de AskUserQuestion
+    ask_handler.py         # bridge_pane_ask() — UI + ciclo de vida DB de AskUserQuestion
     streaming_manager.py   # StreamingMessageManager — ediciones de mensaje en sitio con debounce
     thread_dashboard.py    # Embed fijo en vivo mostrando estados de sesión
   session_sync.py          # Descubrimiento e importación de sesiones CLI

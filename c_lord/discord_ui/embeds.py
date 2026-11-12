@@ -1,4 +1,4 @@
-"""Discord embed builders for Claude Code events."""
+"""Builders for the embeds c-lord posts — pure functions, no Discord calls."""
 
 from __future__ import annotations
 
@@ -8,15 +8,33 @@ import discord
 
 from ..claude.types import AskOption, UsageLimit
 
-# Colors
-COLOR_INFO = 0x5865F2  # Discord blurple
-COLOR_SUCCESS = 0x57F287  # Green
-COLOR_ERROR = 0xED4245  # Red
-COLOR_TOOL = 0xFEE75C  # Yellow
-COLOR_ASK = 0x3498DB  # Blue — question-like
-COLOR_TODO = 0xE67E22  # Orange — task list
+# Palette. One meaning per colour, so a glance at the stripe tells the kind.
+COLOR_INFO = 0x5865F2  # neutral notice (Discord blurple)
+COLOR_SUCCESS = 0x57F287  # it worked (green)
+COLOR_ERROR = 0xED4245  # it failed (red)
+COLOR_TOOL = 0xFEE75C  # yellow
+COLOR_ASK = 0x3498DB  # Claude is asking something (blue)
+COLOR_TODO = 0xE67E22  # orange
 
+# Context usage, in percent, from which auto-compaction is considered imminent.
 AUTOCOMPACT_THRESHOLD = 83.5
+
+# Discord's ceilings on an embed's title and description.
+_TITLE_LIMIT = 256
+_DESCRIPTION_LIMIT = 4096
+# How much of a session id the start embed shows.
+_SESSION_ID_PREFIX = 8
+# How much of a raw error text the generic error embed carries.
+_ERROR_TEXT_LIMIT = 4000
+# A stop is something the user asked for, so it is orange, not COLOR_ERROR.
+_COLOR_STOPPED = 0xFFA500
+
+
+def _notice(title: str, body: str, color: int) -> discord.Embed:
+    """A title-and-text embed, both cut to what Discord accepts."""
+    return discord.Embed(
+        title=title[:_TITLE_LIMIT], description=body[:_DESCRIPTION_LIMIT], color=color
+    )
 
 
 def session_start_embed(
@@ -24,17 +42,14 @@ def session_start_embed(
     *,
     window_name: str | None = None,
 ) -> discord.Embed:
-    """Create an embed for session start."""
-    embed = discord.Embed(
-        title="\U0001f916 Claude Code session started",
-        color=COLOR_INFO,
-    )
+    """The "session started" notice; the footer names the session when known."""
+    embed = discord.Embed(title="🤖 Claude Code session started", color=COLOR_INFO)
     if session_id:
         if session_id.startswith("tmux-"):
             label = window_name or "tmux"
             embed.set_footer(text=f"Session: {label}")
         else:
-            embed.set_footer(text=f"Session: {session_id[:8]}...")
+            embed.set_footer(text=f"Session: {session_id[:_SESSION_ID_PREFIX]}...")
     return embed
 
 
@@ -60,12 +75,8 @@ def unknown_tui_prompt_embed(pane_snapshot: str) -> discord.Embed:
 
 
 def error_embed(error: str) -> discord.Embed:
-    """Create an embed for errors."""
-    return discord.Embed(
-        title="\u274c Error",
-        description=error[:4000],
-        color=COLOR_ERROR,
-    )
+    """A generic failure: the error text itself, cut to what an embed can hold."""
+    return _notice("❌ Error", error[:_ERROR_TEXT_LIMIT], COLOR_ERROR)
 
 
 def api_error_embed(detail: str, advice: str) -> discord.Embed:
@@ -304,18 +315,18 @@ def usage_limit_embed(limit: UsageLimit) -> discord.Embed:
     )
 
 
+_TIMEOUT_ADVICE = (
+    "",
+    "**What to do:**",
+    "• Send a message to resume the session",
+    "• Use `/clear` to start fresh",
+)
+
+
 def timeout_embed(seconds: int) -> discord.Embed:
-    """Create an embed for session timeout with actionable guidance."""
-    return discord.Embed(
-        title="\u23f1\ufe0f Session timed out",
-        description=(
-            f"No response received for {seconds} seconds.\n\n"
-            "**What to do:**\n"
-            "\u2022 Send a message to resume the session\n"
-            "\u2022 Use `/clear` to start fresh"
-        ),
-        color=COLOR_ERROR,
-    )
+    """Claude said nothing for *seconds* seconds; tell the user how to go on."""
+    lines = (f"No response received for {seconds} seconds.", *_TIMEOUT_ADVICE)
+    return _notice("⏱️ Session timed out", "\n".join(lines), COLOR_ERROR)
 
 
 def ask_embed(
@@ -338,11 +349,7 @@ def ask_embed(
         legend = "\n".join(f"**{o.label}** — {o.description}" for o in options if o.description)
         if legend:
             body = f"{question}\n\n{legend}"
-    return discord.Embed(
-        title=title[:256],
-        description=body[:4096],
-        color=COLOR_ASK,
-    )
+    return _notice(title, body, COLOR_ASK)
 
 
 def ask_answered_embed(
@@ -358,11 +365,7 @@ def ask_answered_embed(
     """
     answer = ", ".join(selected or []) or "（未選択）"
     title = f"✅ {header}" if header else "✅ 回答しました"
-    return discord.Embed(
-        title=title[:256],
-        description=f"{question}\n\n**あなたの回答:** {answer}"[:4096],
-        color=COLOR_SUCCESS,
-    )
+    return _notice(title, f"{question}\n\n**あなたの回答:** {answer}", COLOR_SUCCESS)
 
 
 def ask_sending_embed(
@@ -527,13 +530,9 @@ def stopped_embed(*, shells_stopped: int = 0) -> discord.Embed:
         if shells_stopped
         else ""
     )
-    return discord.Embed(
-        title="\u23f9\ufe0f Session stopped",
-        description=(
-            "The session was stopped.\n\n"
-            f"{background}"
-            "The session is preserved \u2014 send a message to resume, "
-            "or use `/clear` to start fresh."
-        ),
-        color=0xFFA500,  # Orange — not an error, just interrupted
+    paragraphs = (
+        "The session was stopped.\n\n",
+        background,
+        "The session is preserved — send a message to resume, or use `/clear` to start fresh.",
     )
+    return _notice("⏹️ Session stopped", "".join(paragraphs), _COLOR_STOPPED)

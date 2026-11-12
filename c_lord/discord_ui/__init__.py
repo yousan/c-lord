@@ -1,8 +1,11 @@
-"""Discord UI components for rendering Claude Code output."""
+"""Discord-facing pieces of c-lord: views, embeds, the status lamp, the board.
 
-from .ask_handler import ASK_ANSWER_TIMEOUT, collect_ask_answers
+Submodules are imported by name (``from c_lord.discord_ui import status``);
+only the ask-menu timeout is re-exported at package level.
+"""
 
-__all__ = [
-    "ASK_ANSWER_TIMEOUT",
-    "collect_ask_answers",
-]
+from __future__ import annotations
+
+from .ask_handler import ASK_ANSWER_TIMEOUT
+
+__all__ = ["ASK_ANSWER_TIMEOUT"]

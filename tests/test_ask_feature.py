@@ -3,7 +3,6 @@
 Covers:
 - types: AskOption, AskQuestion, ToolCategory.ASK, _parse_ask_questions
 - embeds: ask_embed
-- run_helper: _collect_ask_answers (answer formatting)
 """
 
 from __future__ import annotations
@@ -213,89 +212,6 @@ class TestAskEmbed:
         embed = ask_embed("Q?")
         assert embed.color is not None
         assert embed.color.value == 0x3498DB
-
-
-# ---------------------------------------------------------------------------
-# _collect_ask_answers (answer formatting helper)
-# ---------------------------------------------------------------------------
-
-
-class TestCollectAskAnswers:
-    """Tests for the _collect_ask_answers answer string format.
-
-    We test the pure formatting logic by constructing what the function
-    would return given a mocked AskView response.  The Discord interaction
-    itself (buttons/modals) is tested separately via integration tests.
-    """
-
-    def _format_answer(self, question: AskQuestion, selected: list[str]) -> str:
-        """Replicate the formatting logic from _collect_ask_answers."""
-        answer_text = ", ".join(selected)
-        return f"**{question.question}**\nAnswer: {answer_text}"
-
-    def test_single_answer_formatted(self) -> None:
-        q = AskQuestion(question="Which auth?", options=[AskOption(label="JWT")])
-        result = self._format_answer(q, ["JWT"])
-        assert "**Which auth?**" in result
-        assert "Answer: JWT" in result
-
-    def test_multi_select_answer_joined(self) -> None:
-        q = AskQuestion(
-            question="Which features?",
-            multi_select=True,
-            options=[AskOption(label="Auth"), AskOption(label="Logging")],
-        )
-        result = self._format_answer(q, ["Auth", "Logging"])
-        assert "Answer: Auth, Logging" in result
-
-    def test_full_resume_prompt_format(self) -> None:
-        """The resume prompt must start with the [Response] marker."""
-        q = AskQuestion(question="Q?")
-        part = self._format_answer(q, ["A"])
-        resume_prompt = (
-            "[Response to AskUserQuestion]\n\n"
-            + part
-            + "\n\nPlease continue based on these answers."
-        )
-        assert resume_prompt.startswith("[Response to AskUserQuestion]")
-        assert "Please continue" in resume_prompt
-
-
-class TestCollectAskAnswersTimeout:
-    """Tests for asyncio.TimeoutError handling in collect_ask_answers (Python 3.10 compat)."""
-
-    @pytest.mark.asyncio
-    async def test_collect_ask_answers_handles_asyncio_timeout(self) -> None:
-        """collect_ask_answers does not raise on asyncio.TimeoutError (Python 3.10 compat).
-
-        On Python 3.10, asyncio.TimeoutError is NOT a subclass of the built-in
-        TimeoutError. If the wait_for call times out, collect_ask_answers must
-        catch the exception and return None (graceful timeout) rather than
-        propagating an unhandled exception to _run_helper.
-        """
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from c_lord.claude.types import AskOption, AskQuestion
-        from c_lord.discord_ui.ask_handler import collect_ask_answers
-
-        q = AskQuestion(
-            question="Which option?",
-            options=[AskOption(label="A"), AskOption(label="B")],
-        )
-        mock_msg = AsyncMock()
-        mock_msg.edit = AsyncMock()
-        thread = MagicMock()
-        thread.id = 12345
-        thread.send = AsyncMock(return_value=mock_msg)
-
-        with patch(
-            "c_lord.discord_ui.ask_handler.asyncio.wait_for",
-            side_effect=asyncio.TimeoutError,
-        ):
-            result = await collect_ask_answers(thread, [q], session_id="abc123")
-
-        assert result is None  # timeout → no answer → returns None
 
 
 # ---------------------------------------------------------------------------

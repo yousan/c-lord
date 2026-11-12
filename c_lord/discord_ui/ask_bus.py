@@ -1,13 +1,13 @@
-"""In-process routing bus for AskUserQuestion interactions.
+"""The hand-off point between a menu's buttons and whoever is waiting on them.
 
-AskView button/select callbacks call ``ask_bus.post_answer()`` to deliver the
-user's choice to the coroutine waiting inside ``_collect_ask_answers``.
+A question menu has two ends that never meet directly: the coroutine that
+posted the menu and now waits for its answer, and the Discord interaction that
+fires when somebody presses a button.  They find each other here, by thread id.
 
-Using an asyncio.Queue (rather than a Future) means:
-- Multiple answers can be posted safely without raising InvalidStateError.
-- The waiting side can use ``asyncio.wait_for`` with any timeout it likes.
-- The view itself needs no reference to the internal Future/Event; routing is
-  fully decoupled.
+The waiting end calls :meth:`AskAnswerBus.register` and gets a queue; the
+pressing end calls :meth:`AskAnswerBus.post_answer`, which drops the answer
+into that queue.  A queue (rather than a one-shot future) means a second press
+can never raise, and the waiter is free to pick its own timeout.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import logging
 import time
 
 logger = logging.getLogger(__name__)
-
 # Why a thread's menu stopped accepting answers (#536).  A click that arrives
 # after the fact needs the real reason: "the bot restarted" was told to every
 # late clicker, including the one who had just answered in the terminal.
@@ -56,9 +55,8 @@ class ChosenOption(str):
     text with no index (✏️ Other, a typed sentence) is matched by label.
 
     It is still the option's full label as a string, so everything that only
-    *shows* an answer — the embeds, the logs, the non-tmux answer prompt —
-    reads it unchanged. (``option_index``, not ``index``: that would shadow
-    ``str.index``.)
+    *shows* an answer — the embeds, the logs — reads it unchanged.
+    (``option_index``, not ``index``: that would shadow ``str.index``.)
     """
 
     option_index: int
@@ -70,14 +68,15 @@ class ChosenOption(str):
 
 
 class AskAnswerBus:
-    """Routes button/select interactions to the coroutine awaiting an answer.
+    """Per-thread answer queues, shared by every session in the process.
 
-    One instance is shared across all active sessions (module-level singleton).
-    Each waiting session registers a Queue keyed by thread_id; AskView callbacks
+    Whoever claims a thread's menu waits on the Queue it is given; the button
+    and Select callbacks of that menu's View
     post the chosen options (as :class:`ChosenOption`) into that Queue.
     """
 
     def __init__(self) -> None:
+        # thread_id -> the queue its current menu owner is waiting on
         self._waiters: dict[int, asyncio.Queue[list[str]]] = {}
         # thread_id -> (noted_at_monotonic, reason) — see note_closed (#536)
         self._closed: dict[int, tuple[float, str]] = {}
@@ -119,11 +118,11 @@ class AskAnswerBus:
                 "AskAnswerBus: thread %d already has an owner — refusing register", thread_id
             )
             return None
-        q: asyncio.Queue[list[str]] = asyncio.Queue()
-        self._waiters[thread_id] = q
+        waiter: asyncio.Queue[list[str]] = asyncio.Queue()
+        self._waiters[thread_id] = waiter
         self._free_text[thread_id] = allow_free_text
         logger.debug("AskAnswerBus: registered waiter for thread %d", thread_id)
-        return q
+        return waiter
 
     def is_active(self, thread_id: int) -> bool:
         """Return True if a bridge is currently waiting for an answer on *thread_id*.
@@ -135,18 +134,19 @@ class AskAnswerBus:
         return thread_id in self._waiters
 
     def post_answer(self, thread_id: int, answers: list[str]) -> bool:
-        """Deliver *answers* to the coroutine waiting for *thread_id*.
+        """Hand *answers* to whoever owns *thread_id*'s menu.
 
-        Returns True if a waiter was found (live session), False if the session
-        is gone (e.g. bot was restarted).
+        ``True`` says only that an owner was there to receive them — not that
+        Claude has seen them.  ``False`` means nobody is waiting any more (the
+        menu was closed, or the process that posted it is gone).
         """
-        q = self._waiters.get(thread_id)
-        if q is not None:
-            q.put_nowait(answers)
-            logger.debug("AskAnswerBus: delivered %r to thread %d", answers, thread_id)
-            return True
-        logger.debug("AskAnswerBus: no waiter for thread %d (bot restarted?)", thread_id)
-        return False
+        try:
+            self._waiters[thread_id].put_nowait(answers)
+        except KeyError:
+            logger.debug("AskAnswerBus: no waiter for thread %d (bot restarted?)", thread_id)
+            return False
+        logger.debug("AskAnswerBus: delivered %r to thread %d", answers, thread_id)
+        return True
 
     def accepts_free_text(self, thread_id: int) -> bool:
         """True if a typed sentence may be delivered as this menu's answer (#536).
@@ -191,9 +191,13 @@ class AskAnswerBus:
         self._delivery.pop(thread_id, None)
 
     def unregister(self, thread_id: int) -> None:
-        """Remove the waiter for *thread_id* (called after answer or timeout)."""
-        self._waiters.pop(thread_id, None)
-        self._free_text.pop(thread_id, None)
+        """Give up *thread_id*'s menu.  Safe to call when nothing is claimed.
+
+        Only what :meth:`register` set up is dropped; the closure note and the
+        delivery channel have lifetimes of their own.
+        """
+        for claimed in (self._waiters, self._free_text):
+            claimed.pop(thread_id, None)
         logger.debug("AskAnswerBus: unregistered waiter for thread %d", thread_id)
 
     def note_closed(self, thread_id: int, reason: str) -> None:
@@ -230,5 +234,5 @@ class AskAnswerBus:
         return reason
 
 
-# Module-level singleton — import this everywhere.
+# The one bus of this process: views post to it, bridges wait on it.
 ask_bus = AskAnswerBus()

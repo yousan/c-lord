@@ -1,15 +1,13 @@
-"""SchedulerCog — SQLite-backed periodic Claude Code task executor.
+"""Runs the tasks in the ``scheduled_tasks`` table when they fall due.
 
-Design:
-- Tasks are stored in ``scheduled_tasks`` DB table and registered via REST API
-  (Claude Code calls POST /api/tasks from within a chat session).
-- A single 30-second master loop checks for due tasks and spawns them.
-- ``discord.ext.tasks`` is used only for the master loop — individual tasks
-  are not @tasks.loop decorated (they are runtime-dynamic).
-- Claude handles all domain logic (what to check, how to deduplicate).
+How the pieces fit:
+
+- Tasks are rows in SQLite, added and removed at runtime over the REST API.
+- A single master loop wakes every ``MASTER_LOOP_INTERVAL_SECONDS`` and starts
+  whatever is due. ``discord.ext.tasks`` drives that one loop only — a
+  decorator per task would fix the set of tasks at import time.
+- What a task *does* is up to Claude, working from the task's prompt;
   c-lord only manages scheduling.
-
-See: Issue #90, CLAUDE.md §Key Design Decisions #7-9.
 """
 
 from __future__ import annotations
@@ -30,23 +28,23 @@ from ..utils.logger import log_ctx
 from ._run_helper import run_claude_with_config
 from .run_config import RunConfig
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from ..claude.config import ClaudeConfig
     from ..database.task_repo import TaskRepository
 
-logger = logging.getLogger(__name__)
-
-# How often the master loop wakes up to check for due tasks.
+# How often the master loop looks for due tasks, in seconds.
 MASTER_LOOP_INTERVAL_SECONDS = 30
 
 
 class SchedulerCog(commands.Cog):
-    """Cog that periodically runs Claude Code tasks stored in SQLite.
+    """Starts each due task in a thread of its own.
 
     Args:
-        bot: The Discord bot instance.
+        bot: The bot the cog is loaded into.
         runner: ClaudeConfig with CLI settings.
-        repo: TaskRepository for reading/updating scheduled tasks.
+        repo: Where the scheduled tasks are stored.
     """
 
     def __init__(
@@ -59,46 +57,55 @@ class SchedulerCog(commands.Cog):
         self.bot = bot
         self.runner = runner
         self.repo = repo
-        # Track in-flight tasks to avoid double-running the same task_id.
+        # Ids of the tasks whose run is under way. A run adds and removes its
+        # own id (``_run_task``); the loop only consults it.
         self._running: set[int] = set()
+        # The runs the loop started and nobody awaits — referenced from here so
+        # they cannot be garbage-collected half way through.
+        self._launched: set[asyncio.Task[None]] = set()
+
+    # -- the master loop ------------------------------------------------
 
     async def cog_load(self) -> None:
-        """Start the master loop when the Cog is loaded."""
         self._master_loop.start()
         logger.info("SchedulerCog loaded — master loop started")
 
     def cog_unload(self) -> None:
-        """Cancel the master loop when the Cog is unloaded."""
+        # The loop stops looking for work; runs already launched carry on.
         self._master_loop.cancel()
         logger.info("SchedulerCog unloaded — master loop stopped")
 
     @tasks.loop(seconds=MASTER_LOOP_INTERVAL_SECONDS)
     async def _master_loop(self) -> None:
-        """Wake up every 30 s, find due tasks, and spawn them concurrently."""
+        """One tick: launch what is due, in the order the repository gives it."""
         due = await self.repo.get_due()
         if not due:
             return
-
         due_ids = [t["id"] for t in due]
         logger.info("SchedulerCog: %d task(s) due (ids=%s)", len(due), due_ids)
         for task in due:
-            task_id: int = task["id"]
-            if task_id in self._running:
-                logger.debug("%s still running — skipping", log_ctx(task_id=task_id))
-                continue
-
-            # Advance next_run_at *before* spawning to prevent duplicate runs
-            # if the loop fires again before the task finishes.
-            await self.repo.update_next_run(task_id, interval_seconds=task["interval_seconds"])
-
-            asyncio.create_task(
-                self._run_task(task),
-                name=f"clord-scheduler-{task_id}",
-            )
+            await self._launch(task)
 
     @_master_loop.before_loop
     async def _before_master_loop(self) -> None:
+        """No tick before the bot is connected: a run needs its channels."""
         await self.bot.wait_until_ready()
+
+    async def _launch(self, task: dict) -> None:
+        """Start *task* running by itself — unless its previous run is still going.
+
+        The next run time is pushed forward before the run starts, so a run
+        that outlives a tick is not started a second time by the next one. A
+        task that is skipped keeps its due time and comes up again next tick.
+        """
+        task_id = task["id"]
+        if task_id in self._running:
+            logger.debug("%s still running — skipping", log_ctx(task_id=task_id))
+            return
+        await self.repo.update_next_run(task_id, interval_seconds=task["interval_seconds"])
+        run = asyncio.create_task(self._run_task(task), name=f"clord-scheduler-{task_id}")
+        self._launched.add(run)
+        run.add_done_callback(self._launched.discard)
 
     async def _resolve_tmux_manager(self, channel_id: int, *, thread_id: int | None):
         """Resolve a TmuxSessionManager for the given channel via ChannelRepoCog."""
@@ -145,10 +152,10 @@ class SchedulerCog(commands.Cog):
             )
 
     async def _run_task(self, task: dict) -> None:
-        """Execute a single scheduled task in a Discord thread."""
+        """Run one task from start to finish in a new thread of its channel."""
         from ..claude.tmux_runner import TmuxClaudeRunner
 
-        task_id: int = task["id"]
+        task_id = task["id"]
         ctx = log_ctx(task_id=task_id, channel_id=task["channel_id"])
         self._running.add(task_id)
         logger.info("%s _run_task: enter (name=%s)", ctx, task["name"])
@@ -160,17 +167,16 @@ class SchedulerCog(commands.Cog):
             if not isinstance(channel, discord.TextChannel):
                 logger.warning("%s channel is not a TextChannel", ctx)
                 return
-
             # A scheduled task targets a channel, never a thread (#600 audit).
             tmux = await self._resolve_tmux_manager(channel.id, thread_id=None)
             if tmux is None:
                 logger.warning("%s no tmux manager (name=%s)", ctx, task["name"])
                 return
 
-            # Post a starter message first so the thread appears in the channel
-            # timeline and shows up in the left sidebar under the parent channel.
-            # channel.create_thread() without a message only appears in the
-            # Threads panel (🧵), not in the channel list.
+            # The thread hangs off a message posted in the channel. A thread
+            # created with no message behind it shows up in the thread list
+            # only — not in the channel's timeline, nor in the sidebar — so
+            # nobody would see that the task ran.
             starter = await channel.send(f"🔄 **[Scheduled]** `{task['name']}`")
             archive_minutes = await resolve_auto_archive_duration(
                 getattr(self.bot, "settings_repo", None)
@@ -179,7 +185,6 @@ class SchedulerCog(commands.Cog):
                 name=f"[Scheduled] {task['name']}",
                 auto_archive_duration=archive_minutes,
             )
-
             working_dir = task.get("working_dir") or self.runner.working_dir
 
             # #621: create the tmux window BEFORE building the runner.  This
@@ -279,8 +284,8 @@ class SchedulerCog(commands.Cog):
                     task["name"],
                     run_config.outcome.error,
                 )
-
         except Exception:
+            # Nobody awaits this task, so the failure is reported here or nowhere.
             logger.exception("%s task failed (name=%s)", ctx, task["name"])
         finally:
             self._running.discard(task_id)

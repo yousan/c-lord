@@ -1,6 +1,6 @@
-"""Session management Cog.
+"""Slash commands (and their text twins) for inspecting and managing workspaces.
 
-Provides slash commands for viewing and managing Claude Code sessions:
+What lives in this cog, among others:
 - /clord-status: Per-channel session status (size, attach, resume) — supersedes
   the removed /sessions, /session-dirs, /resume-info (#363)
 - /workspace-cleanup, /tmux-list, /tmux-screenshot, /workspace-delete, ...
@@ -124,7 +124,7 @@ def _fit_field_lines(lines: list[str], limit: int = _EMBED_FIELD_LIMIT) -> str:
     return "\n".join([*shown, tail]) if shown else tail
 
 
-# Model management
+# Settings-table key under which the instance-wide model override is stored.
 SETTING_CLAUDE_MODEL = "claude_model"
 
 # Tier aliases the Claude CLI resolves to the *latest* model of that tier
@@ -169,6 +169,40 @@ _WAKE_FAILED = (
     "⚠️ 停止していたワークスペースの復元に失敗したため、スクリーンショットを撮れませんでした。\n"
     "**このスレッドにメッセージを送れば、通常の経路で復元を試みます。**"
 )
+
+
+#: What a new session runs on when nothing — no stored choice, no runner — says otherwise.
+_FALLBACK_MODEL = "sonnet"
+
+#: "This source has no opinion" — distinct from ``None``, which a runner may really hold.
+_NO_OPINION: object = object()
+
+
+async def stored_model_override(settings_repo: SettingsRepository | None) -> str | None:
+    """The instance-wide model ``/model`` wrote down; ``None`` without a store or a value."""
+    if settings_repo is None:
+        return None
+    return await settings_repo.get(SETTING_CLAUDE_MODEL)
+
+
+def _chat_cog_runner(bot: commands.Bot) -> object | None:
+    """The config ``ClaudeChatCog`` launches Claude with, if that cog is loaded."""
+    chat_cog = bot.get_cog("ClaudeChatCog")
+    return getattr(chat_cog, "runner", None) if chat_cog is not None else None
+
+
+def _runner_model(runner: object | None) -> object:
+    """What *runner* says its model is, or :data:`_NO_OPINION` when it cannot say."""
+    if runner is None or not hasattr(runner, "model"):
+        return _NO_OPINION
+    return runner.model  # type: ignore[attr-defined]
+
+
+def _cleanup_color(*, removed: bool, kept_work: bool) -> int:
+    """Embed colour for a cleanup result: kept work outranks success, success outranks "nothing"."""
+    if kept_work:
+        return COLOR_TOOL
+    return COLOR_SUCCESS if removed else COLOR_INFO
 
 
 def _is_valid_model_id(model: str) -> bool:
@@ -239,7 +273,7 @@ def _short_repo(source_repo: str | None) -> str:
 
 
 class SessionManageCog(commands.Cog):
-    """Cog for session listing, resume info, and CLI sync commands."""
+    """Workspace housekeeping commands: status listing, resume hints, CLI resync."""
 
     def __init__(
         self,
@@ -259,7 +293,7 @@ class SessionManageCog(commands.Cog):
         # persistence layer was dead code and its table was never created.
         self._devenv_repo = devenv_repo
         # Optional ClaudeConfig reference for reading the default model.
-        # Resolved lazily from ClaudeChatCog if not provided directly.
+        # Left as None when not handed in; _get_runner() then asks ClaudeChatCog.
         self._runner = runner
         # #781: who may run these commands. Optional so consumers constructing
         # the cog themselves keep working — :meth:`_command_authorizer` then
@@ -267,24 +301,25 @@ class SessionManageCog(commands.Cog):
         self._authorizer = authorizer
 
     def _get_runner(self) -> object | None:
-        """Return the runner, resolving it from ClaudeChatCog if not set directly."""
-        if self._runner is not None:
-            return self._runner
-        chat_cog = self.bot.get_cog("ClaudeChatCog")
-        if chat_cog is not None:
-            return getattr(chat_cog, "runner", None)
-        return None
+        """The config whose defaults we report — ours if we were given one, else the chat cog's.
+
+        Asked afresh on every call: the chat cog may be added after this one.
+        """
+        return self._runner if self._runner is not None else _chat_cog_runner(self.bot)
 
     async def _get_effective_model(self) -> str:
-        """Return the effective model: settings_repo override or runner default."""
-        if self.settings_repo is not None:
-            stored = await self.settings_repo.get(SETTING_CLAUDE_MODEL)
-            if stored:
-                return stored
-        runner = self._get_runner()
-        if runner is not None and hasattr(runner, "model"):
-            return runner.model  # type: ignore[return-value]
-        return "sonnet"
+        """The model a brand-new session would run on.
+
+        Each source is asked in turn and the first with an opinion wins: the
+        stored ``/model`` choice, then the runner, then the built-in fallback.
+        """
+        stored = await stored_model_override(self.settings_repo)
+        if stored:
+            return stored
+        from_runner = _runner_model(self._get_runner())
+        if from_runner is not _NO_OPINION:
+            return from_runner  # type: ignore[return-value]
+        return _FALLBACK_MODEL
 
     # ── Authorization (#781) ───────────────────────────────────────────────────
 
@@ -361,7 +396,7 @@ class SessionManageCog(commands.Cog):
 
         return respond, ack
 
-    # ── Model commands ────────────────────────────────────────────────────────
+    # ── Model commands ─────────────────────────────────────────────────────────
 
     async def _model_show_impl(self, *, channel: object, respond: _Responder) -> None:
         """Core of ``!model-show`` (the old ``/model show``): the table ``/model`` shows (#918)."""
@@ -385,27 +420,24 @@ class SessionManageCog(commands.Cog):
                 )
             )
             return
-        effective_model = await self._get_effective_model()
-
-        embed = discord.Embed(
-            title="🤖 Current Claude Model",
-            color=COLOR_INFO,
+        # Legacy rendering, for when the scope service cannot be built.
+        effective = await self._get_effective_model()
+        embed = discord.Embed(title="🤖 Current Claude Model", color=COLOR_INFO)
+        override = (
+            await self.settings_repo.get(SETTING_CLAUDE_MODEL) if self.settings_repo else None
         )
-
-        # Global / default model field
-        stored = await self.settings_repo.get(SETTING_CLAUDE_MODEL) if self.settings_repo else None
         runner = self._get_runner()
-        runner_model = getattr(runner, "model", "sonnet") if runner else "sonnet"
-        if stored:
+        runner_model = getattr(runner, "model", _FALLBACK_MODEL) if runner else _FALLBACK_MODEL
+        if override:
             embed.description = (
-                f"**Global override:** `{stored}`\n*(runner default: `{runner_model}`)*"
+                f"**Global override:** `{override}`\n*(runner default: `{runner_model}`)*"
             )
         else:
             embed.description = (
                 f"**Default model:** `{runner_model}`\n*(no override set — use `/model` to change)*"
             )
 
-        # Per-thread session model (if inside a thread)
+        # Inside a thread, also say which model that thread's session ran on.
         if isinstance(channel, discord.Thread):
             record = await self.repo.get(channel.id)
             if record and record.model:
@@ -415,7 +447,7 @@ class SessionManageCog(commands.Cog):
                     inline=False,
                 )
 
-        embed.set_footer(text=f"Effective model for new sessions: {effective_model}")
+        embed.set_footer(text=f"Effective model for new sessions: {effective}")
         await respond(embed=embed)
 
     @commands.command(name="model-show")
@@ -447,7 +479,9 @@ class SessionManageCog(commands.Cog):
 
         embed = discord.Embed(
             title="✅ Model Updated",
-            description=f"Global model set to **`{model}`**.\nAll new sessions will use this model.",  # noqa: E501
+            description=(
+                f"Global model set to **`{model}`**.\nAll new sessions will use this model."
+            ),
             color=COLOR_SUCCESS,
         )
         await respond(embed=embed)
@@ -819,9 +853,8 @@ class SessionManageCog(commands.Cog):
             return
         await self._thread_rename_impl(channel=ctx.channel, respond=respond, ack=ack)
 
-    # ------------------------------------------------------------------
+    # ── Workspace directories ──────────────────────────────────────────────────
     # Session directory commands
-    # ------------------------------------------------------------------
 
     def _get_session_dir_manager(self) -> SessionDirManager | None:
         """Return the SessionDirManager from the bot, if configured.
@@ -1170,7 +1203,7 @@ class SessionManageCog(commands.Cog):
 
         import asyncio
 
-        # Determine active thread IDs from the session registry
+        # Directories of threads with a live session are never reclaimed.
         active_ids: set[int] = set()
         if hasattr(self.bot, "session_registry"):
             active_ids = {s.thread_id for s in self.bot.session_registry.list_active()}
@@ -1198,8 +1231,8 @@ class SessionManageCog(commands.Cog):
                 dirs = await asyncio.to_thread(sdm.find_session_dirs)
                 all_dirs.extend(dirs)
 
-            candidates = []
-            skipped = []
+            candidates: list[SessionDirInfo] = []
+            skipped: list[tuple[SessionDirInfo, str]] = []
             for d in all_dirs:
                 if d.thread_id in active_ids:
                     skipped.append((d, "session is active"))
@@ -1245,9 +1278,7 @@ class SessionManageCog(commands.Cog):
             if not r.removed and not r.kept_work and r.reason != "session is still active"
         ]
 
-        color = COLOR_SUCCESS if removed else COLOR_INFO
-        if dirty:
-            color = COLOR_TOOL
+        color = _cleanup_color(removed=bool(removed), kept_work=bool(dirty))
 
         embed = discord.Embed(
             title="📁 ワークスペースの作業ディレクトリを回収しました",
@@ -1283,7 +1314,7 @@ class SessionManageCog(commands.Cog):
         description="使われていないワークスペースの作業ディレクトリを回収する",
     )
     @app_commands.describe(
-        dry_run="Preview what would be removed without actually removing anything",
+        dry_run="Preview what would be removed without actually removing anything"
     )
     async def workspace_cleanup(
         self,
@@ -1322,7 +1353,7 @@ class SessionManageCog(commands.Cog):
         description="(旧名) /workspace-cleanup と同じです",
     )
     @app_commands.describe(
-        dry_run="Preview what would be removed without actually removing anything",
+        dry_run="Preview what would be removed without actually removing anything"
     )
     async def session_cleanup(
         self,
