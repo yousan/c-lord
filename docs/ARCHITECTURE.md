@@ -79,7 +79,7 @@ notifications or start a session. It is not part of how an answer is delivered.
 
 | Module | Class | What it does |
 |--------|-------|--------------|
-| `claude_chat.py` | `ClaudeChatCog` | Core message handler. Listens for `on_message` in the configured channel and its child threads. Creates threads for new conversations, resumes sessions for thread replies. Manages concurrency via `asyncio.Semaphore`. Provides `/clear` slash command, which types Claude Code's own `/clear` into the pane (#803). |
+| `claude_chat.py` | `ClaudeChatCog` | Core message handler. `/clord <prompt>` (and `spawn_session()`, which `POST /api/spawn` also uses) creates the thread for a new conversation; `on_message` continues the session for replies in a thread c-lord already tracks. A plain message typed in the channel itself starts nothing — threads are opened on purpose, not by accident. Manages concurrency via `asyncio.Semaphore`. Provides `/clear` slash command, which types Claude Code's own `/clear` into the pane (#803). |
 | `skill_command.py` | `SkillCommandCog` | `/skill` (and its text twin `!skill`). Reads `SKILL.md` frontmatter under `~/.claude/skills/`, reloading at most every 60 s, and offers the names as Discord autocomplete. Opens a thread and runs `/<name> [args]` in it through `_run_helper`. |
 | `_run_helper.py` | `run_claude_with_config()` | Shared function extracted to avoid duplicating the Claude CLI run logic between ClaudeChatCog and SkillCommandCog. Drives one turn: iterates the runner's events and hands them to `EventProcessor` (status lamp, ask bridge, error embeds, session persistence). **It never posts the answer text** — that is the transcript mirror's job (#712). |
 | `event_processor.py` | `EventProcessor` | Turns the runner's SYSTEM / RESULT events into Discord side effects: saves the session record, bridges `pane_ask` menus to buttons, sets the 🟢/🟡/❌ lamp, posts error / usage-limit embeds. |
@@ -142,15 +142,17 @@ connection and closes it again; there is no pool to manage.
 ### A new conversation
 
 ```
-1. A person posts in the channel c-lord is bound to
+1. A person runs `/clord <prompt>` in a channel (or its text twin `!clord`, or a caller
+   uses POST /api/spawn). A plain message in the channel does not start a session.
    │
-2. ClaudeChatCog.on_message → authorized? → _handle_new_conversation()
-   ├── Create Discord thread (name = topic read off the message —
+2. ClaudeChatCog — authorized? → spawn_session()
+   ├── Create Discord thread (name = topic read off the prompt —
    │   one line, no markdown/URLs, … when cut; #721)
+   ├── post the prompt into it as the seed message (the lamp needs a message to sit on)
    │
 3. _run_claude()
    ├── semaphore: all slots busy → post "⏳ Waiting for a free session slot..."
-   ├── StatusManager on the user's message → 🟢
+   ├── StatusManager on the trigger (seed) message → 🟢
    ├── session_dir: git clone into c-lord-sessions/<ch>/<thread>/
    │   (+ prepare-commit-msg co-author hook, #518)
    ├── resolve_tmux_manager(channel_id, thread_id=…) → tmux window w<N>
