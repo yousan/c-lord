@@ -1,5 +1,4 @@
 """Optional extensions for c-lord.
-
-Extensions in this package may require additional dependencies.
+# <<REDACTED 2 lines>>
 Install with: pip install c-lord[api]
 """
