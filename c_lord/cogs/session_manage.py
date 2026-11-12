@@ -1,33 +1,23 @@
-"""Session management Cog.
-
-Provides slash commands for viewing and managing Claude Code sessions:
+# <<REDACTED 3 lines>>
 - /clord-status: Per-channel session status (size, attach, resume) — supersedes
   the removed /sessions, /session-dirs, /resume-info (#363)
 - /workspace-cleanup, /tmux-list, /tmux-screenshot, /workspace-delete, ...
-"""
-
-from __future__ import annotations
-
+# <<REDACTED 4 lines>>
 import contextlib
-import logging
+# <<REDACTED 1 lines>>
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-import discord
-from discord import app_commands
-from discord.ext import commands
-
+# <<REDACTED 6 lines>>
 from ..command_gate import NOT_AUTHORIZED, authorize_command
 from ..database.repository import SessionRecord, SessionRepository
-from ..database.settings_repo import SettingsRepository
+# <<REDACTED 1 lines>>
 from ..devenv import DevContainer, containers_for_session_dir, stop_containers
 from ..discord_ui.ask_handler import retire_menus_for_stop
 from ..discord_ui.authorization import Authorizer, get_default_authorizer
-from ..discord_ui.embeds import COLOR_INFO, COLOR_SUCCESS, COLOR_TOOL
+# <<REDACTED 1 lines>>
 from ..discord_ui.pane_renderer import render_pane_png
 from ..discord_ui.slash_io import slash_io
 from ..discord_ui.views import StatusShowAllView
@@ -68,13 +58,9 @@ from ..workspace_notice import (
     restored_devenv_notice,
     workspace_notice_embed,
 )
-
-if TYPE_CHECKING:
-    from ..bot import ClaudeDiscordBot
+# <<REDACTED 3 lines>>
     from ..tmux import TmuxSessionManager
-
-logger = logging.getLogger(__name__)
-
+# <<REDACTED 3 lines>>
 # Lets each command's core run from either a slash interaction or a !text twin
 # without duplicating the body (#209 follow-up).
 _Responder = Callable[..., Awaitable[None]]
@@ -124,20 +110,17 @@ def _fit_field_lines(lines: list[str], limit: int = _EMBED_FIELD_LIMIT) -> str:
     return "\n".join([*shown, tail]) if shown else tail
 
 
-# Model management
-SETTING_CLAUDE_MODEL = "claude_model"
+# <<REDACTED 2 lines>>
 
 # Tier aliases the Claude CLI resolves to the *latest* model of that tier
 # (``claude --help``: "Provide an alias for the latest model"). Labels are kept
 # version-agnostic on purpose — hardcoding "4.7"/"5" would go stale and mislead,
 # since the alias already tracks the latest (#478).
-_VALID_MODELS = {"haiku", "sonnet", "opus"}
-_MODEL_CHOICES = [
+# <<REDACTED 2 lines>>
     app_commands.Choice(name="Sonnet — latest balanced (default)", value="sonnet"),
     app_commands.Choice(name="Opus — most capable, deep reasoning", value="opus"),
     app_commands.Choice(name="Haiku — fastest, low cost", value="haiku"),
-]
-
+# <<REDACTED 2 lines>>
 _EFFORT_CHOICES = [
     app_commands.Choice(name=level, value=level)
     for level in ("low", "medium", "high", "xhigh", "max", "inherit")
@@ -195,7 +178,7 @@ def _format_duration(minutes: int) -> str:
         10080: "7 days",
     }.get(minutes, f"{minutes} min")
 
-
+# <<REDACTED 1 lines>>
 def _dir_size_bytes(path: str) -> int:
     """Disk usage of ``path`` in bytes via ``du -sb`` (never shell=True).
 
@@ -238,54 +221,22 @@ def _short_repo(source_repo: str | None) -> str:
     return "/".join(parts[-2:]) if len(parts) >= 2 else s
 
 
-class SessionManageCog(commands.Cog):
-    """Cog for session listing, resume info, and CLI sync commands."""
-
-    def __init__(
-        self,
-        bot: ClaudeDiscordBot,
-        repo: SessionRepository,
-        settings_repo: SettingsRepository | None = None,
-        runner: object | None = None,
+# <<REDACTED 9 lines>>
         devenv_repo: object | None = None,
         authorizer: Authorizer | None = None,
-    ) -> None:
-        self.bot = bot
-        self.repo = repo
-        self.settings_repo = settings_repo
+    # <<REDACTED 4 lines>>
         # #612: where the docker↔workspace link is written down. Optional so
         # consumers constructing the cog themselves keep working, but the
         # standard setup always passes it — without a call site, #573's
         # persistence layer was dead code and its table was never created.
         self._devenv_repo = devenv_repo
         # Optional ClaudeConfig reference for reading the default model.
-        # Resolved lazily from ClaudeChatCog if not provided directly.
-        self._runner = runner
+        # <<REDACTED 2 lines>>
         # #781: who may run these commands. Optional so consumers constructing
         # the cog themselves keep working — :meth:`_command_authorizer` then
         # finds the process's own one.
         self._authorizer = authorizer
-
-    def _get_runner(self) -> object | None:
-        """Return the runner, resolving it from ClaudeChatCog if not set directly."""
-        if self._runner is not None:
-            return self._runner
-        chat_cog = self.bot.get_cog("ClaudeChatCog")
-        if chat_cog is not None:
-            return getattr(chat_cog, "runner", None)
-        return None
-
-    async def _get_effective_model(self) -> str:
-        """Return the effective model: settings_repo override or runner default."""
-        if self.settings_repo is not None:
-            stored = await self.settings_repo.get(SETTING_CLAUDE_MODEL)
-            if stored:
-                return stored
-        runner = self._get_runner()
-        if runner is not None and hasattr(runner, "model"):
-            return runner.model  # type: ignore[return-value]
-        return "sonnet"
-
+# <<REDACTED 21 lines>>
     # ── Authorization (#781) ───────────────────────────────────────────────────
 
     def _command_authorizer(self) -> Authorizer | None:
@@ -361,8 +312,7 @@ class SessionManageCog(commands.Cog):
 
         return respond, ack
 
-    # ── Model commands ────────────────────────────────────────────────────────
-
+    # <<REDACTED 2 lines>>
     async def _model_show_impl(self, *, channel: object, respond: _Responder) -> None:
         """Core of ``!model-show`` (the old ``/model show``): the table ``/model`` shows (#918)."""
         svc = self._model_scopes()
@@ -379,43 +329,18 @@ class SessionManageCog(commands.Cog):
             )
             await respond(
                 embed=discord.Embed(
-                    title="🤖 Current Claude Model",
+                    # <<REDACTED 1 lines>>
                     description=render_view(view, svc),
                     color=COLOR_INFO,
                 )
             )
             return
-        effective_model = await self._get_effective_model()
-
-        embed = discord.Embed(
-            title="🤖 Current Claude Model",
-            color=COLOR_INFO,
-        )
-
-        # Global / default model field
-        stored = await self.settings_repo.get(SETTING_CLAUDE_MODEL) if self.settings_repo else None
-        runner = self._get_runner()
-        runner_model = getattr(runner, "model", "sonnet") if runner else "sonnet"
-        if stored:
-            embed.description = (
-                f"**Global override:** `{stored}`\n*(runner default: `{runner_model}`)*"
-            )
-        else:
-            embed.description = (
+        # <<REDACTED 17 lines>>
                 f"**Default model:** `{runner_model}`\n*(no override set — use `/model` to change)*"
-            )
-
-        # Per-thread session model (if inside a thread)
+            # <<REDACTED 3 lines>>
         if isinstance(channel, discord.Thread):
             record = await self.repo.get(channel.id)
-            if record and record.model:
-                embed.add_field(
-                    name="This thread's last session",
-                    value=f"`{record.model}`",
-                    inline=False,
-                )
-
-        embed.set_footer(text=f"Effective model for new sessions: {effective_model}")
+            # <<REDACTED 8 lines>>
         await respond(embed=embed)
 
     @commands.command(name="model-show")
@@ -423,7 +348,7 @@ class SessionManageCog(commands.Cog):
         """Text/mention twin of /model show — webhook-invokable for E2E (#209)."""
         respond, _ = self._ctx_io(ctx)
         await self._model_show_impl(channel=ctx.channel, respond=respond)
-
+# <<REDACTED 1 lines>>
     async def _model_set_impl(self, *, model: str, respond: _Responder) -> None:
         """Core of ``!model-set``: set the global model (the old ``/model set``)."""
         model = (model or "").strip()
@@ -432,24 +357,9 @@ class SessionManageCog(commands.Cog):
                 f"❌ Invalid model `{model}`. Use an alias "
                 f"({'/'.join(sorted(_VALID_MODELS))}) or a model ID like "
                 "`claude-fable-5` (letters, digits, `.` `-` `_`; no spaces).",
-                ephemeral=True,
-            )
-            return
-
-        if self.settings_repo is None:
+                # <<REDACTED 5 lines>>
             await respond(
-                "❌ Settings repository is unavailable — model cannot be persisted.",
-                ephemeral=True,
-            )
-            return
-
-        await self.settings_repo.set(SETTING_CLAUDE_MODEL, model)
-
-        embed = discord.Embed(
-            title="✅ Model Updated",
-            description=f"Global model set to **`{model}`**.\nAll new sessions will use this model.",  # noqa: E501
-            color=COLOR_SUCCESS,
-        )
+                # <<REDACTED 12 lines>>
         await respond(embed=embed)
 
     async def _model_autocomplete(
@@ -677,7 +587,7 @@ class SessionManageCog(commands.Cog):
             )
             return
         await self._model_set_impl(model=model, respond=respond)
-
+# <<REDACTED 1 lines>>
     # ── Thread auto-archive duration commands ──────────────────────────────────
 
     thread_archive_group = app_commands.Group(
@@ -697,8 +607,7 @@ class SessionManageCog(commands.Cog):
         embed = discord.Embed(title="🗂️ Thread Auto-Archive Duration", color=COLOR_INFO)
         if stored:
             embed.description = f"**Configured:** {_format_duration(effective)} (`{effective}` min)"
-        else:
-            embed.description = (
+        # <<REDACTED 2 lines>>
                 f"**Default:** {_format_duration(effective)} (`{effective}` min)\n"
                 "*(no override set — use `/thread-archive set` to change)*"
             )
@@ -723,11 +632,7 @@ class SessionManageCog(commands.Cog):
             valid = ", ".join(str(d) for d in VALID_DURATIONS)
             await respond(
                 f"❌ Invalid duration `{duration}`. Discord only accepts: {valid} (minutes).",
-                ephemeral=True,
-            )
-            return
-
-        if self.settings_repo is None:
+                # <<REDACTED 5 lines>>
             await respond(
                 "❌ Settings repository is unavailable — duration cannot be persisted.",
                 ephemeral=True,
@@ -745,7 +650,7 @@ class SessionManageCog(commands.Cog):
             color=COLOR_SUCCESS,
         )
         await respond(embed=embed)
-
+# <<REDACTED 1 lines>>
     @thread_archive_group.command(
         name="set", description="Change how long new threads stay active before archiving"
     )
@@ -819,10 +724,9 @@ class SessionManageCog(commands.Cog):
             return
         await self._thread_rename_impl(channel=ctx.channel, respond=respond, ack=ack)
 
-    # ------------------------------------------------------------------
+    # <<REDACTED 1 lines>>
     # Session directory commands
-    # ------------------------------------------------------------------
-
+    # <<REDACTED 2 lines>>
     def _get_session_dir_manager(self) -> SessionDirManager | None:
         """Return the SessionDirManager from the bot, if configured.
 
@@ -875,7 +779,7 @@ class SessionManageCog(commands.Cog):
         if channel_cog is not None and isinstance(channel_cog, ChannelRepoCog):
             return await channel_cog._repo.list_all()
         return []
-
+# <<REDACTED 1 lines>>
     # ── /clord-status (#363) ────────────────────────────────────────────────
     # One per-channel view that supersedes /sessions, /session-dirs, /resume-info.
     # docker ps model: default = live only, `all` = live + closed; deleted (no
@@ -884,7 +788,7 @@ class SessionManageCog(commands.Cog):
     @staticmethod
     def _resume_uuid_for(working_dir: str | None) -> str:
         """Real ``claude --resume`` id for a session = its transcript jsonl stem.
-
+# <<REDACTED 1 lines>>
         The DB ``session_id`` is ``tmux-…`` for tmux-managed sessions (not a
         resumable id), so the actual Claude session uuid is recovered from
         ``~/.claude/projects/<slug>/<uuid>.jsonl`` (#363).
@@ -893,7 +797,7 @@ class SessionManageCog(commands.Cog):
             return ""
         jsonl = latest_session_jsonl(derive_project_dir(working_dir))
         return jsonl.stem if jsonl is not None else ""
-
+# <<REDACTED 1 lines>>
     async def _clord_status_impl(
         self,
         *,
@@ -915,13 +819,13 @@ class SessionManageCog(commands.Cog):
         cannot answer privately, so it keeps the channel-wide view.
         """
         from datetime import datetime
-
+# <<REDACTED 1 lines>>
         channel_id = getattr(channel, "id", None)
         parent_id = getattr(channel, "parent_id", None) or channel_id
         if parent_id is None:
             await respond("This command must be used in a server channel.", ephemeral=True)
             return
-
+# <<REDACTED 1 lines>>
         sdm = await self._resolve_session_dir_manager(parent_id)
         # Resolved only to answer "is this channel bound to a repo at all?".
         # #616: it must NOT decide which session a row is in — after #615 the
@@ -932,11 +836,9 @@ class SessionManageCog(commands.Cog):
                 "ℹ️ このチャンネルにはリポジトリが紐づけられていません。"
                 " `/clord-init` で設定してください。",
                 ephemeral=True,
-            )
-            return
-
+            # <<REDACTED 3 lines>>
         await ack()
-
+# <<REDACTED 1 lines>>
         in_thread = isinstance(channel, discord.Thread) and channel_id != parent_id
         channel_name = getattr(getattr(channel, "parent", None), "name", None) or getattr(
             channel, "name", str(parent_id)
@@ -1153,28 +1055,19 @@ class SessionManageCog(commands.Cog):
         await self._clord_status_impl(
             channel=ctx.channel, show_all=show_all, respond=respond, ack=ack
         )
-
+# <<REDACTED 1 lines>>
     async def _workspace_cleanup_impl(
         self, *, dry_run: bool, respond: _Responder, ack: _Acknowledger
-    ) -> None:
+    # <<REDACTED 1 lines>>
         """Shared core for /workspace-cleanup and its /session-cleanup alias (#209, #578)."""
         bindings = await self._get_all_bindings()
         if not bindings:
             await respond(
                 "❌ No channel-repo bindings configured. Use `/clord-init` first.",
                 ephemeral=True,
-            )
-            return
-
+            # <<REDACTED 3 lines>>
         await ack()
-
-        import asyncio
-
-        # Determine active thread IDs from the session registry
-        active_ids: set[int] = set()
-        if hasattr(self.bot, "session_registry"):
-            active_ids = {s.thread_id for s in self.bot.session_registry.list_active()}
-
+# <<REDACTED 8 lines>>
         # Collect managers from all bindings
         managers: list[SessionDirManager] = []
         for binding in bindings:
@@ -1192,87 +1085,53 @@ class SessionManageCog(commands.Cog):
             )
             return
 
-        if dry_run:
+        # <<REDACTED 1 lines>>
             all_dirs = []
             for sdm in managers:
                 dirs = await asyncio.to_thread(sdm.find_session_dirs)
                 all_dirs.extend(dirs)
-
-            candidates = []
-            skipped = []
+# <<REDACTED 3 lines>>
             for d in all_dirs:
                 if d.thread_id in active_ids:
                     skipped.append((d, "session is active"))
-                    continue
+                    # <<REDACTED 1 lines>>
                 if d.is_clean:
                     candidates.append(d)
-                else:
+                # <<REDACTED 1 lines>>
                     # #1016: the same reason the real run would give.
                     skipped.append((d, d.kept_reason or "dirty"))
-
-            embed = discord.Embed(
+# <<REDACTED 2 lines>>
                 title="📁 ワークスペースの作業ディレクトリ回収 — Dry Run",
-                color=COLOR_INFO,
-            )
-            if candidates:
-                embed.add_field(
-                    name=f"Would remove ({len(candidates)})",
+                # <<REDACTED 5 lines>>
                     value=_fit_field_lines([f"`{d.path}`" for d in candidates]),
-                    inline=False,
-                )
-            if skipped:
-                embed.add_field(
-                    name=f"Would skip ({len(skipped)})",
+                    # <<REDACTED 5 lines>>
                     value=_fit_field_lines([f"`{d.path}` — {reason}" for d, reason in skipped]),
-                    inline=False,
-                )
-            if not candidates and not skipped:
+                    # <<REDACTED 3 lines>>
                 embed.description = "作業ディレクトリが見つかりませんでした。"
-            embed.set_footer(text="Re-run without dry_run=True to actually remove.")
+            # <<REDACTED 1 lines>>
             await respond(embed=embed)
-            return
-
+            # <<REDACTED 2 lines>>
         all_results = []
         for sdm in managers:
             results = await asyncio.to_thread(sdm.cleanup_orphaned, active_ids)
             all_results.extend(results)
-
+# <<REDACTED 1 lines>>
         removed = [r for r in all_results if r.removed]
         dirty = [r for r in all_results if r.kept_work]
-        other_skipped = [
-            r
+        # <<REDACTED 2 lines>>
             for r in all_results
             if not r.removed and not r.kept_work and r.reason != "session is still active"
-        ]
-
-        color = COLOR_SUCCESS if removed else COLOR_INFO
-        if dirty:
-            color = COLOR_TOOL
-
-        embed = discord.Embed(
+        # <<REDACTED 7 lines>>
             title="📁 ワークスペースの作業ディレクトリを回収しました",
-            color=color,
-        )
-        embed.add_field(
-            name=f"✅ Removed ({len(removed)})",
+            # <<REDACTED 4 lines>>
             value=_fit_field_lines([f"`{r.path}`" for r in removed]),
-            inline=False,
-        )
-        if dirty:
-            embed.add_field(
-                name=f"⚠️ Dirty — not removed ({len(dirty)})",
+            # <<REDACTED 5 lines>>
                 value=_fit_field_lines([f"`{r.path}` — {r.reason}" for r in dirty]),
-                inline=False,
-            )
-        if other_skipped:
-            embed.add_field(
-                name=f"ℹ️ Skipped ({len(other_skipped)})",
+                # <<REDACTED 5 lines>>
                 value=_fit_field_lines([f"`{r.path}` — {r.reason}" for r in other_skipped]),
-                inline=False,
-            )
-
+                # <<REDACTED 3 lines>>
         await respond(embed=embed)
-
+# <<REDACTED 1 lines>>
     @staticmethod
     def _dry_run_arg(arg: str | None) -> bool:
         """``dry`` / ``dry-run`` / ``true`` / ``1`` all mean "preview only"."""
@@ -1281,15 +1140,9 @@ class SessionManageCog(commands.Cog):
     @app_commands.command(
         name="workspace-cleanup",
         description="使われていないワークスペースの作業ディレクトリを回収する",
-    )
-    @app_commands.describe(
-        dry_run="Preview what would be removed without actually removing anything",
-    )
+    # <<REDACTED 4 lines>>
     async def workspace_cleanup(
-        self,
-        interaction: discord.Interaction,
-        dry_run: bool = False,
-    ) -> None:
+        # <<REDACTED 4 lines>>
         """Reclaim the working directories of workspaces nothing is using (#578).
 
         Renamed from ``/session-cleanup``. What it removes is the **作業
@@ -1317,18 +1170,12 @@ class SessionManageCog(commands.Cog):
             return
         await self._workspace_cleanup_impl(dry_run=self._dry_run_arg(arg), respond=respond, ack=ack)
 
-    @app_commands.command(
+    # <<REDACTED 1 lines>>
         name="session-cleanup",
         description="(旧名) /workspace-cleanup と同じです",
-    )
-    @app_commands.describe(
-        dry_run="Preview what would be removed without actually removing anything",
-    )
+    # <<REDACTED 4 lines>>
     async def session_cleanup(
-        self,
-        interaction: discord.Interaction,
-        dry_run: bool = False,
-    ) -> None:
+        # <<REDACTED 4 lines>>
         """Old name for :meth:`workspace_cleanup`, kept working (#578).
 
         Same implementation, so there is nothing to keep in sync — and the
@@ -1463,11 +1310,7 @@ class SessionManageCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
-
+                # <<REDACTED 5 lines>>
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
@@ -1659,10 +1502,7 @@ class SessionManageCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
+                # <<REDACTED 4 lines>>
 
         if await self._answered_as_foreign_thread(channel, respond):
             return
@@ -1873,11 +1713,7 @@ class SessionManageCog(commands.Cog):
         """Shared core for /workspace-delete and !workspace-delete (#209 follow-up)."""
         if not isinstance(channel, discord.Thread):
             await respond(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
-
+                # <<REDACTED 5 lines>>
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
@@ -1930,7 +1766,7 @@ class SessionManageCog(commands.Cog):
             color=COLOR_SUCCESS,
         )
         await respond(embed=embed)
-
+# <<REDACTED 1 lines>>
     @app_commands.command(
         name="workspace-delete",
         description="Stop this thread (turn, tmux window, docker) and delete its session directory",
@@ -2175,11 +2011,7 @@ class SessionManageCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
-
+                # <<REDACTED 5 lines>>
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
@@ -2226,7 +2058,7 @@ class SessionManageCog(commands.Cog):
         # The rename lost too: Discord refuses to rename an archived thread
         # (code 50083), so the ``[停止]`` marker never landed either.
         await respond(embed=embed)
-
+# <<REDACTED 1 lines>>
         new_name = await apply_closed_name(self.repo, channel)
         if new_name:
             logger.info(
@@ -2301,10 +2133,7 @@ class SessionManageCog(commands.Cog):
         """
         if not isinstance(channel, discord.Thread):
             await respond(
-                "This command can only be used in a Claude chat thread.",
-                ephemeral=True,
-            )
-            return
+                # <<REDACTED 4 lines>>
 
         if await self._answered_as_foreign_thread(channel, respond):
             return
@@ -2358,8 +2187,7 @@ class SessionManageCog(commands.Cog):
         embed = discord.Embed(
             title="▶️ このスレッドのワークスペースを再開しました",
             description="\n".join(lines),
-            color=COLOR_SUCCESS,
-        )
+            # <<REDACTED 2 lines>>
         await respond(embed=embed)
 
     @app_commands.command(
