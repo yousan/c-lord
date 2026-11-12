@@ -1,14 +1,37 @@
-# <<REDACTED 4 lines>>
+"""Sessions: which Claude Code session each Discord thread continues.
+
+One row of ``sessions`` per thread. Besides the row, the repository keeps a
+little in-memory state about each thread's trigger message — writes and clears
+the database refused, so that they still hold for this process and land later.
+"""
+
+from __future__ import annotations
+
 import itertools
-# <<REDACTED 1 lines>>
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
-# <<REDACTED 3 lines>>
+
+import aiosqlite
+
 from ..utils.logger import log_ctx
-# <<REDACTED 2 lines>>
+from . import _sqlite
+
+logger = logging.getLogger(__name__)
 
 
-# <<REDACTED 12 lines>>
+@dataclass
+class SessionRecord:
+    """A row of ``sessions``, column for column."""
+
+    thread_id: int
+    session_id: str
+    working_dir: str | None
+    model: str | None
+    origin: str
+    summary: str | None
+    created_at: str
+    last_used_at: str
     # Issue #95: thread naming redesign
     topic: str | None = None
     state: str | None = "alive"
@@ -44,7 +67,8 @@ from ..utils.logger import log_ctx
     # workspace comes back silently, a crashed one announces itself (#464).
     # Whether to resume is still decided by "is the pane alive?" alone.
     slept_at: str | None = None
-# <<REDACTED 2 lines>>
+
+
 #: #818: ``closed_reason`` of a row the 30-day sweep tidied away.
 #:
 #: The sweep used to ``DELETE`` the row, and with it the only link from a
@@ -86,7 +110,11 @@ def _record(row) -> SessionRecord:
     return SessionRecord(**{k: v for k, v in dict(row).items() if k in known})
 
 
-# <<REDACTED 5 lines>>
+class SessionRepository:
+    """Async access to ``sessions``, plus the per-thread trigger bookkeeping."""
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
         # #1212: a thread's first turn records its trigger before the session
         # row exists (the row comes with the turn's SYSTEM event), so the
         # UPDATE had nothing to write. Held here until ``save`` creates the row.
@@ -113,12 +141,25 @@ def _record(row) -> SessionRecord:
         # one landed must not be kept to be written over it.
         self._write_order = itertools.count()
         self._latest_write: dict[int, int] = {}
-# <<REDACTED 2 lines>>
+
+    async def _write(self, sql: str, params: _sqlite.Params = ()) -> _sqlite.Written:
+        """Run one statement on a connection of its own and commit it."""
+        return await _sqlite.write(self.db_path, sql, params)
+
+    async def _records(self, sql: str, params: _sqlite.Params = ()) -> list[SessionRecord]:
+        """The rows of a ``SELECT *`` as records."""
+        rows = await _sqlite.read_all(self.db_path, sql, params, named=True)
+        return [_record(row) for row in rows]
+
+    async def get(self, thread_id: int) -> SessionRecord | None:
         """Get session by Discord thread ID. A swept tombstone (#818) is not one."""
-        # <<REDACTED 3 lines>>
-                f"SELECT * FROM sessions WHERE thread_id = ? AND {_LIVE}",
-                # <<REDACTED 5 lines>>
-            record = _record(row)
+        found = await self._records(
+            f"SELECT * FROM sessions WHERE thread_id = ? AND {_LIVE}",
+            (thread_id,),
+        )
+        if not found:
+            return None
+        record = found[0]
         # #1254: a trigger write the database refused still holds for this process.
         if thread_id in self._unwritten_triggers:
             record.trigger_message_id = self._unwritten_triggers[thread_id]
@@ -126,7 +167,7 @@ def _record(row) -> SessionRecord:
         if record.trigger_message_id in self._unapplied_clears.get(thread_id, ()):
             record.trigger_message_id = None
         return record
-# <<REDACTED 1 lines>>
+
     async def get_swept(self, thread_id: int) -> SessionRecord | None:
         """The tombstone the 30-day sweep left for ``thread_id``, or ``None`` — #818.
 
@@ -134,13 +175,40 @@ def _record(row) -> SessionRecord:
         ``session_id``, and when (``closed_at``) it was tidied away. ``None`` for
         a live or stopped row — those are :meth:`get`'s.
         """
-        # <<REDACTED 3 lines>>
-                "SELECT * FROM sessions WHERE thread_id = ? AND closed_reason = ?",
-                (thread_id, SWEPT_REASON),
-            # <<REDACTED 2 lines>>
-            return None if row is None else _record(row)
+        found = await self._records(
+            "SELECT * FROM sessions WHERE thread_id = ? AND closed_reason = ?",
+            (thread_id, SWEPT_REASON),
+        )
+        return found[0] if found else None
 
-    # <<REDACTED 21 lines>>
+    async def save(
+        self,
+        thread_id: int,
+        session_id: str,
+        working_dir: str | None = None,
+        model: str | None = None,
+        origin: str = "discord",
+        summary: str | None = None,
+    ) -> SessionRecord:
+        """Record that *thread_id* now continues *session_id*; return the row.
+
+        A new thread gets a new row. For a known thread the session id is
+        replaced, the other values only where one is given (``None`` keeps what
+        the row had), and the row counts as used now. Trigger writes and clears
+        that were waiting for this thread go into the same transaction.
+        """
+        async with _sqlite.connection(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO sessions
+                    (thread_id, session_id, working_dir, model, origin, summary)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                     session_id = excluded.session_id,
+                     working_dir = COALESCE(excluded.working_dir, sessions.working_dir),
+                     model = COALESCE(excluded.model, sessions.model),
+                     origin = COALESCE(excluded.origin, sessions.origin),
+                     summary = COALESCE(excluded.summary, sessions.summary),
                      -- A turn is starting, so this workspace is awake by
                      -- definition. Clearing it here rather than at each call
                      -- site means no turn path (scheduler, skill, webhook) can
@@ -154,7 +222,8 @@ def _record(row) -> SessionRecord:
                                  THEN NULL ELSE sessions.closed_at END,
                      closed_reason = CASE WHEN sessions.closed_reason = ?
                                      THEN NULL ELSE sessions.closed_reason END,
-                     # <<REDACTED 1 lines>>
+                     last_used_at = datetime('now', 'localtime')
+                """,
                 (
                     thread_id,
                     session_id,
@@ -165,7 +234,7 @@ def _record(row) -> SessionRecord:
                     SWEPT_REASON,
                     SWEPT_REASON,
                 ),
-            # <<REDACTED 1 lines>>
+            )
             clear = self._unapplied_clears.get(thread_id)
             if clear:
                 await self._execute_clear(db, thread_id, clear)
@@ -181,20 +250,27 @@ def _record(row) -> SessionRecord:
                     "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
                     (unwritten, thread_id),
                 )
-            # <<REDACTED 1 lines>>
+            await db.commit()
         if clear and self._unapplied_clears.get(thread_id) == clear:
             self._unapplied_clears.pop(thread_id, None)
         if unwritten is not _NOTHING and self._unwritten_triggers.get(thread_id, _NOTHING) == (
             unwritten
         ):
             self._unwritten_triggers.pop(thread_id, None)
-# <<REDACTED 6 lines>>
+        saved = await self.get(thread_id)
+        if saved is None:
+            raise RuntimeError(f"Failed to retrieve session after save for thread {thread_id}")
+        return saved
+
     async def list_all(self, limit: int = 50) -> list[SessionRecord]:
-        # <<REDACTED 8 lines>>
-                f"SELECT * FROM sessions WHERE {_LIVE} ORDER BY last_used_at DESC LIMIT ?",
-                # <<REDACTED 3 lines>>
-            return [_record(row) for row in rows]
-# <<REDACTED 2 lines>>
+        """Up to *limit* sessions, most recently used first. Swept tombstones
+        (#818) are not sessions and are left out."""
+        return await self._records(
+            f"SELECT * FROM sessions WHERE {_LIVE} ORDER BY last_used_at DESC LIMIT ?",
+            (limit,),
+        )
+
+    async def delete(self, thread_id: int) -> bool:
         """Delete a session mapping. Returns True if a row was deleted.
 
         The thread's in-memory trigger state goes with it (#1254): a kept write,
@@ -210,17 +286,23 @@ def _record(row) -> SessionRecord:
             self._latest_write,
         ):
             held.pop(thread_id, None)
-        # <<REDACTED 8 lines>>
+        done = await self._write("DELETE FROM sessions WHERE thread_id = ?", (thread_id,))
+        return done.changed
+
     async def reset(self, thread_id: int) -> bool:
         """Clear the session_id but keep the row, so the next message starts fresh.
 
         Used by /clear: the row's existence is what allows on_message to route
         future messages into _handle_thread_reply (issue #117).
         Returns True if a row was updated, False if no row existed.
-        # <<REDACTED 3 lines>>
-                "UPDATE sessions SET session_id = '', last_used_at = datetime('now', 'localtime')"
-                f" WHERE thread_id = ? AND {_LIVE}",
-                # <<REDACTED 5 lines>>
+        """
+        done = await self._write(
+            "UPDATE sessions SET session_id = '', last_used_at = datetime('now', 'localtime')"
+            f" WHERE thread_id = ? AND {_LIVE}",
+            (thread_id,),
+        )
+        return done.changed
+
     # ── Issue #95: thread naming redesign helpers ─────────────────────
 
     async def get_by_thread_id(self, thread_id: int) -> SessionRecord | None:
@@ -229,34 +311,31 @@ def _record(row) -> SessionRecord:
 
     async def set_topic(self, thread_id: int, topic: str, source: str = "llm") -> None:
         """Set the stable topic and topic_source for a thread."""
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET topic = ?, topic_source = ? WHERE thread_id = ?",
-                (topic, source, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET topic = ?, topic_source = ? WHERE thread_id = ?",
+            (topic, source, thread_id),
+        )
 
     async def set_state(self, thread_id: int, state: str) -> None:
         """Set the session state (alive/pending/dead)."""
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET state = ? WHERE thread_id = ?",
-                (state, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET state = ? WHERE thread_id = ?",
+            (state, thread_id),
+        )
 
     async def set_tmux_window_id(self, thread_id: int, window_id: str | None) -> None:
         """Store the tmux internal window-id (e.g. '@7') for the thread."""
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET tmux_window_id = ? WHERE thread_id = ?",
-                (window_id, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET tmux_window_id = ? WHERE thread_id = ?",
+            (window_id, thread_id),
+        )
 
     async def lock_topic(self, thread_id: int) -> None:
         """Mark the topic as user-locked (no further auto-rewrite)."""
-        # <<REDACTED 1 lines>>
-            await db.execute(
-                "UPDATE sessions SET auto_topic_locked = 1 WHERE thread_id = ?",
-                # <<REDACTED 3 lines>>
+        await self._write(
+            "UPDATE sessions SET auto_topic_locked = 1 WHERE thread_id = ?",
+            (thread_id,),
+        )
 
     async def set_issue_ref(self, thread_id: int, issue_ref: str | None) -> None:
         """Persist the Issue/PR number the thread is working on (Issue #414).
@@ -270,14 +349,13 @@ def _record(row) -> SessionRecord:
         Keeping it here rather than at the call sites means every path that
         records a number (naming pass, pending drain, API) seeds the origin.
         """
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions "
-                "   SET issue_ref = ?, "
-                "       origin_issue_ref = COALESCE(origin_issue_ref, ?) "
-                " WHERE thread_id = ?",
-                (issue_ref, issue_ref, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions "
+            "   SET issue_ref = ?, "
+            "       origin_issue_ref = COALESCE(origin_issue_ref, ?) "
+            " WHERE thread_id = ?",
+            (issue_ref, issue_ref, thread_id),
+        )
 
     async def set_origin_issue_ref(self, thread_id: int, origin_issue_ref: str) -> None:
         """Seed ``origin_issue_ref`` (#593) without touching ``issue_ref`` (#856).
@@ -287,12 +365,11 @@ def _record(row) -> SessionRecord:
         it must not move ``issue_ref``. Write-once like :meth:`set_issue_ref` —
         an origin already recorded is never replaced.
         """
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET origin_issue_ref = COALESCE(origin_issue_ref, ?) "
-                " WHERE thread_id = ?",
-                (origin_issue_ref, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET origin_issue_ref = COALESCE(origin_issue_ref, ?) "
+            " WHERE thread_id = ?",
+            (origin_issue_ref, thread_id),
+        )
 
     async def set_closed(self, thread_id: int, closed: bool, *, reason: str = "manual") -> None:
         """Mark the workspace stopped (停止) or reopen it (#512, #574).
@@ -309,7 +386,8 @@ def _record(row) -> SessionRecord:
         say **why** it happened. It is never consulted to decide *whether* the
         workspace is stopped — ``closed_at`` alone answers that, so the two
         cannot drift apart.
-        # <<REDACTED 2 lines>>
+        """
+        async with _sqlite.connection(self.db_path) as db:
             if closed:
                 await db.execute(
                     "UPDATE sessions SET closed_at = datetime('now', 'localtime'), "
@@ -338,7 +416,8 @@ def _record(row) -> SessionRecord:
         decided by "is the pane alive?", exactly as before, so a stale value here
         can never resume (or refuse to resume) anything — the same discipline as
         ``closed_reason``.
-        # <<REDACTED 2 lines>>
+        """
+        async with _sqlite.connection(self.db_path) as db:
             if slept:
                 await db.execute(
                     "UPDATE sessions SET slept_at = datetime('now', 'localtime') "
@@ -374,12 +453,10 @@ def _record(row) -> SessionRecord:
         the honest answer is still "this was slept". The caller clears it once
         the wake succeeds.
         """
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET last_used_at = datetime('now', 'localtime') "
-                "WHERE thread_id = ?",
-                (thread_id,),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET last_used_at = datetime('now', 'localtime') WHERE thread_id = ?",
+            (thread_id,),
+        )
 
     async def update_trigger_message(self, thread_id: int, message_id: int) -> None:
         """Persist the Discord message ID that triggered the current Claude turn.
@@ -395,11 +472,10 @@ def _record(row) -> SessionRecord:
         """
         order = next(self._write_order)
         try:
-            # <<REDACTED 2 lines>>
-                    "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
-                    (message_id, thread_id),
-                )
-                await db.commit()
+            done = await self._write(
+                "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
+                (message_id, thread_id),
+            )
         except Exception:
             # Kept only when no write that started after it landed or was kept.
             if self._note_latest_write(thread_id, order):
@@ -411,7 +487,7 @@ def _record(row) -> SessionRecord:
         if not self._note_latest_write(thread_id, order):
             return  # a newer write is kept and still waiting to land
         self._unwritten_triggers.pop(thread_id, None)
-        if cursor.rowcount == 0:
+        if not done.changed:
             # #1212: no row yet (first turn) — written by ``save`` when it comes.
             self._pending_triggers[thread_id] = message_id
             while len(self._pending_triggers) > 1000:
@@ -513,7 +589,7 @@ def _record(row) -> SessionRecord:
         self._unapplied_clears[thread_id] = waiting | among
         while len(self._unapplied_clears) > 1000:
             self._unapplied_clears.pop(next(iter(self._unapplied_clears)))
-        # <<REDACTED 1 lines>>
+        async with _sqlite.connection(self.db_path) as db:
             await self._execute_clear(db, thread_id, among)
             await db.commit()
         left = self._unapplied_clears.get(thread_id, frozenset()) - among
@@ -538,12 +614,11 @@ def _record(row) -> SessionRecord:
             return None
         if self._unwritten_triggers.get(thread_id) == replacing:
             self._unwritten_triggers[thread_id] = sent  # #1254: not written yet either
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET trigger_message_id = ?"
-                " WHERE thread_id = ? AND trigger_message_id = ?",
-                (sent, thread_id, replacing),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET trigger_message_id = ?"
+            " WHERE thread_id = ? AND trigger_message_id = ?",
+            (sent, thread_id, replacing),
+        )
         return sent
 
     def clear_is_waiting(self, thread_id: int, message_id: int) -> bool:
@@ -560,11 +635,10 @@ def _record(row) -> SessionRecord:
         """
         for thread_id, value in list(self._unwritten_triggers.items()):
             try:
-                # <<REDACTED 2 lines>>
-                        "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
-                        (value, thread_id),
-                    )
-                    await db.commit()
+                await self._write(
+                    "UPDATE sessions SET trigger_message_id = ? WHERE thread_id = ?",
+                    (value, thread_id),
+                )
             except Exception:
                 logger.warning(
                     "%s could not write the trigger message %s at shutdown (#1254)",
@@ -577,7 +651,7 @@ def _record(row) -> SessionRecord:
                 del self._unwritten_triggers[thread_id]
         for thread_id, among in list(self._unapplied_clears.items()):
             try:
-                # <<REDACTED 1 lines>>
+                async with _sqlite.connection(self.db_path) as db:
                     await self._execute_clear(db, thread_id, among)
                     await db.commit()
             except Exception:
@@ -621,11 +695,10 @@ def _record(row) -> SessionRecord:
         Used by TranscriptMirror (live) and TranscriptMirrorCog (restart
         recovery) to dedupe re-delivery of a dropped final answer (Issue #215).
         """
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET mirror_replied_uuid = ? WHERE thread_id = ?",
-                (uuid, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET mirror_replied_uuid = ? WHERE thread_id = ?",
+            (uuid, thread_id),
+        )
 
     async def set_rename_backoff_until(self, thread_id: int, deadline: str | None) -> None:
         """Persist the state-sync rename rate-limit deadline (Issue #281).
@@ -635,19 +708,16 @@ def _record(row) -> SessionRecord:
         rename window instead of forgetting the in-memory backoff and re-PATCHing
         within the window (429).
         """
-        # <<REDACTED 2 lines>>
-                "UPDATE sessions SET rename_backoff_until = ? WHERE thread_id = ?",
-                (deadline, thread_id),
-            )
-            await db.commit()
+        await self._write(
+            "UPDATE sessions SET rename_backoff_until = ? WHERE thread_id = ?",
+            (deadline, thread_id),
+        )
 
     async def list_alive(self) -> list[SessionRecord]:
         """List sessions whose state is 'alive'."""
-        # <<REDACTED 3 lines>>
-                f"SELECT * FROM sessions WHERE state = 'alive' AND {_LIVE} "
-                "ORDER BY last_used_at DESC"
-            # <<REDACTED 2 lines>>
-            return [_record(row) for row in rows]
+        return await self._records(
+            f"SELECT * FROM sessions WHERE state = 'alive' AND {_LIVE} ORDER BY last_used_at DESC"
+        )
 
     async def open_thread_ids(self) -> set[int]:
         """Thread ids whose workspace is **not** stopped — the live ones.
@@ -664,10 +734,12 @@ def _record(row) -> SessionRecord:
         Only rows are listed. A thread with no row at all is invisible here, and
         must stay archivable by name: 7 of the 186 threads found on 2026-09-04
         had lost their row, and a DB-driven sweep would strand them forever.
-        # <<REDACTED 3 lines>>
-                "SELECT thread_id FROM sessions WHERE closed_at IS NULL OR TRIM(closed_at) = ''"
-            # <<REDACTED 2 lines>>
-            return {int(row[0]) for row in rows if row[0] is not None}
+        """
+        rows = await _sqlite.read_all(
+            self.db_path,
+            "SELECT thread_id FROM sessions WHERE closed_at IS NULL OR TRIM(closed_at) = ''",
+        )
+        return {int(row[0]) for row in rows if row[0] is not None}
 
     async def all_working_dirs(self) -> set[str]:
         """Every ``working_dir`` any row still claims — closed rows included.
@@ -681,10 +753,12 @@ def _record(row) -> SessionRecord:
         #818 their rows were deleted, so a directory the 30-day sweep kept
         (uncommitted work) was already an orphan to #613 — keeping the row as
         history must not quietly change that.
-        # <<REDACTED 3 lines>>
-                f"SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL AND {_LIVE}"
-            # <<REDACTED 2 lines>>
-            return {row[0] for row in rows if row[0]}
+        """
+        rows = await _sqlite.read_all(
+            self.db_path,
+            f"SELECT working_dir FROM sessions WHERE working_dir IS NOT NULL AND {_LIVE}",
+        )
+        return {row[0] for row in rows if row[0]}
 
     async def cleanup_old(self, days: int = 30) -> list[SessionRecord]:
         """Mark sessions unused for N days as swept. Returns the rows it marked.
@@ -703,7 +777,7 @@ def _record(row) -> SessionRecord:
         excluded, or every restart would announce the same sweep again.
         """
         where = f" WHERE julianday('now', 'localtime') - julianday(last_used_at) >= ? AND {_LIVE}"
-        # <<REDACTED 2 lines>>
+        async with _sqlite.connection(self.db_path, named=True) as db:
             cursor = await db.execute("SELECT * FROM sessions" + where, (days,))
             swept = [_record(row) for row in await cursor.fetchall()]
             if not swept:
@@ -713,5 +787,5 @@ def _record(row) -> SessionRecord:
                 "closed_reason = ?" + where,
                 (SWEPT_REASON, days),
             )
-            # <<REDACTED 1 lines>>
+            await db.commit()
             return swept

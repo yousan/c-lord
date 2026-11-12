@@ -6,16 +6,22 @@ session directory override via /clord-thread-init.
 
 from __future__ import annotations
 
-# <<REDACTED 6 lines>>
+import logging
+
+import aiosqlite
+
+logger = logging.getLogger(__name__)
+
 THREAD_REPO_SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_repo_bindings (
     thread_id   INTEGER PRIMARY KEY,
     source_repo TEXT    NOT NULL,
     channel_id  INTEGER,
-    # <<REDACTED 1 lines>>
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
-# <<REDACTED 2 lines>>
+"""
+
 
 class ThreadRepository:
     """Async CRUD for thread_repo_bindings table."""
