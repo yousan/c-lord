@@ -755,6 +755,8 @@ CI は、これらのチェックを Python 3.10・3.11・3.12 で実行しま�
 
 上の段落は、もとになった claude-code-discord-bridge についての記述です。c-lord はそこから最初のアーキテクチャを MIT ライセンスのもとで受け継いだ派生版で、いまは [@yousan](https://github.com/yousan) がメンテナンスしています。yousan が要件を決め、プルリクエストをレビューし、すべての変更を承認します。実装するのは Claude Code です。
 
+**[@ebibibi](https://github.com/ebibibi) さん、ありがとうございます。** c-lord は、Masahiko Ebisuda さんが MIT ライセンスで公開した [claude-code-discord-bridge](https://github.com/ebibibi/claude-code-discord-bridge) のコードから始まりました。その著作権表示とライセンス文は [NOTICE](../../NOTICE) に残しています。
+
 日々の進め方はこうです。変更は、受け入れ条件（Acceptance Criteria）を書いた Issue から始まります。Claude Code — たいていは c-lord のスレッドの中で動いています。つまり c-lord は c-lord で作られています — が、まず失敗するテストを書き、それを通し、staging の bot で実際に動くところをスクリーンショットで示してから、プルリクエストを出します。`main` は 2 つの必須チェックで守られていて、プルリクエストは [Definition of Done](../../CLAUDE.md#definition-of-done-dod--single-source-of-truth) の項目がすべて満たされて初めてマージされます。
 
 c-lord 自身の履歴は、2026-02-22 にその上流プロジェクトをコピーしたところから始まります。バグ報告とプルリクエストは、人からでもエージェントからでも歓迎します。
@@ -775,4 +777,4 @@ EbiBot は、上流の claude-code-discord-bridge の上に作られた ebibibi 
 
 ## ライセンス
 
-[MIT](../../LICENSE)
+[MIT](../../LICENSE)。c-lord の出発点になったコードの著作権表示とライセンス文は [NOTICE](../../NOTICE) にあります。

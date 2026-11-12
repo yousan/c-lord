@@ -761,6 +761,8 @@ El CI ejecuta esas comprobaciones en Python 3.10, 3.11 y 3.12. Usan mocks, así 
 
 El párrafo anterior describe el proyecto original, claude-code-discord-bridge, que aportó a c-lord su arquitectura inicial bajo la licencia MIT. Esta obra derivada la mantiene ahora [@yousan](https://github.com/yousan), que define los requisitos, revisa los pull requests y aprueba todos los cambios, mientras que Claude Code se encarga de la implementación.
 
+**Gracias, [@ebibibi](https://github.com/ebibibi).** c-lord comenzó a partir del código de [claude-code-discord-bridge](https://github.com/ebibibi/claude-code-discord-bridge), publicado por Masahiko Ebisuda bajo la licencia MIT. Su aviso de copyright y el texto de su licencia se conservan en [NOTICE](../../NOTICE).
+
 En el día a día funciona así. Un cambio empieza como un Issue con criterios de aceptación. Claude Code —que normalmente se ejecuta en un hilo de c-lord, de modo que c-lord se construye con c-lord— escribe un test que falla, hace que pase, muestra el cambio funcionando en un bot de staging con capturas de pantalla y abre un pull request. Dos comprobaciones obligatorias protegen `main`, y un pull request solo se fusiona cuando se cumplen todos los puntos de la [Definition of Done](../../CLAUDE.md#definition-of-done-dod--single-source-of-truth).
 
 La historia propia de c-lord empieza el 2026-02-22 con una copia de ese proyecto original. Los informes de errores y los pull requests son bienvenidos, tanto de personas como de agentes.
@@ -781,4 +783,4 @@ EbiBot es el bot del propio ebibibi y está construido sobre el proyecto origina
 
 ## Licencia
 
-[MIT](../../LICENSE)
+[MIT](../../LICENSE). El aviso de copyright y la licencia del código del que partió c-lord están en [NOTICE](../../NOTICE).

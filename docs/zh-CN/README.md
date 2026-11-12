@@ -788,6 +788,8 @@ CI 在 Python 3.10、3.11 和 3.12 上运行这些检查。它们使用 mock，�
 
 上面这段话描述的是上游项目 claude-code-discord-bridge，它依据 MIT 许可证为 c-lord 提供了最初的架构。这个衍生项目现在由 [@yousan](https://github.com/yousan) 维护，他负责定义需求、审查 pull request 并批准所有改动，实现工作则由 Claude Code 完成。
 
+**感谢 [@ebibibi](https://github.com/ebibibi)。** c-lord 起步于 Masahiko Ebisuda 以 MIT 许可证发布的 [claude-code-discord-bridge](https://github.com/ebibibi/claude-code-discord-bridge) 的代码。其版权声明和许可证全文保留在 [NOTICE](../../NOTICE) 中。
+
 日常的流程是这样的。一项改动从带有验收标准的 Issue 开始。Claude Code——通常运行在 c-lord 的子区里，也就是说 c-lord 是用 c-lord 构建的——先写一个失败的测试，让它通过，在 staging bot 上用截图演示改动确实可用，然后开一个 pull request。`main` 由两项必需的检查把关，只有当 [Definition of Done](../../CLAUDE.md#definition-of-done-dod--single-source-of-truth) 的每一项都满足时，pull request 才会合并。
 
 c-lord 自己的历史始于 2026-02-22，起点是该上游项目的一份副本。欢迎提交 bug 报告和 pull request，无论来自人还是代理。
@@ -808,4 +810,4 @@ EbiBot 是 ebibibi 自己的 bot，它建立在上游的 claude-code-discord-bri
 
 ## 许可证
 
-[MIT](../../LICENSE)
+[MIT](../../LICENSE)。c-lord 起步时所用代码的版权声明和许可证见 [NOTICE](../../NOTICE)。

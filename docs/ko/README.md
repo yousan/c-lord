@@ -730,6 +730,8 @@ CI는 이 검사들을 Python 3.10, 3.11, 3.12에서 실행합니다. 이 검사
 
 위 문단은 업스트림 프로젝트인 claude-code-discord-bridge에 관한 설명입니다. 이 프로젝트가 MIT 라이선스에 따라 c-lord에 초기 아키텍처를 제공했습니다. 현재 이 파생 프로젝트는 [@yousan](https://github.com/yousan)이 유지 관리하고 있으며, 요구사항을 정의하고 pull request를 리뷰하고 모든 변경을 승인합니다. 구현은 Claude Code가 합니다.
 
+**[@ebibibi](https://github.com/ebibibi) 님, 감사합니다.** c-lord는 Masahiko Ebisuda 님이 MIT 라이선스로 공개한 [claude-code-discord-bridge](https://github.com/ebibibi/claude-code-discord-bridge)의 코드에서 시작했습니다. 원래의 저작권 표시와 라이선스 전문은 [NOTICE](../../NOTICE)에 보존되어 있습니다.
+
 평소의 흐름은 이렇습니다. 변경은 인수 기준이 적힌 Issue에서 시작합니다. Claude Code는(대개 c-lord 스레드에서 실행되므로, c-lord는 c-lord로 만들어지는 셈입니다) 실패하는 테스트를 작성하고, 그 테스트를 통과시키고, 변경 사항이 스테이징 봇에서 동작하는 모습을 스크린샷으로 보여 주고, pull request를 엽니다. 두 개의 필수 체크가 `main`을 지키고 있으며, pull request는 [Definition of Done](../../CLAUDE.md#definition-of-done-dod--single-source-of-truth)의 모든 항목이 충족되었을 때만 머지됩니다.
 
 c-lord 자체의 히스토리는 2026-02-22에 그 업스트림 프로젝트의 사본으로 시작합니다. 버그 리포트와 pull request는 사람이 보낸 것이든 에이전트가 보낸 것이든 환영합니다.
@@ -750,4 +752,4 @@ EbiBot은 ebibibi 본인의 봇이며, c-lord가 아니라 업스트림인 claud
 
 ## 라이선스
 
-[MIT](../../LICENSE)
+[MIT](../../LICENSE). c-lord의 출발점이 된 코드의 저작권 표시와 라이선스는 [NOTICE](../../NOTICE)에 있습니다.
