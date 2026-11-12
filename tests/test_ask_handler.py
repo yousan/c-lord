@@ -17,7 +17,7 @@ import pytest
 from c_lord.claude.types import FREE_TEXT_NOTES, AskOption, AskQuestion
 from c_lord.discord_ui import ask_handler
 from c_lord.discord_ui.ask_bus import ask_bus
-from c_lord.discord_ui.ask_handler import bridge_pane_ask, collect_ask_answers
+from c_lord.discord_ui.ask_handler import bridge_pane_ask
 
 
 def _question() -> AskQuestion:
@@ -832,52 +832,6 @@ async def test_bridge_pane_ask_no_mention_when_notify_user_unset(monkeypatch):
 
     embed_sends = [s for s in thread.send.await_args_list if "embed" in s.kwargs]
     assert all(not (s.kwargs.get("content") or "").startswith("<@") for s in embed_sends)
-
-
-@pytest.mark.asyncio
-async def test_collect_ask_answers_still_ends_at_answered(monkeypatch):
-    """#651: on the non-tmux path the answer IS the next prompt, so ✅ is earned.
-
-    The click now leaves an interim ⏳ that some later step has to resolve. Here
-    that step is this function: nothing can swallow the answer, because it is
-    returned from here and injected as Claude's next turn. Leaving ⏳ standing
-    forever would be the new way to look broken.
-    """
-    thread, msg = _thread(651_0020)
-
-    async def _click_soon() -> None:
-        await asyncio.sleep(0.05)
-        ask_bus.post_answer(thread.id, ["A1"])
-
-    await asyncio.gather(
-        asyncio.wait_for(collect_ask_answers(thread, [_question()], "sess-1"), timeout=3.0),
-        _click_soon(),
-    )
-
-    assert "✅" in _final_text(msg)
-
-
-@pytest.mark.asyncio
-async def test_collect_ask_answers_pings_notify_user(monkeypatch):
-    """#480: the drain-path AskUserQuestion menu also pings the notify user."""
-    thread, _msg = _thread(480_0003)
-
-    async def _click_soon() -> None:
-        await asyncio.sleep(0.05)
-        ask_bus.post_answer(thread.id, ["A1"])
-
-    await asyncio.gather(
-        asyncio.wait_for(
-            collect_ask_answers(thread, [_question()], "sess-1", notify_user_id=999),
-            timeout=3.0,
-        ),
-        _click_soon(),
-    )
-
-    embed_sends = [s for s in thread.send.await_args_list if "embed" in s.kwargs]
-    assert any("<@999>" in (s.kwargs.get("content") or "") for s in embed_sends), (
-        f"collect menu must ping notify user 999; sends={thread.send.await_args_list}"
-    )
 
 
 @pytest.mark.asyncio

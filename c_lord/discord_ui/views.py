@@ -1,4 +1,4 @@
-"""Discord UI Views for interactive session controls."""
+"""Small button views attached to c-lord's own notices (stop, reopen, re-run, …)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from .error_reporting import ErrorReportingViewMixin
 from .slash_io import followup
 
 logger = logging.getLogger(__name__)
-
 # Protocol-compatible type: any object with an async interrupt() method.
 # TmuxClaudeRunner satisfies this.
 
@@ -36,7 +35,7 @@ STOP_MESSAGE_PREFIX = "-# ⏺ Session running"
 
 
 class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
-    """A ⏹ Stop button attached to the session status message.
+    """The ⏹ Stop button under the "session running" line of a turn.
 
     Clicking it runs ``on_stop`` — the same stop ``/stop`` and ``!stop`` run
     (``ClaudeChatCog._stop_thread_work``, #878): interrupt the turn, end the
@@ -45,8 +44,9 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     never says "stopped" when the stop failed. Without ``on_stop`` (older
     callers) it falls back to ``runner.interrupt()``.
 
-    After the session ends — either via the button or naturally — call
-    ``disable()`` to deactivate the button on the status message.
+    The button answers only in the process that posted it (no ``custom_id``,
+    no timeout). When the turn ends by itself, :meth:`disable` removes the
+    message the button sits on.
     """
 
     def __init__(
@@ -59,23 +59,32 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
         self._runner = runner
         self._on_stop = on_stop
         self._authorizer = authorizer
+        # True once the button was pressed or the message was cleared away.
         self._stopped = False
+        # The message this button is attached to — see set_message.
         self._message: discord.Message | None = None
 
     def set_message(self, message: discord.Message) -> None:
-        """Store the message this view is attached to."""
+        """Tell the view which message it was sent on, so :meth:`disable` can find it."""
         self._message = message
+
+    def _retire(self) -> bool:
+        """Mark the button used up. False when it already was — do nothing then."""
+        if self._stopped:
+            return False
+        self._stopped = True
+        return True
 
     @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger)
     async def stop_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         """Stop the thread's Claude work — the same stop as /stop and !stop (#878)."""
-        if self._stopped:
+        if not self._retire():
+            # A second press while the first is still being handled: just ACK.
             await interaction.response.defer()
             return
 
-        self._stopped = True
         button.disabled = True
         await interaction.response.edit_message(view=self)
 
@@ -106,16 +115,15 @@ class StopView(AuthorizedViewMixin, ErrorReportingViewMixin, discord.ui.View):
     async def disable(self, message: discord.Message | None = None) -> None:
         """Delete the stop-button message after the session ends naturally.
 
-        Uses the stored message reference if ``message`` is not provided.
-        No-op if the stop button was already clicked.
+        Does nothing once the button was pressed or the message already
+        cleared. *message* overrides the one given to :meth:`set_message`.
         """
-        if self._stopped:
+        # Retired before Discord is touched: a failed delete must not leave the
+        # view looking live.
+        if not self._retire():
             return
-
-        target = message or self._message
-        self._stopped = True
         self.stop()
-
+        target = message or self._message
         if target:
             try:
                 await target.delete()

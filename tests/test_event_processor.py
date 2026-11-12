@@ -52,16 +52,6 @@ class TestEventProcessorProperties:
         p = EventProcessor(config)
         assert p.session_id == "existing"
 
-    def test_pending_ask_none_initially(self, thread: MagicMock, runner: MagicMock) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-        assert p.pending_ask is None
-
-    def test_should_drain_false_initially(self, thread: MagicMock, runner: MagicMock) -> None:
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-        assert p.should_drain is False
-
 
 class TestOnSystem:
     """SYSTEM event handling."""
@@ -169,43 +159,6 @@ class TestOnAssistantText:
             c for c in thread.send.call_args_list if c.args and isinstance(c.args[0], str)
         ]
         assert text_sends == []
-
-
-class TestAskUserQuestion:
-    """AskUserQuestion detection."""
-
-    @pytest.mark.asyncio
-    async def test_pending_ask_set_on_detect(self, thread: MagicMock, runner: MagicMock) -> None:
-        runner.interrupt = AsyncMock()
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        ask = AskQuestion(
-            question="Which option?",
-            options=[AskOption(label="A"), AskOption(label="B")],
-        )
-        event = StreamEvent(
-            message_type=MessageType.ASSISTANT,
-            ask_questions=[ask],
-        )
-        await p.process(event)
-
-        assert p.pending_ask == [ask]
-        assert p.should_drain is True
-
-    @pytest.mark.asyncio
-    async def test_runner_interrupted_on_ask(self, thread: MagicMock, runner: MagicMock) -> None:
-        runner.interrupt = AsyncMock()
-        config = _make_config(thread, runner)
-        p = EventProcessor(config)
-
-        event = StreamEvent(
-            message_type=MessageType.ASSISTANT,
-            ask_questions=[AskQuestion(question="?", options=[AskOption(label="A")])],
-        )
-        await p.process(event)
-
-        runner.interrupt.assert_called_once()
 
 
 class TestPaneAskOwnership:

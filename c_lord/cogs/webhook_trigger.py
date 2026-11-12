@@ -1,13 +1,16 @@
-"""WebhookTriggerCog — Webhook message → Claude Code task execution.
+"""Lets a Discord webhook post start a Claude run that the server defined.
 
-Generic pattern for triggering Claude Code runs via Discord webhooks.
-Useful for CI/CD pipelines (e.g. GitHub Actions → Discord → Claude Code).
+A CI job (or anything else that can post to a webhook) sends a message whose
+text starts with a configured *prefix*; the prompt Claude then runs is the one
+configured for that prefix on the bot's side.
 
-Security design:
-- Only processes messages with a webhook_id (ignores regular users and bots)
-- Optional webhook_id allowlist for stricter access control
-- Prompts are defined server-side (webhook payload only selects which trigger)
-- Per-prefix asyncio.Lock prevents concurrent runs of the same trigger
+What keeps this safe:
+
+- Only webhook messages are considered — a person typing the prefix does nothing.
+- An optional allowlist narrows it to particular webhook ids.
+- The message chooses *which* trigger fires and nothing more; its text never
+  reaches Claude.
+- A prefix runs one at a time: a second post while one is running is dropped.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -22,8 +26,6 @@ import discord
 from discord.ext import commands
 
 from .. import turn_events
-from ..cogs._run_helper import run_claude_with_config
-from ..cogs.run_config import RunConfig
 from ..concurrency import SessionRegistry
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ui.thread_dashboard import board_turn, dashboard_of
@@ -32,6 +34,8 @@ from ..notify_policy import owner_notify_id
 from ..thread_settings import resolve_auto_archive_duration
 from ..utils.logger import log_ctx
 from ..voice_webhooks import is_voice_message
+from ._run_helper import run_claude_with_config
+from .run_config import RunConfig
 
 if TYPE_CHECKING:
     from ..claude.config import ClaudeConfig
@@ -41,14 +45,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class WebhookTrigger:
-    """Configuration for a single webhook trigger.
+    """What one prefix runs.
 
-    Attributes:
-        prompt: The Claude Code prompt to execute when triggered.
+    Args:
+        prompt: The prompt Claude is given when the trigger fires.
         working_dir: Override the default working directory.
         timeout: Override the default timeout in seconds.
         allowed_tools: Override the default allowed tools list.
-        dangerously_skip_permissions: Whether to skip Claude Code permission checks.
+        dangerously_skip_permissions: Run Claude Code without permission prompts.
     """
 
     prompt: str
@@ -59,19 +63,15 @@ class WebhookTrigger:
 
 
 class WebhookTriggerCog(commands.Cog):
-    """Cog that executes Claude Code tasks in response to Discord webhook messages.
-
-    Each trigger is identified by a message prefix (e.g. "🔄 docs-sync").
-    The prompt is defined server-side — the webhook only selects which trigger to fire.
+    """Watches for webhook posts and runs the trigger whose prefix they carry.
 
     Args:
-        bot: The Discord bot instance.
+        bot: The bot the cog is loaded into.
         runner: ClaudeConfig with CLI settings.
-        triggers: Mapping of prefix string → WebhookTrigger configuration.
-        allowed_webhook_ids: Optional set of allowed Discord webhook IDs.
-            If None, all webhooks are accepted.
-        channel_ids: Optional set of channel IDs to listen in.
-            If None, listens in all channels.
+        triggers: Prefix → what it runs. Checked in the dict's order.
+        allowed_webhook_ids: Webhooks that may fire a trigger; ``None`` = any.
+        channel_ids: Channels that are listened to; ``None`` = all.
+        registry: Session registry; defaults to the bot's own.
     """
 
     def __init__(
@@ -89,33 +89,57 @@ class WebhookTriggerCog(commands.Cog):
         self.allowed_webhook_ids = allowed_webhook_ids
         self.channel_ids = channel_ids
         self._registry = registry or getattr(bot, "session_registry", None)
+        # Mutual exclusion per prefix, for the prefixes configured right now.
+        # A run holds its prefix's lock from thread creation to the reaction.
         self._locks: dict[str, asyncio.Lock] = {prefix: asyncio.Lock() for prefix in triggers}
         self._active_count: int = 0
 
+    # -- how many runs are under way (``DrainAware``) -------------------
+
     @property
     def active_count(self) -> int:
-        """Number of currently running webhook-triggered Claude sessions."""
+        """Trigger runs in progress — the upgrade cog waits for this to reach 0."""
         return self._active_count
+
+    @contextlib.contextmanager
+    def _counted_run(self) -> Iterator[None]:
+        """Count one run as active for as long as the block lasts, however it ends."""
+        self._active_count += 1
+        try:
+            yield
+        finally:
+            self._active_count -= 1
+
+    # -- which messages fire which trigger ------------------------------
+
+    def _sender_accepted(self, message: discord.Message) -> bool:
+        """With an allowlist, only listed webhooks count (an empty list admits none)."""
+        allowed = self.allowed_webhook_ids
+        return allowed is None or message.webhook_id in allowed
+
+    def _channel_watched(self, message: discord.Message) -> bool:
+        """With a channel list, only posts in those channels count."""
+        watched = self.channel_ids
+        return watched is None or message.channel.id in watched
+
+    def _trigger_named_by(self, text: str) -> tuple[str, WebhookTrigger] | None:
+        """The first configured prefix *text* starts with, and what it runs.
+
+        Case-sensitive; nothing has to separate the prefix from what follows.
+        """
+        text = text.strip()
+        for prefix, trigger in self.triggers.items():
+            if text.startswith(prefix):
+                return prefix, trigger
+        return None
 
     def _match(self, message: discord.Message) -> tuple[str, WebhookTrigger] | None:
         """The trigger *message* fires, or ``None`` when it is not one of ours."""
         if not message.webhook_id or is_voice_message(message):
             return None  # #971: c-lord speaking for a sub-agent triggers nothing
-
-        if (
-            self.allowed_webhook_ids is not None
-            and message.webhook_id not in self.allowed_webhook_ids
-        ):
+        if not (self._sender_accepted(message) and self._channel_watched(message)):
             return None
-
-        if self.channel_ids is not None and message.channel.id not in self.channel_ids:
-            return None
-
-        content = message.content.strip()
-        for prefix, trigger in self.triggers.items():
-            if content == prefix or content.startswith(prefix):
-                return prefix, trigger
-        return None
+        return self._trigger_named_by(message.content)
 
     def claims_message(self, message: discord.Message) -> bool:
         """Whether *message* is a trigger this cog acts on — #862.
@@ -128,12 +152,11 @@ class WebhookTriggerCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        """Handle incoming messages, filtering for webhook triggers."""
+        """Run the trigger a webhook post names — unless that trigger is busy."""
         matched = self._match(message)
         if matched is None:
             return
         matched_prefix, matched_trigger = matched
-
         logger.info(
             "%s Webhook trigger matched: prefix=%r, webhook_id=%d",
             log_ctx(channel_id=message.channel.id),
@@ -141,12 +164,14 @@ class WebhookTriggerCog(commands.Cog):
             message.webhook_id,
         )
 
-        lock = self._locks[matched_prefix]
-        if lock.locked():
+        # A busy prefix drops the post — it is neither queued nor run later.
+        # Nothing is awaited between looking at the lock and taking it, so two
+        # posts arriving together cannot both get through.
+        in_use = self._locks[matched_prefix]
+        if in_use.locked():
             await message.reply(f"⏳ `{matched_prefix}` is already running. Skipping.")
             return
-
-        async with lock:
+        async with in_use:
             await self._execute_trigger(message, matched_prefix, matched_trigger)
 
     async def _resolve_tmux_manager(self, channel_id: int, *, thread_id: int | None):
@@ -206,7 +231,7 @@ class WebhookTriggerCog(commands.Cog):
         prefix: str,
         trigger: WebhookTrigger,
     ) -> None:
-        """Execute a matched trigger via Claude Code."""
+        """Run *trigger* in a thread under *message*, then mark it ✅ or ❌."""
         from ..claude.tmux_runner import TmuxClaudeRunner
 
         archive_minutes = await resolve_auto_archive_duration(
@@ -265,8 +290,7 @@ class WebhookTriggerCog(commands.Cog):
             effort=effort_for_launch(model, turn.effort if turn else self.runner.effort),
         )
 
-        self._active_count += 1
-        try:
+        with self._counted_run():
             # #754: a CI-triggered run belongs on 📊 Session Status too.
             # Labelled by the public prefix — the prompt is server-side config.
             async with board_turn(dashboard_of(self.bot), thread.id, prefix):
@@ -274,6 +298,7 @@ class WebhookTriggerCog(commands.Cog):
                     RunConfig(
                         thread=thread,
                         runner=runner,
+                        # A webhook run leaves no session row behind.
                         repo=None,
                         prompt=trigger.prompt,
                         session_id=None,
@@ -296,10 +321,4 @@ class WebhookTriggerCog(commands.Cog):
                         ),
                     )
                 )
-
-            if session_id:
-                await message.add_reaction("✅")
-            else:
-                await message.add_reaction("❌")
-        finally:
-            self._active_count -= 1
+            await message.add_reaction("✅" if session_id else "❌")

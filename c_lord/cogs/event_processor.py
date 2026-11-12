@@ -29,7 +29,7 @@ from ..claude.tmux_runner import (
     TRUST_STUCK_ERROR_PREFIX,
     unavailable_model,
 )
-from ..claude.types import AskQuestion, MessageType, SessionState, StreamEvent
+from ..claude.types import MessageType, SessionState, StreamEvent
 from ..discord_ui.embeds import session_start_embed, unknown_tui_prompt_embed
 from ..login_alert import login_alert
 from ..usage_limit import usage_limit_notices
@@ -49,69 +49,28 @@ class EventProcessor:
     call finalize() in a finally block.
 
     State:
-    - session_start_sent: prevents duplicate session start embeds
-    - pending_ask: set when AskUserQuestion detected; caller should drain runner
-
-    Example usage (see _run_helper.run_claude_with_config for the full flow)::
-
-        processor = EventProcessor(config)
-        try:
-            async for event in config.runner.run(prompt):
-                if processor.should_drain:
-                    continue
-                await processor.process(event)
-        finally:
-            await processor.finalize()
-
-        if processor.pending_ask and processor.session_id:
-            # Handle AskUserQuestion (see run_helper)
-            ...
-
-        return processor.session_id
+    - ``session_id`` — the session this turn is on, as the runner last
+      reported it. Read it once the stream has ended: it is what the turn
+      hands back to its caller.
     """
 
     def __init__(self, config: RunConfig) -> None:
         self._config = config
-        self._state = SessionState(
-            session_id=config.session_id,
-            thread_id=config.thread.id,
-        )
-
-        # Guards against duplicate embeds/messages in the same run.
-        self._session_start_sent: bool = False
+        # Starts from the session being resumed (None for a brand-new one) and
+        # follows whatever id the runner reports.
+        self._state = SessionState(session_id=config.session_id, thread_id=config.thread.id)
         # #856: ``RunConfig.on_session_saved`` fires once per turn.
         self._session_saved_notified: bool = False
-
-        # Set when AskUserQuestion is detected. Caller should drain the runner
-        # (skip events) then handle the ask after the stream ends.
-        self._pending_ask: list[AskQuestion] | None = None
-
+        # Whether this turn already posted its session-start embed.
+        self._session_start_sent: bool = False
         # The session-start embed this turn posted, if any. It is bookkeeping,
         # so it is taken away again when the turn ends.
         self._session_start_msg: discord.Message | None = None
 
-    # ------------------------------------------------------------------
-    # Public properties
-    # ------------------------------------------------------------------
-
     @property
     def session_id(self) -> str | None:
-        """The current session ID, updated as SYSTEM events arrive."""
+        """The session id as of the latest SYSTEM / RESULT event."""
         return self._state.session_id
-
-    @property
-    def pending_ask(self) -> list[AskQuestion] | None:
-        """Set when AskUserQuestion was detected. None otherwise."""
-        return self._pending_ask
-
-    @property
-    def should_drain(self) -> bool:
-        """True while the runner should be drained (AskUserQuestion detected)."""
-        return self._pending_ask is not None
-
-    # ------------------------------------------------------------------
-    # Public methods
-    # ------------------------------------------------------------------
 
     @property
     def _failure_mention(self) -> str | None:
@@ -136,12 +95,13 @@ class EventProcessor:
         return uid
 
     async def process(self, event: StreamEvent) -> None:
-        """Dispatch a single stream event to the appropriate handler."""
+        """Act on one runner event.
+
+        A SYSTEM event that also completes the turn is handled as both, in
+        that order.
+        """
         if event.message_type == MessageType.SYSTEM:
             await self._on_system(event)
-        elif event.message_type == MessageType.ASSISTANT:
-            await self._on_assistant(event)
-
         if event.is_complete:
             await self._on_complete(event)
 
@@ -152,9 +112,7 @@ class EventProcessor:
         timers); kept so callers have one place to end a turn.
         """
 
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
+    # -- per-event handlers ---------------------------------------------
 
     async def _on_system(self, event: StreamEvent) -> None:
         """Handle SYSTEM events — a TUI menu, an unknown prompt, or the session id."""
@@ -174,8 +132,8 @@ class EventProcessor:
 
         if not event.session_id:
             return
-
         self._state.session_id = event.session_id
+
         if self._config.repo:
             await self._config.repo.save(
                 self._config.thread.id,
@@ -190,19 +148,13 @@ class EventProcessor:
                 with contextlib.suppress(Exception):
                     await hook(self._config.thread.id)
 
-        # Guard: post session_start_embed only once (Claude can emit multiple SYSTEM events).
+        # Announce the session once, and only when this turn began a new one —
+        # a resumed session was announced by the turn that started it.
         if not self._config.session_id and not self._session_start_sent:
             self._session_start_msg = await self._config.thread.send(
                 embed=session_start_embed(self._state.session_id)
             )
             self._session_start_sent = True
-
-    async def _on_assistant(self, event: StreamEvent) -> None:
-        """Handle ASSISTANT events — an AskUserQuestion carried on the event itself."""
-        # AskUserQuestion — set pending and signal caller to interrupt runner.
-        if event.ask_questions:
-            self._pending_ask = event.ask_questions
-            await self._config.runner.interrupt()
 
     async def _on_complete(self, event: StreamEvent) -> None:
         """Handle RESULT events — the turn is over.
@@ -212,6 +164,7 @@ class EventProcessor:
         and saves the session id. Claude's answer is not posted here: the
         transcript mirror delivers it from the jsonl (#712).
         """
+        # Imported here: ``_run_helper`` imports this module at its top.
         from ._run_helper import _make_error_embed
 
         if event.error == STOPPED_BY_USER_ERROR:

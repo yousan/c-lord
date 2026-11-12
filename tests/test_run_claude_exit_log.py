@@ -10,7 +10,8 @@ leaving the function skipped it:
   ``CancelledError`` is not an ``Exception`` and bypassed the handler),
 * the runner raising (the ``except`` block ``return``-ed before the log line),
 * the AskUserQuestion answer resuming in a nested call (``return await ...``
-  jumped over the outer turn's line).
+  jumped over the outer turn's line) — that resume path was removed in #1315,
+  since nothing ever set ``StreamEvent.ask_questions``.
 
 Production had 18 such unpaired ``enter`` lines from the cancel path alone
 (2026-09-01 … 09-23), which made every one of them look like a hang.
@@ -27,12 +28,12 @@ import asyncio
 import contextlib
 import logging
 import re
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
 
-from c_lord.claude.types import AskOption, AskQuestion, MessageType, StreamEvent
+from c_lord.claude.types import MessageType, StreamEvent
 from c_lord.cogs import _run_helper
 from c_lord.cogs._run_helper import run_claude_with_config
 from c_lord.cogs.run_config import RunConfig
@@ -187,26 +188,6 @@ async def test_preempted_turn_says_so(caplog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ask_resume_closes_both_turns(caplog) -> None:
-    """RED: the answer resumes in a nested call whose ``return await`` skipped
-    the outer turn's exit line."""
-    question = AskQuestion(question="Which?", options=[AskOption("A"), AskOption("B")])
-    asking = StreamEvent(
-        message_type=MessageType.ASSISTANT, session_id="sess-1", ask_questions=[question]
-    )
-    runner = _runner([_started(), asking], [_done()])
-
-    with patch(
-        "c_lord.cogs._run_helper.collect_ask_answers", AsyncMock(return_value="A")
-    ) as collect:
-        await run_claude_with_config(_config(runner))
-
-    collect.assert_awaited_once()
-    assert len(_lines(caplog, "enter")) == 2
-    assert len(_lines(caplog, "exit")) == 2
-
-
-@pytest.mark.asyncio
 async def test_nothing_left_in_flight_after_any_exit(caplog) -> None:
     await run_claude_with_config(_config(_runner([_done()])))
     assert not _run_helper._IN_FLIGHT
@@ -275,19 +256,6 @@ async def test_other_threads_are_not_orphans(caplog) -> None:
         first.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await first
-
-    assert _orphan_warnings(caplog) == []
-
-
-@pytest.mark.asyncio
-async def test_ask_resume_is_not_an_orphan(caplog) -> None:
-    """The nested resume runs inside its own turn — that is not a second run."""
-    question = AskQuestion(question="Which?", options=[AskOption("A"), AskOption("B")])
-    asking = StreamEvent(
-        message_type=MessageType.ASSISTANT, session_id="sess-1", ask_questions=[question]
-    )
-    with patch("c_lord.cogs._run_helper.collect_ask_answers", AsyncMock(return_value="A")):
-        await run_claude_with_config(_config(_runner([_started(), asking], [_done()])))
 
     assert _orphan_warnings(caplog) == []
 

@@ -1,4 +1,4 @@
-"""Emoji reaction status manager.
+"""The turn lamp: one reaction that says where a turn stands.
 
 Shows Claude's per-turn status as a single reaction on the user's trigger
 message: 🟢 *running* while the turn is active, 🟡 *waiting* once it's the
@@ -12,6 +12,8 @@ so they stay responsive even under heavy use (#246). The thread-name lamp
 consistent "sidebar" view driven by the state-sync poll — it is no longer
 flipped per turn, which is what saturated Discord's ~2-renames-per-10-min
 limit and made the lamp stick (#236 regression).
+
+Silence is measured on the event loop's own clock (see ``_loop_now``).
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from ..discord_failures import DISCORD_CALL_FAILURES
 from ..turn_activity import turn_activity
 
 logger = logging.getLogger(__name__)
-
 # Per-turn lamp (the message reaction).
 EMOJI_RUNNING = "\U0001f7e2"  # 🟢 — Claude is actively working
 EMOJI_WAITING = "\U0001f7e1"  # 🟡 — turn finished, your move
@@ -42,8 +43,17 @@ _OPEN_LAMPS = (EMOJI_RUNNING, EMOJI_STALL_SOFT, EMOJI_STALL_HARD)
 # What a reaction call can fail with without the turn being in trouble (#904).
 _LAMP_FAILURES = DISCORD_CALL_FAILURES
 
+# Seconds without any sign of life before the lamp turns ⏳, then ⚠️.
 STALL_SOFT_SECONDS = 10
 STALL_HARD_SECONDS = 30
+
+# How often the stall monitor looks, in seconds.
+_MONITOR_TICK = 2
+
+
+def _loop_now() -> float:
+    """The running event loop's clock — the one timebase of the stall logic."""
+    return asyncio.get_running_loop().time()
 
 
 class StatusManager:
@@ -62,6 +72,7 @@ class StatusManager:
     """
 
     def __init__(self, message: discord.Message, *, thread_id: int | None = None) -> None:
+        # The message the lamp is painted on.
         self._message = message
         # #769: the thread whose transcript activity keeps this turn off ⏳/⚠️.
         # None (older callers) = no transcript feed; the lamp then only knows
@@ -69,17 +80,21 @@ class StatusManager:
         self._thread_id = thread_id
         self._unsubscribe_activity: Callable[[], None] | None = None
         self._activity_listener: Callable[[], None] | None = None
+        # What we believe is on the message right now (None = nothing of ours).
         self._current_emoji: str | None = None
+        # The stall monitor of the running turn, if one is up.
         self._stall_task: asyncio.Task | None = None
         # #799: the task running the turn. A turn cancelled by the next message
         # never reaches set_done()/set_error(), so the monitor watches this to
         # learn that the turn is over.
         self._turn_task: asyncio.Task | None = None
         self._turn_active = False
+        # Serialises repaints, so "remove old, add new" never interleaves.
         self._lock = asyncio.Lock()
         # #871: a reaction call failed, so Discord may show more than we think.
         self._out_of_sync = False
-        self._last_activity = asyncio.get_running_loop().time()
+        # When the turn last showed a sign of life.
+        self._last_activity = _loop_now()
 
     @classmethod
     def adopt(
@@ -220,9 +235,9 @@ class StatusManager:
             )
 
     async def _start_stall_timer(self) -> None:
-        """Start the stall detection timer."""
+        """Begin watching this turn for silence, replacing any earlier watch."""
         await self._stop_stall_timer()
-        self._last_activity = asyncio.get_running_loop().time()
+        self._last_activity = _loop_now()
         self._turn_active = True
         self._turn_task = asyncio.current_task()
         if self._thread_id is not None:
@@ -232,6 +247,7 @@ class StatusManager:
             self._unsubscribe_activity = turn_activity.subscribe(
                 self._thread_id, self._activity_listener
             )
+        # Started last, so the monitor never runs ahead of the subscription.
         self._stall_task = asyncio.create_task(self._stall_monitor())
 
     def _reset_stall_timer(self) -> None:
@@ -241,7 +257,7 @@ class StatusManager:
         it reads (#769). A ⏳/⚠️ already on the message is taken back by the
         monitor on its next tick.
         """
-        self._last_activity = asyncio.get_running_loop().time()
+        self._last_activity = _loop_now()
 
     async def _stop_stall_timer(self) -> None:
         """Stop the stall monitor and *wait for it to be gone* (#718).
@@ -268,7 +284,8 @@ class StatusManager:
         """Monitor for stall conditions and override the lamp accordingly."""
         soft_warned = False
         while True:
-            await asyncio.sleep(2)
+            # Sleep first: nothing can be stalled the instant a turn starts.
+            await asyncio.sleep(_MONITOR_TICK)
             if not self._turn_active:
                 return
             if self._turn_task is not None and self._turn_task.done():
@@ -286,8 +303,7 @@ class StatusManager:
                 # until it returns. That is work, not a stall: the progress
                 # line says 作業中 for the same reason (#757).
                 self._reset_stall_timer()
-            elapsed = asyncio.get_running_loop().time() - self._last_activity
-
+            elapsed = _loop_now() - self._last_activity
             if elapsed < STALL_SOFT_SECONDS and self._current_emoji in (
                 EMOJI_STALL_SOFT,
                 EMOJI_STALL_HARD,
