@@ -30,6 +30,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Claude CLI settings that go into the config exactly as the environment has
+#: them (no validation, no trimming): variable → value used when it is unset.
+_CLAUDE_ENV_DEFAULTS = {
+    "CLAUDE_COMMAND": "claude",
+    "CLAUDE_MODEL": "sonnet",
+    "CLAUDE_PERMISSION_MODE": "acceptEdits",
+    "CLAUDE_WORKING_DIR": "",
+}
+
 #: Defaults of the two numeric limits (#1119).
 _DEFAULT_MAX_CONCURRENT = "3"
 _DEFAULT_TIMEOUT = "300"
@@ -41,6 +50,23 @@ _MAX_LIMIT_DIGITS = 18
 #: rather than inlined because #554 made it user-visible: the notice posted into
 #: each swept thread quotes it, and README/docs/COMMANDS.md now state it.
 SESSION_CLEANUP_DAYS = 30
+
+
+def _claude_env(name: str) -> str:
+    """Read one of the pass-through Claude settings, falling back to its default."""
+    return os.getenv(name, _CLAUDE_ENV_DEFAULTS[name])
+
+
+def _require_setting(name: str, value: str) -> None:
+    """Stop the process when a setting the bot cannot start without is empty."""
+    if not value:
+        logger.error("%s is required", name)
+        sys.exit(1)
+
+
+def _optional_id(text: str) -> int | None:
+    """An ID from the config as a number; an empty entry means "not configured"."""
+    return int(text) if text else None
 
 
 def acquire_single_instance_lock(data_dir: Path) -> IO[bytes] | None:
@@ -199,17 +225,14 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     if resolved_env_path:
         os.environ.setdefault("CLORD_ENV_PATH", resolved_env_path)
 
+    # Not stripped: the token is handed to Discord exactly as it was written.
     token = os.getenv("DISCORD_BOT_TOKEN", "")
-    if not token:
-        logger.error("DISCORD_BOT_TOKEN is required")
-        sys.exit(1)
+    _require_setting("DISCORD_BOT_TOKEN", token)
 
     # #1194: spaces around an ID (``KEY="123 "``) started before #1084 — ``int()``
     # ignores them — so strip them here, as the counts below do (#1119).
     channel_id = os.getenv("DISCORD_CHANNEL_ID", "").strip()
-    if not channel_id:
-        logger.error("DISCORD_CHANNEL_ID is required")
-        sys.exit(1)
+    _require_setting("DISCORD_CHANNEL_ID", channel_id)
 
     # Every Discord ID is "ASCII digits only" (#1084). ``isdigit()`` alone is
     # True for ``²`` and full-width digits, and the channel id was only checked
@@ -302,14 +325,14 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
         "token": token,
         "channel_id": channel_id,
         "expected_bot_user_id": expected_bot_user_id,
-        "claude_command": os.getenv("CLAUDE_COMMAND", "claude"),
-        "claude_model": os.getenv("CLAUDE_MODEL", "sonnet"),
+        "claude_command": _claude_env("CLAUDE_COMMAND"),
+        "claude_model": _claude_env("CLAUDE_MODEL"),
         "claude_effort": os.getenv("CLAUDE_EFFORT", ""),
         # #918: where those two came from, for the /model display.
         "claude_model_source": _env_source("CLAUDE_MODEL", resolved_env_path, "組み込み既定"),
         "claude_effort_source": _env_source("CLAUDE_EFFORT", resolved_env_path, "未設定"),
-        "claude_permission_mode": os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits"),
-        "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
+        "claude_permission_mode": _claude_env("CLAUDE_PERMISSION_MODE"),
+        "claude_working_dir": _claude_env("CLAUDE_WORKING_DIR"),
         "max_concurrent": max_concurrent,
         "timeout": timeout,
         "owner_id": owner_id_raw,
@@ -493,7 +516,7 @@ def install_shutdown_signal_handlers(
 
 
 async def main(env_path: Path | None = None) -> None:
-    """Start the bot."""
+    """Bring the bot up and stay connected until it is told to stop."""
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     setup_logging(log_level)
@@ -526,10 +549,8 @@ async def main(env_path: Path | None = None) -> None:
         timeout_seconds=int(config["timeout"]),
     )
 
-    owner_id = int(config["owner_id"]) if config["owner_id"] else None
-    coordination_channel_id = (
-        int(config["coordination_channel_id"]) if config["coordination_channel_id"] else None
-    )
+    owner_id = _optional_id(config["owner_id"])
+    coordination_channel_id = _optional_id(config["coordination_channel_id"])
     allowed_user_ids = {owner_id} if owner_id else None
     allowed_role_name = os.getenv("CLORD_ALLOWED_ROLE") or None
 
@@ -610,7 +631,7 @@ async def main(env_path: Path | None = None) -> None:
                 [r.thread_id for r in deleted],
             )
 
-        # Handle signals
+        # Signals have to be hooked up before start() below takes over.
         loop = asyncio.get_running_loop()
 
         async def _shutdown() -> None:

@@ -1,13 +1,13 @@
-"""Configuration dataclass for Claude Code execution.
+"""Everything one Claude Code run needs, as a single dataclass.
 
-Bundles all parameters needed to execute Claude Code CLI and stream results
-to a Discord thread. Using a dataclass instead of a long positional argument
-list makes call sites more readable and extension safer (new fields can be
-added without changing every caller).
+Run helpers used to grow a positional parameter per feature. Passing one
+object instead keeps call sites readable, and a new field no longer means
+touching every caller.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -75,22 +75,22 @@ class RunOutcome:
 
 @dataclass
 class RunConfig:
-    """All parameters needed for a single Claude Code execution.
+    """The full set of inputs for one Claude Code run.
 
-    Required fields:
-        thread: Discord thread to post results to.
+    Required:
+        thread: The Discord thread the results go to.
         runner: A TmuxClaudeRunner instance for this thread.
-        prompt: The user's message or skill invocation.
+        prompt: What to send — the user's message, or the line that invokes a skill.
 
-    Optional fields:
-        session_id: Session ID to resume. None for new sessions.
-        repo: Session repository for persisting thread-session mappings.
-              Pass None for automated workflows without session persistence.
-        status: StatusManager for emoji reactions on the user's message.
+    Optional:
+        session_id: Session to resume; None starts a new one.
+        repo: Where the thread ↔ session mapping is saved. None for automated
+              workflows that keep no session.
+        status: StatusManager that puts the emoji reactions on the user's message.
         registry: SessionRegistry. When provided, the session is registered
                   during execution (``/workspace-cleanup`` reads it). Nothing
                   is sent to Claude (#758/#766).
-        ask_repo: Repository for persisting AskUserQuestion state across restarts.
+        ask_repo: Keeps open AskUserQuestion menus across a bot restart.
         lounge_repo: Unused since #766 (the lounge text was never delivered —
                      #758). Kept so existing callers keep working.
         settings_repo: KV store for the persisted per-model context-window total
@@ -126,8 +126,8 @@ class RunConfig:
     stop_view: StopView | None = None
     session_dir_manager: SessionDirManager | None = None
     tmux_manager: TmuxSessionManager | None = None
-    # Paths to downloaded image tempfiles passed via --image flags.
-    # Cleaned up in run_claude_with_config() finally block.
+    # Images from the message, already downloaded to temp files and handed to
+    # Claude with ``--image``. Whoever runs the turn deletes them when it ends.
     image_paths: list[str] | None = None
     # Absolute path of the session's working directory. Persisted to the
     # sessions DB so TranscriptMirrorCog can restart mirrors after a bot
@@ -175,14 +175,15 @@ class RunConfig:
     # caller is expected to mutate.
     outcome: RunOutcome = field(default_factory=lambda: RunOutcome())
 
-    # Prevent accidental field mutation — RunConfig is a value object.
-    # Use dataclasses.replace() to create modified copies.
     def __post_init__(self) -> None:
+        # Runs for every copy too (``dataclasses.replace`` goes through __init__),
+        # so no RunConfig — however it was made — carries an empty prompt.
         if not self.prompt:
             raise ValueError("RunConfig.prompt must not be empty")
 
     def with_prompt(self, prompt: str) -> RunConfig:
-        """Return a new RunConfig with a different prompt (immutable copy)."""
-        from dataclasses import replace
+        """A copy of this config that sends *prompt* instead; ``self`` is untouched.
 
-        return replace(self, prompt=prompt)
+        Every other field — ``outcome`` included — is the same object in both.
+        """
+        return dataclasses.replace(self, prompt=prompt)
