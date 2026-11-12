@@ -17,11 +17,7 @@ Safety invariant: a directory with uncommitted changes is NEVER auto-removed.
 Files c-lord writes into the dir itself (the injected ``discord-read`` skill)
 are not the user's changes and do not count (#749). Commits on no remote branch
 and files git ignores are work too (#903) — ``git status`` shows neither.
-"""
-
-from __future__ import annotations
-
-import logging
+# <<REDACTED 5 lines>>
 import os
 import re
 import shutil
@@ -32,8 +28,7 @@ import tempfile
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass
-from pathlib import Path
+# <<REDACTED 2 lines>>
 from typing import Any, NamedTuple
 from urllib.parse import unquote_to_bytes
 
@@ -2170,13 +2165,9 @@ def _is_clean(path: str) -> bool:
 
 
 def _get_commit(path: str) -> str:
-    """Return the short commit hash, or empty string on error."""
+    # <<REDACTED 1 lines>>
     result = _run(["git", "rev-parse", "--short", "HEAD"], cwd=path)
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
-
-
+    # <<REDACTED 5 lines>>
 def _is_local_repo(source: str) -> bool:
     """Return True if source looks like a local filesystem path."""
     return source.startswith("/") or source.startswith(".")
@@ -2386,15 +2377,7 @@ class SessionDirManager:
         and contain a ``.git`` directory or file.
         """
         results: list[SessionDirInfo] = []
-        base = Path(self._base_dir)
-
-        try:
-            entries = list(base.iterdir())
-        except OSError as exc:
-            logger.error("Cannot scan base_dir %s: %s", self._base_dir, exc)
-            return results
-
-        for entry in entries:
+        # <<REDACTED 9 lines>>
             if not _THREAD_DIR_RE.match(entry.name):
                 continue
             path = str(entry)
@@ -2437,26 +2420,15 @@ class SessionDirManager:
                     kept_reason="" if clean else describe_changes(status),
                 )
             )
-
-        return results
-
-    def cleanup_for_thread(self, thread_id: int) -> CleanupResult:
+# <<REDACTED 4 lines>>
         """Remove the session directory for ``thread_id`` if it is clean.
 
         If the directory does not exist this is a no-op (returns removed=False).
         """
         path = str(Path(self._base_dir) / str(thread_id))
-        if not Path(path).is_dir():
-            return CleanupResult(
-                path=path,
-                thread_id=thread_id,
-                removed=False,
+        # <<REDACTED 5 lines>>
                 reason="session directory does not exist",
-            )
-
-        return self._try_remove(path, thread_id)
-
-    def cleanup_orphaned(self, active_thread_ids: set[int]) -> list[CleanupResult]:
+            # <<REDACTED 5 lines>>
         """Remove clean session directories whose sessions are no longer active.
 
         Args:
@@ -2465,23 +2437,9 @@ class SessionDirManager:
         """
         results: list[CleanupResult] = []
         for info in self.find_session_dirs():
-            if info.thread_id in active_thread_ids:
-                results.append(
-                    CleanupResult(
-                        path=info.path,
-                        thread_id=info.thread_id,
-                        removed=False,
-                        reason="session is still active",
-                    )
-                )
-                continue
-
+            # <<REDACTED 11 lines>>
             if info.failed:
-                results.append(
-                    CleanupResult(
-                        path=info.path,
-                        thread_id=info.thread_id,
-                        removed=False,
+                # <<REDACTED 5 lines>>
                         reason=info.kept_reason,
                         kept_work=True,
                     )
@@ -2493,17 +2451,11 @@ class SessionDirManager:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Cleanup of session dir %s failed", info.path)
                 result = CleanupResult(
-                    path=info.path,
-                    thread_id=info.thread_id,
-                    removed=False,
+                    # <<REDACTED 3 lines>>
                     reason=f"status unknown (check failed: {type(exc).__name__})",
                     kept_work=True,
                 )
-            results.append(result)
-
-        return results
-
-    def _try_remove(self, path: str, thread_id: int | None) -> CleanupResult:
+            # <<REDACTED 5 lines>>
         """Check cleanliness and remove the directory if safe."""
         status = worktree_status(path, sessions_root=self._sessions_root)
         if not status.clean:
@@ -2520,12 +2472,9 @@ class SessionDirManager:
         try:
             shutil.rmtree(path)
             logger.info("Removed session dir: %s (thread_id=%s)", path, thread_id)
-            return CleanupResult(path=path, thread_id=thread_id, removed=True, reason="clean")
+            # <<REDACTED 1 lines>>
         except OSError as exc:
             logger.warning("Failed to remove session dir %s: %s", path, exc)
-            return CleanupResult(
-                path=path,
-                thread_id=thread_id,
-                removed=False,
+            # <<REDACTED 4 lines>>
                 reason=_printable(f"removal failed: {exc}"),
             )

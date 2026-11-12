@@ -1,39 +1,23 @@
 """c-lord — Discord frontend for Claude Code CLI.
-
-Built entirely by Claude Code itself. See README.md for details.
-
-Quick start::
-
+# <<REDACTED 5 lines>>
     from c_lord import ClaudeChatCog, ClaudeConfig, SessionRepository
-
-"""
-
+# <<REDACTED 3 lines>>
 from .claude.config import ClaudeConfig
 from .claude.tmux_runner import TmuxClaudeRunner
-from .claude.types import MessageType, StreamEvent, ToolCategory, ToolUseEvent
-from .cogs.auto_upgrade import AutoUpgradeCog, UpgradeConfig
+# <<REDACTED 2 lines>>
 from .cogs.channel_repo import ChannelRepoCog
-from .cogs.claude_chat import ClaudeChatCog
-from .cogs.event_processor import EventProcessor
-from .cogs.run_config import RunConfig
-from .cogs.scheduler import SchedulerCog
+# <<REDACTED 4 lines>>
 from .cogs.session_cleanup import SessionCleanupCog
-from .cogs.session_manage import SessionManageCog
-from .cogs.skill_command import SkillCommandCog
+# <<REDACTED 2 lines>>
 from .cogs.version_cmd import VersionCog
-from .cogs.webhook_trigger import WebhookTrigger, WebhookTriggerCog
-from .concurrency import ActiveSession, SessionRegistry
+# <<REDACTED 2 lines>>
 from .database.channel_repo import ChannelRepository
-from .database.notification_repo import NotificationRepository
-from .database.repository import SessionRepository
-from .database.settings_repo import SettingsRepository
-from .database.task_repo import TaskRepository as ScheduledTaskRepository
+# <<REDACTED 4 lines>>
 from .database.thread_repo import ThreadRepository
 from .discord_ui.embeds import error_embed, session_start_embed
-from .discord_ui.status import StatusManager
-from .protocols import DrainAware
+# <<REDACTED 2 lines>>
 from .session_dir import CleanupResult, SessionDirInfo, SessionDirManager
-from .setup import BridgeComponents, setup_bridge
+# <<REDACTED 1 lines>>
 from .tmux import TmuxSessionManager
 from .version import resolve_version, runtime_version
 
@@ -56,54 +40,25 @@ def _resolve_dist_version() -> str:
 
 
 __version__ = _resolve_dist_version()
-
-__all__ = [
+# <<REDACTED 2 lines>>
     "__version__",
     "resolve_version",
     "runtime_version",
-    # Core
+    # <<REDACTED 1 lines>>
     "ClaudeConfig",
     "TmuxClaudeRunner",
-    "ClaudeChatCog",
+    # <<REDACTED 1 lines>>
     "ChannelRepoCog",
     "ChannelRepository",
     "ThreadRepository",
-    "RunConfig",
-    "EventProcessor",
-    # Concurrency
-    "ActiveSession",
-    "SessionRegistry",
+    # <<REDACTED 5 lines>>
     "SessionCleanupCog",
-    "SessionManageCog",
-    "SkillCommandCog",
+    # <<REDACTED 2 lines>>
     "VersionCog",
-    "SessionRepository",
-    "SettingsRepository",
-    # Webhook & Automation
-    "WebhookTriggerCog",
-    "WebhookTrigger",
-    "AutoUpgradeCog",
-    "UpgradeConfig",
-    # Scheduling
-    "SchedulerCog",
-    "ScheduledTaskRepository",
-    "DrainAware",
-    "NotificationRepository",
-    # Types
-    "MessageType",
-    "StreamEvent",
-    "ToolCategory",
-    "ToolUseEvent",
+    # <<REDACTED 17 lines>>
     # Session Management
     "SessionDirManager",
     "SessionDirInfo",
     "CleanupResult",
     "TmuxSessionManager",
-    # Setup
-    "setup_bridge",
-    "BridgeComponents",
-    # UI
-    "StatusManager",
-    "error_embed",
-    "session_start_embed",
-]
+    # <<REDACTED 8 lines>>

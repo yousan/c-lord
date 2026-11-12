@@ -1,25 +1,10 @@
 """Cogs for c-lord."""
-
-from .auto_upgrade import AutoUpgradeCog
+# <<REDACTED 2 lines>>
 from .channel_repo import ChannelRepoCog
-from .claude_chat import ClaudeChatCog
-from .event_processor import EventProcessor
-from .run_config import RunConfig
-from .scheduler import SchedulerCog
+# <<REDACTED 4 lines>>
 from .session_cleanup import SessionCleanupCog
-from .session_manage import SessionManageCog
-from .skill_command import SkillCommandCog
-from .webhook_trigger import WebhookTriggerCog
-
-__all__ = [
-    "AutoUpgradeCog",
+# <<REDACTED 6 lines>>
     "ChannelRepoCog",
-    "ClaudeChatCog",
-    "EventProcessor",
-    "RunConfig",
-    "SchedulerCog",
+    # <<REDACTED 4 lines>>
     "SessionCleanupCog",
-    "SessionManageCog",
-    "SkillCommandCog",
-    "WebhookTriggerCog",
-]
+    # <<REDACTED 4 lines>>

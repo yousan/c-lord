@@ -1,21 +1,14 @@
 """Entry point for c-lord bot."""
-
-from __future__ import annotations
-
-import asyncio
+# <<REDACTED 4 lines>>
 import fcntl
 import hashlib
-import logging
-import os
-import signal
-import sys
+# <<REDACTED 4 lines>>
 from collections.abc import Callable, Coroutine
-from pathlib import Path
+# <<REDACTED 1 lines>>
 from typing import IO, TYPE_CHECKING, Any
-
+# <<REDACTED 1 lines>>
 from dotenv import find_dotenv, load_dotenv
-
-from .bot import ClaudeDiscordBot
+# <<REDACTED 2 lines>>
 from .claude.config import ClaudeConfig
 from .command_gate import is_trusted_bot_id_text
 from .coordination.env import MAX_ID_DIGITS as COORDINATION_MAX_ID_DIGITS
@@ -23,13 +16,11 @@ from .git_mirrors import stop_running_git
 from .session_cleanup import DirOutcome, retire_swept_workspace, sweep_days
 from .setup import setup_bridge
 from .shutdown_watchdog import arm_shutdown_watchdog, shutdown_timeout_from_env
-from .utils.logger import setup_logging
-
+# <<REDACTED 2 lines>>
 if TYPE_CHECKING:
     from .ext.api_server import ApiServer
 
-logger = logging.getLogger(__name__)
-
+# <<REDACTED 2 lines>>
 #: Defaults of the two numeric limits (#1119).
 _DEFAULT_MAX_CONCURRENT = "3"
 _DEFAULT_TIMEOUT = "300"
@@ -42,7 +33,7 @@ _MAX_LIMIT_DIGITS = 18
 #: each swept thread quotes it, and README/docs/COMMANDS.md now state it.
 SESSION_CLEANUP_DAYS = 30
 
-
+# <<REDACTED 1 lines>>
 def acquire_single_instance_lock(data_dir: Path) -> IO[bytes] | None:
     """Acquire an exclusive non-blocking flock on ``data_dir/.bot.lock``.
 
@@ -198,19 +189,11 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     # (env-var-only setups); the read skill then renders its path-less variant.
     if resolved_env_path:
         os.environ.setdefault("CLORD_ENV_PATH", resolved_env_path)
-
-    token = os.getenv("DISCORD_BOT_TOKEN", "")
-    if not token:
-        logger.error("DISCORD_BOT_TOKEN is required")
-        sys.exit(1)
-
+# <<REDACTED 6 lines>>
     # #1194: spaces around an ID (``KEY="123 "``) started before #1084 — ``int()``
     # ignores them — so strip them here, as the counts below do (#1119).
     channel_id = os.getenv("DISCORD_CHANNEL_ID", "").strip()
-    if not channel_id:
-        logger.error("DISCORD_CHANNEL_ID is required")
-        sys.exit(1)
-
+    # <<REDACTED 4 lines>>
     # Every Discord ID is "ASCII digits only" (#1084). ``isdigit()`` alone is
     # True for ``²`` and full-width digits, and the channel id was only checked
     # for being non-empty — so ``int()`` further down raised ValueError and the
@@ -298,25 +281,19 @@ def load_config(env_path: Path | None = None) -> dict[str, str]:
     max_concurrent = limits["MAX_CONCURRENT_SESSIONS"]
     timeout = limits["SESSION_TIMEOUT_SECONDS"]
 
-    return {
-        "token": token,
-        "channel_id": channel_id,
+    # <<REDACTED 3 lines>>
         "expected_bot_user_id": expected_bot_user_id,
-        "claude_command": os.getenv("CLAUDE_COMMAND", "claude"),
-        "claude_model": os.getenv("CLAUDE_MODEL", "sonnet"),
+        # <<REDACTED 2 lines>>
         "claude_effort": os.getenv("CLAUDE_EFFORT", ""),
         # #918: where those two came from, for the /model display.
         "claude_model_source": _env_source("CLAUDE_MODEL", resolved_env_path, "組み込み既定"),
         "claude_effort_source": _env_source("CLAUDE_EFFORT", resolved_env_path, "未設定"),
-        "claude_permission_mode": os.getenv("CLAUDE_PERMISSION_MODE", "acceptEdits"),
-        "claude_working_dir": os.getenv("CLAUDE_WORKING_DIR", ""),
+        # <<REDACTED 2 lines>>
         "max_concurrent": max_concurrent,
         "timeout": timeout,
         "owner_id": owner_id_raw,
         "coordination_channel_id": coordination_raw,
-    }
-
-
+    # <<REDACTED 3 lines>>
 # Where the REST API listens when ``CLORD_API_PORT`` is not set.
 DEFAULT_API_PORT = 8080
 #: The largest TCP port; a larger CLORD_API_PORT is refused, not a crash (#1237).
@@ -488,17 +465,17 @@ def install_shutdown_signal_handlers(
         stop_running_git()
         loop.create_task(shutdown())
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    # <<REDACTED 1 lines>>
         loop.add_signal_handler(sig, _on_signal)
 
 
 async def main(env_path: Path | None = None) -> None:
-    """Start the bot."""
+    # <<REDACTED 1 lines>>
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     setup_logging(log_level)
     config = load_config(env_path)
-
+# <<REDACTED 1 lines>>
     data_dir = resolve_data_dir(env_path)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -513,42 +490,28 @@ async def main(env_path: Path | None = None) -> None:
     # double-connect launched from a different clone/directory.
     _token_lock = acquire_token_lock(config["token"])  # noqa: F841
 
-    db_path = str(data_dir / "sessions.db")
-
+    # <<REDACTED 2 lines>>
     runner = ClaudeConfig(
-        command=config["claude_command"],
-        model=config["claude_model"],
+        # <<REDACTED 2 lines>>
         effort=config["claude_effort"] or None,
         model_source=config.get("claude_model_source"),
         effort_source=config.get("claude_effort_source"),
-        permission_mode=config["claude_permission_mode"],
-        working_dir=config["claude_working_dir"] or None,
-        timeout_seconds=int(config["timeout"]),
-    )
-
-    owner_id = int(config["owner_id"]) if config["owner_id"] else None
-    coordination_channel_id = (
-        int(config["coordination_channel_id"]) if config["coordination_channel_id"] else None
-    )
+        # <<REDACTED 9 lines>>
     allowed_user_ids = {owner_id} if owner_id else None
     allowed_role_name = os.getenv("CLORD_ALLOWED_ROLE") or None
 
-    bot = ClaudeDiscordBot(
-        channel_id=int(config["channel_id"]),
-        owner_id=owner_id,
-        coordination_channel_id=coordination_channel_id,
+    # <<REDACTED 4 lines>>
         expected_bot_user_id=(
             int(config["expected_bot_user_id"]) if config["expected_bot_user_id"] else None
         ),
-    )
-
+    # <<REDACTED 2 lines>>
     api_server = await build_api_server(
         bot,
         default_channel_id=int(config["channel_id"]),
         data_dir=data_dir,
     )
 
-    async with bot:
+    # <<REDACTED 1 lines>>
         components = await setup_bridge(
             bot,
             runner,
@@ -561,7 +524,7 @@ async def main(env_path: Path | None = None) -> None:
             enable_scheduler=True,
             max_concurrent=int(config["max_concurrent"]),
         )
-
+# <<REDACTED 1 lines>>
         await start_api_server(api_server)
 
         # Cleanup old sessions on startup.
@@ -609,9 +572,7 @@ async def main(env_path: Path | None = None) -> None:
                 sweep_days_value,
                 [r.thread_id for r in deleted],
             )
-
-        # Handle signals
-        loop = asyncio.get_running_loop()
+# <<REDACTED 3 lines>>
 
         async def _shutdown() -> None:
             if api_server is not None:
@@ -619,9 +580,4 @@ async def main(env_path: Path | None = None) -> None:
             await bot.close()
 
         install_shutdown_signal_handlers(loop, _shutdown)
-
-        await bot.start(config["token"])
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# <<REDACTED 6 lines>>

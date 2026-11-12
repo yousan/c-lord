@@ -1,116 +1,41 @@
 """One-call setup for all c-lord bridge Cogs.
-
-Consumers call this instead of manually wiring each Cog.
+# <<REDACTED 2 lines>>
 New Cogs added to c-lord are automatically included — no consumer code changes needed.
-"""
-
-from __future__ import annotations
-
-import logging
-import os
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from discord.ext.commands import Bot
-
+# <<REDACTED 12 lines>>
     from .claude.config import ClaudeConfig
-    from .database.lounge_repo import LoungeRepository
-    from .database.repository import SessionRepository
-    from .database.resume_repo import PendingResumeRepository
-    from .database.task_repo import TaskRepository
-    from .ext.api_server import ApiServer
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class BridgeComponents:
-    """References to initialized bridge components.
-
-    After calling setup_bridge(), pass this to apply_to_api_server() so the
-    ApiServer gains access to all repos without manual wiring::
-
+    # <<REDACTED 16 lines>>
         components = await setup_bridge(bot, config, api_server=api_server)
-
-    Or manually if you need more control::
-
+# <<REDACTED 3 lines>>
         components = await setup_bridge(bot, config)
-        components.apply_to_api_server(api_server)
-    """
-
-    session_repo: SessionRepository
-    task_repo: TaskRepository | None = None
-    lounge_repo: LoungeRepository | None = None
-    resume_repo: PendingResumeRepository | None = None
+        # <<REDACTED 7 lines>>
     #: Where per-thread session dirs are cloned (``<base>/<channel>/<thread>``),
     #: as resolved by setup — the 30-day sweep deletes only under it (#902).
     session_dir_base: str | None = None
-
-    def apply_to_api_server(self, api_server: ApiServer) -> None:
-        """Wire all optional repos to an ApiServer instance.
-
-        Idempotent — safe to call multiple times.  Only non-None repos are
-        applied, so repos that are disabled (e.g. scheduler off) are left as-is.
-
-        When a new repo is added to BridgeComponents in the future, add it here
-        and consumers automatically pick it up without changing their own code.
-        """
-        if self.task_repo is not None:
-            api_server.task_repo = self.task_repo
-        if self.lounge_repo is not None:
-            api_server.lounge_repo = self.lounge_repo
-        if self.resume_repo is not None:
-            api_server.resume_repo = self.resume_repo
-        api_server.session_repo = self.session_repo
+# <<REDACTED 17 lines>>
         api_server.session_dir_base = self.session_dir_base
-
-
-async def setup_bridge(
-    bot: Bot,
+# <<REDACTED 4 lines>>
     runner: ClaudeConfig,
-    *,
-    api_server: ApiServer | None = None,
-    session_db_path: str = "data/sessions.db",
-    allowed_user_ids: set[int] | None = None,
+    # <<REDACTED 4 lines>>
     allowed_role_name: str | None = None,
-    claude_channel_id: int | None = None,
-    enable_scheduler: bool = True,
-    task_db_path: str = "data/tasks.db",
-    lounge_channel_id: int | None = None,
+    # <<REDACTED 4 lines>>
     session_dir_base: str | None = None,
     session_source_repo: str | None = None,
     enable_tmux: bool = True,
     max_concurrent: int = 3,
-) -> BridgeComponents:
+# <<REDACTED 1 lines>>
     """Initialize and register all c-lord Cogs in one call.
-
+# <<REDACTED 1 lines>>
     This is the recommended way for consumers to set up c-lord.
     New Cogs added to c-lord will be automatically included.
-
-    Pass ``api_server`` to automatically wire all repos and set the runner's
-    ``api_port`` — consumers then need zero manual wiring::
-
-        components = await setup_bridge(bot, runner, api_server=api_server, ...)
-        # Done — no manual repo wiring needed.
-
-    Args:
-        bot: Discord bot instance.
+# <<REDACTED 9 lines>>
         runner: ClaudeConfig with CLI invocation settings.
-        api_server: Optional ApiServer to auto-wire repos into.  Also sets
+        # <<REDACTED 1 lines>>
                     runner.api_port so CLORD_API_URL is available to Claude.
-        session_db_path: Path for session SQLite DB.
-        allowed_user_ids: Set of Discord user IDs allowed to use Claude.
+        # <<REDACTED 2 lines>>
         allowed_role_name: Discord role name whose members are allowed to use Claude.
                            OR logic with allowed_user_ids.  Defaults to
                            CLORD_ALLOWED_ROLE env var, or None (disabled).
-        claude_channel_id: Channel ID for Claude chat (needed for SkillCommandCog).
-        enable_scheduler: Whether to enable SchedulerCog.
-        task_db_path: Path for scheduled tasks SQLite DB.
-        lounge_channel_id: Discord channel ID for AI Lounge messages.
-                           Defaults to COORDINATION_CHANNEL_ID env var so
-                           lounge and coordination share the same channel
-                           with no extra configuration needed.
+        # <<REDACTED 7 lines>>
         session_dir_base: Base directory for session clone directories.
                           When set with ``session_source_repo``, a
                           SessionDirManager is created and attached to the bot.
@@ -128,27 +53,17 @@ async def setup_bridge(
         max_concurrent: Maximum number of Claude sessions processed at once
                         (the semaphore limit behind the "Waiting for a free
                         session slot" message). Defaults to 3.
-
-    Returns:
-        BridgeComponents with references to initialized repositories.
-    """
+# <<REDACTED 4 lines>>
     from .cogs.channel_repo import ChannelRepoCog
-    from .cogs.claude_chat import ClaudeChatCog
-    from .cogs.scheduler import SchedulerCog
+    # <<REDACTED 2 lines>>
     from .cogs.session_cleanup import SessionCleanupCog
-    from .cogs.session_manage import SessionManageCog
-    from .cogs.skill_command import SkillCommandCog
+    # <<REDACTED 2 lines>>
     from .cogs.transcript_mirror import TranscriptMirrorCog
     from .cogs.version_cmd import VersionCog
-    from .database.ask_repo import PendingAskRepository
+    # <<REDACTED 1 lines>>
     from .database.channel_repo import ChannelRepository
     from .database.devenv_repo import DevEnvRepository
-    from .database.lounge_repo import LoungeRepository
-    from .database.models import init_db
-    from .database.repository import SessionRepository
-    from .database.resume_repo import PendingResumeRepository
-    from .database.settings_repo import SettingsRepository
-    from .database.task_repo import TaskRepository
+    # <<REDACTED 6 lines>>
     from .database.thread_repo import ThreadRepository
     from .discord_ui.authorization import Authorizer
     from .legacy_env import warn_removed_delivery_env
@@ -175,7 +90,7 @@ async def setup_bridge(
             age,
             version,
         )
-
+# <<REDACTED 1 lines>>
     # Role-based access control — auto-read from env var if not explicitly provided
     if allowed_role_name is None:
         allowed_role_name = os.getenv("CLORD_ALLOWED_ROLE") or None
@@ -192,12 +107,11 @@ async def setup_bridge(
     # call setup_bridge() themselves get the notice too (Zero-Config).
     warn_removed_delivery_env()
 
-    # Lounge shares the coordination channel unless explicitly overridden
-    if lounge_channel_id is None:
+    # <<REDACTED 2 lines>>
         from .coordination.env import coordination_channel_id_from_env
 
         lounge_channel_id = coordination_channel_id_from_env()  # #1194
-
+# <<REDACTED 1 lines>>
     # Global SessionDirManager and TmuxSessionManager are no longer created here.
     # Per-channel managers are resolved dynamically via ChannelRepoCog.
     # The session_dir_base parameter is still accepted and forwarded to
@@ -234,42 +148,20 @@ async def setup_bridge(
             DeprecationWarning,
             stacklevel=2,
         )
-
-    # --- Session DB (also hosts lounge_messages and pending_resumes tables) ---
-    os.makedirs(os.path.dirname(session_db_path) or ".", exist_ok=True)
-    await init_db(session_db_path)
-    session_repo = SessionRepository(session_db_path)
-    settings_repo = SettingsRepository(session_db_path)
-    ask_repo = PendingAskRepository(session_db_path)
-    lounge_repo = LoungeRepository(session_db_path)
-    resume_repo = PendingResumeRepository(session_db_path)
-    logger.info("Session DB initialized: %s", session_db_path)
-
-    # Attach repos to bot so generic cogs (e.g. AutoUpgradeCog) can discover them
+# <<REDACTED 12 lines>>
     # without a hard import dependency on c-lord internals.
-    bot.session_repo = session_repo  # type: ignore[attr-defined]
-    bot.resume_repo = resume_repo  # type: ignore[attr-defined]
+    # <<REDACTED 2 lines>>
     bot.ask_repo = ask_repo  # type: ignore[attr-defined]
     bot.lounge_repo = lounge_repo  # type: ignore[attr-defined]
     bot.lounge_channel_id = lounge_channel_id  # type: ignore[attr-defined]
-
-    # --- ClaudeChatCog ---
-    chat_cog = ClaudeChatCog(
-        bot,  # type: ignore[arg-type]  # consumers pass their own Bot subclass
-        repo=session_repo,
-        runner=runner,
+# <<REDACTED 6 lines>>
         max_concurrent=max_concurrent,
-        allowed_user_ids=allowed_user_ids,
+        # <<REDACTED 1 lines>>
         allowed_role_name=allowed_role_name,
         authorizer=authorizer,
-        ask_repo=ask_repo,
-        lounge_repo=lounge_repo,
-        resume_repo=resume_repo,
-        settings_repo=settings_repo,
-    )
-    await bot.add_cog(chat_cog)
+        # <<REDACTED 6 lines>>
     logger.info("Registered ClaudeChatCog (max_concurrent=%d)", max_concurrent)
-
+# <<REDACTED 1 lines>>
     # --- Dev environment ownership (#573, wired in #612) ---
     # init_db() here is what creates the `dev_environments` table. #573 shipped
     # the repository without a single call site, so the table never existed on
@@ -277,17 +169,10 @@ async def setup_bridge(
     devenv_repo = DevEnvRepository(session_db_path)
     await devenv_repo.init_db()
 
-    # --- SessionManageCog ---
-    session_manage_cog = SessionManageCog(
-        bot,  # type: ignore[arg-type]  # consumers pass their own Bot subclass
-        repo=session_repo,
-        settings_repo=settings_repo,
+    # <<REDACTED 5 lines>>
         devenv_repo=devenv_repo,
         authorizer=authorizer,
-    )
-    await bot.add_cog(session_manage_cog)
-    logger.info("Registered SessionManageCog")
-
+    # <<REDACTED 4 lines>>
     # --- ChannelRepoCog (per-channel and per-thread repo bindings, zero-config) ---
     channel_repo = ChannelRepository(session_db_path)
     await channel_repo.init_db()
@@ -297,30 +182,19 @@ async def setup_bridge(
         bot,
         repo=channel_repo,
         thread_repo=thread_repo,
-        allowed_user_ids=allowed_user_ids,
+        # <<REDACTED 1 lines>>
         allowed_role_name=allowed_role_name,
         authorizer=authorizer,
         session_dir_base=session_dir_base,
-        session_repo=session_repo,
+        # <<REDACTED 1 lines>>
     )
     await bot.add_cog(channel_repo_cog)
     logger.info("Registered ChannelRepoCog")
 
-    # --- SkillCommandCog (requires channel ID) ---
-    if claude_channel_id is not None:
-        skill_cog = SkillCommandCog(
-            bot,
-            repo=session_repo,
-            runner=runner,
-            claude_channel_id=claude_channel_id,
-            allowed_user_ids=allowed_user_ids,
+    # <<REDACTED 8 lines>>
             allowed_role_name=allowed_role_name,
             authorizer=authorizer,
-            settings_repo=settings_repo,
-        )
-        await bot.add_cog(skill_cog)
-        logger.info("Registered SkillCommandCog")
-
+            # <<REDACTED 5 lines>>
     # --- SessionCleanupCog (#554) ---
     # Announce-only: it posts the 「記録を整理しました」 notice for rows the 30-day
     # sweep deleted, and never deletes anything itself. Registering it
@@ -355,16 +229,7 @@ async def setup_bridge(
     await bot.add_cog(VersionCog(bot))
     logger.info("Registered VersionCog")
 
-    # --- SchedulerCog (optional) ---
-    task_repo: TaskRepository | None = None
-    if enable_scheduler:
-        os.makedirs(os.path.dirname(task_db_path) or ".", exist_ok=True)
-        task_repo = TaskRepository(task_db_path)
-        await task_repo.init_db()
-        scheduler_cog = SchedulerCog(bot, runner, repo=task_repo)
-        await bot.add_cog(scheduler_cog)
-        logger.info("Registered SchedulerCog")
-
+    # <<REDACTED 10 lines>>
     # --- Thread state sync loop (Issue #95) ---
     # Refreshes the leading status emoji + trailing #window-index hint on each
     # Discord thread once per minute.  Topic body is never touched.
@@ -535,17 +400,8 @@ async def setup_bridge(
 
     from .clord_home import LEGACY_SESSION_DIR_BASE
 
-    components = BridgeComponents(
-        session_repo=session_repo,
-        task_repo=task_repo,
-        lounge_repo=lounge_repo,
-        resume_repo=resume_repo,
+    # <<REDACTED 5 lines>>
         session_dir_base=session_dir_base or LEGACY_SESSION_DIR_BASE,
-    )
-
+    # <<REDACTED 2 lines>>
     # Auto-wire repos to ApiServer if provided
-    if api_server is not None:
-        components.apply_to_api_server(api_server)
-        logger.info("Auto-wired repos to ApiServer (port=%d)", api_server.port)
-
-    return components
+    # <<REDACTED 5 lines>>

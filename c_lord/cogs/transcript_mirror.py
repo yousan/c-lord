@@ -12,18 +12,10 @@ Lifecycle:
 - :meth:`start_for` is called from :mod:`c_lord.cogs.claude_chat` when a new
   thread is provisioned (or an existing thread continues a session).
 - :meth:`cog_unload` cancels all running mirror tasks cleanly.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import contextlib
-import logging
+# <<REDACTED 7 lines>>
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-import discord
+# <<REDACTED 3 lines>>
 from discord.ext import commands
 
 from .. import turn_events
@@ -155,9 +147,7 @@ class TranscriptMirrorCog(commands.Cog):
         mirror = self._mirrors.get(thread_id)
         if mirror is not None:
             mirror.note_turn_started(trigger_id=message_id)
-
-    @commands.Cog.listener()
-    async def on_ready(self) -> None:
+# <<REDACTED 3 lines>>
         # #1249: completions the previous process held for background agents.
         turn_events.restore_held()
         # Sessions are bounded by Discord usage; 10k is well above realistic.

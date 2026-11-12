@@ -24,12 +24,7 @@ the leading ``W<N> │`` work-number hint are kept fresh.  A session closed with
 ``/close-workspace`` keeps its ``[終了]`` marker here (#512): the loop sees it as
 ``dead`` like any window-less thread, so without the flag the repaint would strip
 the marker off.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import contextlib
+# <<REDACTED 6 lines>>
 import datetime
 import hashlib
 import logging
@@ -37,9 +32,7 @@ import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-import discord
+# <<REDACTED 3 lines>>
 
 from .discord_failures import DISCORD_CALL_FAILURES
 from .log_sampler import LogSampler
@@ -54,11 +47,7 @@ from .session_close import is_closed
 from .thread_name import build_name, note_own_rename
 from .tmux import _is_ascii_number, parse_work_number
 from .utils.logger import log_ctx
-
-if TYPE_CHECKING:
-    from discord.ext.commands import Bot
-
-    from .database.repository import SessionRepository
+# <<REDACTED 5 lines>>
 
 logger = logging.getLogger(__name__)
 

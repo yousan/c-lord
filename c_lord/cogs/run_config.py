@@ -1,36 +1,17 @@
-"""Configuration dataclass for Claude Code execution.
-
-Bundles all parameters needed to execute Claude Code CLI and stream results
-to a Discord thread. Using a dataclass instead of a long positional argument
-list makes call sites more readable and extension safer (new fields can be
-added without changing every caller).
-"""
-
-from __future__ import annotations
-
+# <<REDACTED 10 lines>>
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-import discord
-
+# <<REDACTED 4 lines>>
 from ..claude.tmux_runner import TmuxClaudeRunner
 from ..claude.types import UsageLimit
-from ..concurrency import SessionRegistry
-from ..database.ask_repo import PendingAskRepository
-from ..database.lounge_repo import LoungeRepository
-from ..database.repository import SessionRepository
-from ..database.settings_repo import SettingsRepository
+# <<REDACTED 5 lines>>
 from ..discord_ui.authorization import Authorizer
-from ..discord_ui.status import StatusManager
+# <<REDACTED 1 lines>>
 from ..turn_events import StartedBy, TurnInfo
-
-if TYPE_CHECKING:
-    from ..discord_ui.views import StopView
+# <<REDACTED 3 lines>>
     from ..session_dir import SessionDirManager
     from ..tmux import TmuxSessionManager
-
-
+# <<REDACTED 2 lines>>
 @dataclass
 class RunOutcome:
     """What a completed run needs to tell its caller (#562).
@@ -73,24 +54,13 @@ class RunOutcome:
     turn: TurnInfo | None = None
 
 
-@dataclass
-class RunConfig:
-    """All parameters needed for a single Claude Code execution.
-
-    Required fields:
-        thread: Discord thread to post results to.
+# <<REDACTED 6 lines>>
         runner: A TmuxClaudeRunner instance for this thread.
-        prompt: The user's message or skill invocation.
-
-    Optional fields:
-        session_id: Session ID to resume. None for new sessions.
-        repo: Session repository for persisting thread-session mappings.
-              Pass None for automated workflows without session persistence.
-        status: StatusManager for emoji reactions on the user's message.
+        # <<REDACTED 7 lines>>
         registry: SessionRegistry. When provided, the session is registered
                   during execution (``/workspace-cleanup`` reads it). Nothing
                   is sent to Claude (#758/#766).
-        ask_repo: Repository for persisting AskUserQuestion state across restarts.
+        # <<REDACTED 1 lines>>
         lounge_repo: Unused since #766 (the lounge text was never delivered —
                      #758). Kept so existing callers keep working.
         settings_repo: KV store for the persisted per-model context-window total
@@ -108,27 +78,17 @@ class RunConfig:
         tmux_manager: Read by nothing here, for the same reason — a thread's
                       tmux window outlives its turns. Kept so existing callers
                       keep working.
-    """
-
-    thread: discord.Thread
+    # <<REDACTED 3 lines>>
     runner: TmuxClaudeRunner
-    prompt: str
-    session_id: str | None = None
-    repo: SessionRepository | None = None
-    status: StatusManager | None = None
-    registry: SessionRegistry | None = None
-    ask_repo: PendingAskRepository | None = None
-    lounge_repo: LoungeRepository | None = None
+    # <<REDACTED 7 lines>>
     # #370: persists the per-model context-window total so the /context probe
     # (which renders into the human-visible tmux pane) fires at most once per
     # model per host instead of once per session / bot-restart.
     settings_repo: SettingsRepository | None = None
-    stop_view: StopView | None = None
+    # <<REDACTED 1 lines>>
     session_dir_manager: SessionDirManager | None = None
     tmux_manager: TmuxSessionManager | None = None
-    # Paths to downloaded image tempfiles passed via --image flags.
-    # Cleaned up in run_claude_with_config() finally block.
-    image_paths: list[str] | None = None
+    # <<REDACTED 3 lines>>
     # Absolute path of the session's working directory. Persisted to the
     # sessions DB so TranscriptMirrorCog can restart mirrors after a bot
     # restart. None when no session_dir_manager.
@@ -168,21 +128,11 @@ class RunConfig:
     # #1262: called right before the prompt is handed to tmux — after this, a
     # cancelled turn may still have delivered it. ``None`` ⇒ nothing to do.
     on_send_started: Callable[[], None] | None = None
-
+# <<REDACTED 1 lines>>
     # #562: how the run turned out, written by the runner side and read by the
     # caller after it returns. RunConfig's *inputs* stay a value object; this is
     # a separate, explicitly mutable output channel rather than a field the
     # caller is expected to mutate.
     outcome: RunOutcome = field(default_factory=lambda: RunOutcome())
 
-    # Prevent accidental field mutation — RunConfig is a value object.
-    # Use dataclasses.replace() to create modified copies.
-    def __post_init__(self) -> None:
-        if not self.prompt:
-            raise ValueError("RunConfig.prompt must not be empty")
-
-    def with_prompt(self, prompt: str) -> RunConfig:
-        """Return a new RunConfig with a different prompt (immutable copy)."""
-        from dataclasses import replace
-
-        return replace(self, prompt=prompt)
+    # <<REDACTED 11 lines>>
