@@ -1552,6 +1552,21 @@ def _normalize_capture(text: str) -> str:
     return text
 
 
+def _turn_result(*, error: str | None, usage_limit: UsageLimit | None = None) -> StreamEvent:
+    """The one event that tells whoever consumes a turn that it is over.
+
+    ``is_complete`` is what the consumer watches for; ``error`` is None for a
+    turn that simply finished.
+    """
+    return StreamEvent(
+        raw={},
+        message_type=MessageType.RESULT,
+        is_complete=True,
+        error=error,
+        usage_limit=usage_limit,
+    )
+
+
 class TmuxClaudeRunner:
     """Runs Claude Code inside a tmux window and streams output via capture-pane.
 
@@ -1577,6 +1592,7 @@ class TmuxClaudeRunner:
         # #1223: the turn-end bus token of the turn in progress, if any.
         self._turn_token: object | None = None
         self.model = model
+        # Public on purpose: Cogs read both back when they build a runner like this one.
         self.working_dir = working_dir
         self.timeout_seconds = timeout_seconds
         self._permission_mode = permission_mode
@@ -1932,10 +1948,7 @@ class TmuxClaudeRunner:
                     )
                 else:
                     reason = _delivery_failure("メッセージの送信", prompt)
-                yield StreamEvent(
-                    raw={},
-                    message_type=MessageType.RESULT,
-                    is_complete=True,
+                yield _turn_result(
                     # #701: the fleet's tmux going down explains every one of the
                     # reasons above, and none of them can say so — the pane they
                     # describe belonged to a server that is gone.
@@ -1967,10 +1980,7 @@ class TmuxClaudeRunner:
                 )
                 if not ok:
                     self.send_refused = True  # #1271: nothing reached the pane
-                    yield StreamEvent(
-                        raw={},
-                        message_type=MessageType.RESULT,
-                        is_complete=True,
+                    yield _turn_result(
                         error=(
                             await self._fleet_tmux_error(server_at_start)
                             or await self._start_failure_reason(prompt)
@@ -1998,10 +2008,7 @@ class TmuxClaudeRunner:
                     )
                     if not ok:
                         self.send_refused = True  # #1271: nothing reached the pane
-                        yield StreamEvent(
-                            raw={},
-                            message_type=MessageType.RESULT,
-                            is_complete=True,
+                        yield _turn_result(
                             error=(
                                 await self._fleet_tmux_error(server_at_start)
                                 or await self._start_failure_reason(prompt)
@@ -2026,10 +2033,7 @@ class TmuxClaudeRunner:
                 )
                 if not ok:
                     self.send_refused = True  # #1271: nothing reached the pane
-                    yield StreamEvent(
-                        raw={},
-                        message_type=MessageType.RESULT,
-                        is_complete=True,
+                    yield _turn_result(
                         error=(
                             await self._fleet_tmux_error(server_at_start)
                             or await self._start_failure_reason(prompt)
@@ -2859,10 +2863,7 @@ class TmuxClaudeRunner:
             # discord-reply skill, not through the runner stream.
             error = None
 
-        yield StreamEvent(
-            raw={},
-            message_type=MessageType.RESULT,
-            is_complete=True,
+        yield _turn_result(
             error=error,
             usage_limit=usage_limit,
         )

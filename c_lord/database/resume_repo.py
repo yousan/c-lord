@@ -1,36 +1,33 @@
-"""Repository for pending session resumes after bot restart.
+"""Threads to pick up again after a restart (the ``pending_resumes`` table).
 
-A Claude Code session that is about to restart the bot writes a row to
-``pending_resumes`` via :meth:`PendingResumeRepository.mark`.  On startup
-the bot calls :meth:`get_pending` to collect rows that are still within the
-TTL window, processes them (re-spawning Claude in those threads), then calls
-:meth:`delete` to prevent duplicate resumes.
-
-Safety guarantees
------------------
-* **Single-fire**: rows are deleted immediately after being read, so a
-  second restart within the TTL window does not cause a double-resume.
-* **TTL**: rows older than *ttl_minutes* (default 5) are silently ignored
-  and pruned, preventing stale resumes from triggering after a long downtime.
-* **UNIQUE constraint** on ``thread_id``: only one pending resume per thread
-  can exist at a time; writing a second one overwrites the first.
+Before c-lord restarts itself it leaves a mark for each thread whose work should
+continue; the next process reads the marks, resumes those threads and removes
+them. A mark is only good for a few minutes — one that is older belongs to a
+restart that never came back, and resuming it later would start work nobody is
+waiting for.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
-import aiosqlite
+from . import _sqlite
 
 logger = logging.getLogger(__name__)
 
+#: How long a mark stays valid, in minutes.
 DEFAULT_TTL_MINUTES = 5
+
+_TABLE = "pending_resumes"
 
 
 @dataclass
 class PendingResume:
-    """One row from the ``pending_resumes`` table."""
+    """One mark: resume *thread_id* (as *session_id*, saying *resume_prompt*).
+
+    The fields are the table's columns, in the table's order.
+    """
 
     id: int
     thread_id: int
@@ -40,8 +37,15 @@ class PendingResume:
     created_at: str
 
 
+_SELECT = f"SELECT {', '.join(f.name for f in fields(PendingResume))} FROM {_TABLE}"
+
+# Cut-off for a mark's ``created_at``: the TTL is taken off the clock first and
+# the result is then put into local time, the form ``created_at`` is stored in.
+_EXPIRY = "datetime('now', ?, 'localtime')"
+
+
 class PendingResumeRepository:
-    """Async CRUD for the ``pending_resumes`` table."""
+    """Async access to ``pending_resumes``. At most one mark per thread."""
 
     def __init__(self, db_path: str, ttl_minutes: int = DEFAULT_TTL_MINUTES) -> None:
         self._db_path = db_path
@@ -55,73 +59,48 @@ class PendingResumeRepository:
         reason: str = "self_restart",
         resume_prompt: str | None = None,
     ) -> int:
-        """Insert (or replace) a pending resume for *thread_id*.
+        """Mark *thread_id* for resume and return the mark's id.
 
-        Returns the row id of the inserted/replaced row.
-        The UNIQUE constraint on thread_id means only the latest mark survives.
+        A mark the thread already had is replaced: the new one has a new id and
+        a fresh ``created_at`` (both are SQLite's to give).
         """
-        async with aiosqlite.connect(self._db_path) as db:
-            cursor = await db.execute(
-                """
-                INSERT OR REPLACE INTO pending_resumes
-                    (thread_id, session_id, reason, resume_prompt)
-                VALUES (?, ?, ?, ?)
-                """,
-                (thread_id, session_id, reason, resume_prompt),
-            )
-            await db.commit()
-            row_id: int = cursor.lastrowid or 0
-        logger.info("Marked thread %d for resume (reason=%s, row_id=%d)", thread_id, reason, row_id)
+        row_id = await _sqlite.insert(
+            self._db_path,
+            _TABLE,
+            {
+                "thread_id": thread_id,
+                "session_id": session_id,
+                "reason": reason,
+                "resume_prompt": resume_prompt,
+            },
+            replace=True,
+        )
+        logger.info("Marked thread %s for resume (reason=%s, row_id=%s)", thread_id, reason, row_id)
         return row_id
 
     async def get_pending(self) -> list[PendingResume]:
-        """Return all pending resumes within the TTL window.
+        """The marks still valid, oldest first.
 
-        Rows outside the TTL are pruned in the same call so they don't
-        accumulate indefinitely.
+        Marks at or past the TTL are deleted first (SQLite does the clock
+        arithmetic). The ones returned stay in the table — the caller deletes
+        each as it handles it.
         """
-        async with aiosqlite.connect(self._db_path) as db:
-            db.row_factory = aiosqlite.Row
-
-            # Prune expired rows first
+        async with _sqlite.connection(self._db_path) as db:
             await db.execute(
-                """
-                DELETE FROM pending_resumes
-                WHERE created_at <= datetime('now', :ttl, 'localtime')
-                """,
-                {"ttl": f"-{self._ttl_minutes} minutes"},
+                f"DELETE FROM {_TABLE} WHERE created_at <= {_EXPIRY}",
+                (f"-{self._ttl_minutes} minutes",),
             )
             await db.commit()
+            valid = await db.execute(f"{_SELECT} ORDER BY created_at")
+            return [PendingResume(*row) for row in await valid.fetchall()]
 
-            cursor = await db.execute(
-                """
-                SELECT id, thread_id, session_id, reason, resume_prompt, created_at
-                FROM pending_resumes
-                ORDER BY created_at ASC
-                """
-            )
-            rows = await cursor.fetchall()
-
-        return [
-            PendingResume(
-                id=row["id"],
-                thread_id=row["thread_id"],
-                session_id=row["session_id"],
-                reason=row["reason"],
-                resume_prompt=row["resume_prompt"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+    async def _forget(self, column: str, value: int) -> None:
+        await _sqlite.write(self._db_path, f"DELETE FROM {_TABLE} WHERE {column} = ?", (value,))
 
     async def delete(self, row_id: int) -> None:
-        """Delete a pending resume by its row id (call after processing)."""
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute("DELETE FROM pending_resumes WHERE id = ?", (row_id,))
-            await db.commit()
+        """Remove one mark by its id. A missing one is not an error."""
+        await self._forget("id", row_id)
 
     async def delete_by_thread(self, thread_id: int) -> None:
-        """Delete a pending resume by thread id (alternative cleanup path)."""
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute("DELETE FROM pending_resumes WHERE thread_id = ?", (thread_id,))
-            await db.commit()
+        """Remove the mark of *thread_id*, if it has one."""
+        await self._forget("thread_id", thread_id)
