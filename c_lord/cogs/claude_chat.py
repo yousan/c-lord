@@ -1,16 +1,31 @@
-# <<REDACTED 6 lines>>
+"""The chat cog: conversations with Claude Code held in Discord threads.
+
+What happens to a message:
+1. It arrives in a thread that c-lord holds a session for
+2. Its text is handed to that thread's Claude Code session
+3. The session is kept, so the next message continues the same conversation
 4. The status reaction on the trigger message follows the turn
 5. The transcript mirror posts Claude's answer to the thread
-# <<REDACTED 7 lines>>
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
 import re
 import weakref
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
-# <<REDACTED 5 lines>>
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
 from .. import issue_ref as issue_ref_module
 from .. import topic as topic_module
 from .. import turn_events
@@ -19,9 +34,13 @@ from ..attachments import ensure_git_excluded, save_attachment
 from ..claude.config import ClaudeConfig
 from ..claude.tmux_runner import TmuxClaudeRunner, wait_for_idle_prompt
 from ..command_gate import is_message_authorized, owns
-# <<REDACTED 4 lines>>
+from ..concurrency import SessionRegistry
+from ..coordination.service import CoordinationService
+from ..database.ask_repo import PendingAskRepository
+from ..database.lounge_repo import LoungeRepository
 from ..database.repository import SessionRecord, SessionRepository
-# <<REDACTED 2 lines>>
+from ..database.resume_repo import PendingResume, PendingResumeRepository
+from ..database.settings_repo import SettingsRepository
 from ..denied_notice import DeniedNotifier
 from ..discord_failures import DISCORD_CALL_FAILURES
 from ..discord_ref import enrich_discord_references
@@ -35,7 +54,8 @@ from ..discord_ui.lamp_recovery import HISTORY_LIMIT as LAMP_HISTORY_LIMIT
 from ..discord_ui.lamp_recovery import adopt_orphaned_lamp, find_open_lamp
 from ..discord_ui.permission_help import ThreadCreateForbiddenError, create_thread_permission_help
 from ..discord_ui.slash_io import slash_io
-# <<REDACTED 2 lines>>
+from ..discord_ui.status import StatusManager
+from ..discord_ui.thread_dashboard import ThreadState, ThreadStatusDashboard
 from ..discord_ui.thread_dashboard import safe_set_state as _safe_set_state
 from ..discord_ui.views import (
     STOP_MESSAGE_PREFIX,
@@ -115,10 +135,17 @@ from ._run_helper import (
     run_claude_with_config,
     withdraw_in_flight,
 )
-# <<REDACTED 4 lines>>
+from .run_config import RunConfig
+
+if TYPE_CHECKING:
+    from ..bot import ClaudeDiscordBot
     from ..session_dir import SessionDirManager
     from ..tmux import TmuxSessionManager
-# <<REDACTED 3 lines>>
+
+logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
 # ``!clord repo:<URL> <prompt>`` (#514). The URL ends at the first whitespace of
 # any kind — a newline included (#923).
 _REPO_PREFIX_RE = re.compile(r"repo:(?P<repo>\S+)\s+(?P<rest>.*)", re.DOTALL)
@@ -174,7 +201,7 @@ _ATTACHMENT_PATH_NOTE = (
     "(The user attached this file; it is saved at the path above. "
     "Read it with the Read tool — it is not inlined in this message.)"
 )
-# <<REDACTED 1 lines>>
+
 
 def _human_size(num_bytes: int) -> str:
     """Byte count as something a person can read in a Discord notice."""
@@ -195,9 +222,27 @@ _SEND_PERMISSION_HELP = (
     "「プライベートスレッドでのメッセージ送信」を付与してください。"
 )
 
-# <<REDACTED 1 lines>>
+
 #: Discord's own hard cap on a thread name.
 _DISCORD_NAME_LEN = 100
+
+
+#: How much of a prompt the status dashboard shows for a thread.
+_DASHBOARD_BLURB_LEN = 100
+
+
+def _dashboard_blurb(prompt: str) -> str:
+    """One line of *prompt* for the dashboard: cut first, then line breaks become spaces."""
+    return prompt[:_DASHBOARD_BLURB_LEN].replace("\n", " ")
+
+
+def _held_or_bot_attr(held: _T | None, bot: object, attr: str) -> _T | None:
+    """*held* if there is one, else whatever the bot carries under *attr* (``None`` if nothing).
+
+    The bot is only looked at while nothing is held, so a value found once
+    (and stored by the caller) is never looked up again.
+    """
+    return held if held is not None else getattr(bot, attr, None)
 
 
 def _explicit_thread_name(thread_name: str | None) -> str:
@@ -304,15 +349,33 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
     return latest_session_jsonl(derive_project_dir(working_dir)) is not None
 
 
-# <<REDACTED 7 lines>>
+class ClaudeChatCog(commands.Cog):
+    """Carries Claude Code conversations over Discord threads."""
+
+    def __init__(
+        self,
+        bot: ClaudeDiscordBot,
+        repo: SessionRepository,
         runner: ClaudeConfig,
-        # <<REDACTED 9 lines>>
+        max_concurrent: int = 3,
+        allowed_user_ids: set[int] | None = None,
+        registry: SessionRegistry | None = None,
+        dashboard: ThreadStatusDashboard | None = None,
+        coordination: CoordinationService | None = None,
+        ask_repo: PendingAskRepository | None = None,
+        lounge_repo: LoungeRepository | None = None,
+        resume_repo: PendingResumeRepository | None = None,
+        settings_repo: SettingsRepository | None = None,
         allowed_role_name: str | None = None,
         authorizer: Authorizer | None = None,
         thread_lamp: bool | None = None,
         thread_retitle: bool | None = None,
         auto_topic: bool | None = None,
-    # <<REDACTED 5 lines>>
+    ) -> None:
+        self.bot = bot
+        self.repo = repo
+        self.runner = runner
+        self._max_concurrent = max_concurrent
         # Thread-name status lamp (🟢🟡🔴⚪). Off by default (#329) because
         # repainting the name on every state change saturates Discord's
         # thread-rename rate-limit. Opt in via thread_lamp=True or
@@ -328,7 +391,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # via auto_topic=True or CLORD_AUTO_TOPIC=1; ``/thread-rename`` is the
         # on-demand path that replaces it.
         self._auto_topic = topic_auto_enabled(auto_topic)
-        # <<REDACTED 1 lines>>
+        self._allowed_user_ids = allowed_user_ids
         self._allowed_role_name = allowed_role_name
         # #466: one allowlist predicate shared by message gating (_is_allowed)
         # and button gating (View.interaction_check). Published on the bot so
@@ -346,7 +409,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         set_default_authorizer(getattr(bot, "authorizer", None) or self._authorizer)
         # #346: who gets told — and how often — when a message is refused.
         self._denied_notifier = DeniedNotifier()
-        # <<REDACTED 2 lines>>
+        self._registry = registry or getattr(bot, "session_registry", None)
+        self._semaphore = asyncio.Semaphore(max_concurrent)
         # #634: the startup sweep for a previous process's dead ⏹ Stop buttons.
         # Held so the fire-and-forget task is not garbage-collected mid-sweep.
         self._stop_sweep_task: asyncio.Task[None] | None = None
@@ -355,7 +419,10 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # Without this, two messages arriving in quick succession could
         # both enter _run_claude before the first registers in _active_runners.
         self._thread_locks: dict[int, asyncio.Lock] = {}
-        # <<REDACTED 4 lines>>
+        # The task running each thread's turn. A message that replaces a turn
+        # waits on this entry until the replaced turn has finished cleaning up.
+        self._active_tasks: dict[int, asyncio.Task] = {}
+
         # #800: turns the next message replaced before they had registered a
         # runner — the runner they register later must start out stopped.
         self._preempted_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
@@ -368,9 +435,17 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # recovery is still watching — those turns have no runner here.
         self._turn_triggers: dict[int, int] = {}
         self._adopted_lamps: dict[int, int] = {}
-        # <<REDACTED 6 lines>>
+        # Both may stay None here: _get_dashboard() / _get_coordination() look
+        # them up on first use, by which time the bot has finished its own setup.
+        self._dashboard = dashboard
+        self._coordination = coordination
+        self._ask_repo = ask_repo or getattr(bot, "ask_repo", None)
+
         # AI Lounge repo — passed through to RunConfig but unused since #766
-        # <<REDACTED 5 lines>>
+        self._lounge_repo = lounge_repo or getattr(bot, "lounge_repo", None)
+        self._resume_repo = resume_repo or getattr(bot, "resume_repo", None)
+        self._settings_repo = settings_repo or getattr(bot, "settings_repo", None)
+
         # Issue #95: pending topic writes for sessions whose row hasn't been
         # saved yet (event_processor saves the row only after Claude emits
         # its first session_id).  Drained by _apply_thread_naming on the
@@ -423,7 +498,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         self._backfill_tasks: set[asyncio.Task[None]] = set()
         # #878: post-stop guards that interrupt a turn woken by a task notification.
         self._stop_guard_tasks: set[asyncio.Task[int]] = set()
-# <<REDACTED 1 lines>>
+
     def _is_allowed(self, member: discord.Member | discord.User) -> bool:
         """Check if a member/user is authorized to use the bot.
 
@@ -491,7 +566,21 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         """
         return thread_id in self._active_tasks
 
-    # <<REDACTED 16 lines>>
+    @property
+    def active_session_count(self) -> int:
+        """How many Claude sessions have a turn running right now."""
+        return len(self._active_runners)
+
+    @property
+    def active_count(self) -> int:
+        """Same number under the name the ``DrainAware`` protocol asks for."""
+        return self.active_session_count
+
+    def _get_dashboard(self) -> ThreadStatusDashboard | None:
+        """The status dashboard, picked up from the bot the first time it exists."""
+        self._dashboard = _held_or_bot_attr(self._dashboard, self.bot, "thread_dashboard")
+        return self._dashboard
+
     async def _resolve_session_dir_manager(
         self, channel_id: int | None, thread_id: int | None = None
     ) -> SessionDirManager | None:
@@ -525,7 +614,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         channel_cog = self.bot.get_cog("ChannelRepoCog")
         if channel_cog is None or not isinstance(channel_cog, ChannelRepoCog):
             return None
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             return await channel_cog.divergent_session_name(channel_id, thread_id)
         return None
 
@@ -567,7 +656,15 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             return await channel_cog.resolve_tmux_manager(channel_id, thread_id=thread_id)
         return None
 
-    # <<REDACTED 13 lines>>
+    async def _get_current_model(self) -> str | None:
+        """The instance-wide model chosen with ``/model``; ``None`` ⇒ the runner's default."""
+        # Imported here so loading this module does not pull in another cog. The
+        # lookup itself is the first step of SessionManageCog's "which model?"
+        # chain — shared, so the two cogs cannot read different keys.
+        from .session_manage import stored_model_override
+
+        return await stored_model_override(self._settings_repo)
+
     async def _fix_turn_settings(
         self, thread_id: int, channel_id: int | None, *, keep_running: bool = False
     ) -> TurnSettings | None:
@@ -581,11 +678,21 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             keep_running=keep_running,
         )
 
-    # <<REDACTED 13 lines>>
-                from ..coordination.env import coordination_channel_id_from_env
+    def _get_coordination(self) -> CoordinationService:
+        """The coordination service — there is always one, wired or not.
 
-                channel_id = coordination_channel_id_from_env()  # #1194
-                # <<REDACTED 3 lines>>
+        Whatever was handed to the constructor wins, then the one on the bot.
+        Otherwise one is built here from ``COORDINATION_CHANNEL_ID``; without
+        that variable it is a service that does nothing. Kept after first use.
+        """
+        self._coordination = _held_or_bot_attr(self._coordination, self.bot, "coordination")
+        if self._coordination is None:
+            from ..coordination.env import coordination_channel_id_from_env
+
+            channel_id = coordination_channel_id_from_env()  # #1194
+            self._coordination = CoordinationService(self.bot, channel_id)
+        return self._coordination
+
     async def _apply_thread_naming(
         self,
         *,
@@ -625,7 +732,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             parse_topic_from_name,
         )
 
-        # <<REDACTED 1 lines>>
+        record = await self.repo.get(thread.id)
         topic = record.topic if record else None
         locked = bool(record.auto_topic_locked) if record else False
         state = (record.state if record else None) or "alive"
@@ -666,7 +773,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # thread is not manually renamed (locked). Returns None when the LLM
         # deems the current topic still valid — so no rename API call is fired.
         if topic and not locked and self._thread_retitle and retitle:
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 new_topic = await topic_module.maybe_retitle(first_message or "", topic)
                 if new_topic is not None:
                     if record is not None:
@@ -848,7 +955,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         ):
             return
         try:
-            # <<REDACTED 1 lines>>
+            record = await self.repo.get(thread_id)
             if record is None:
                 return
             written = await self._drain_pending_naming(thread_id, record)
@@ -918,7 +1025,9 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             return None
         return result.stdout.strip() or None
 
-    # <<REDACTED 3 lines>>
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Entry point for every message Discord delivers."""
         # #971: c-lord's own voice for a sub-agent — never a request, and not a
         # refused one either (the owner would be DM'd for every agent message).
         if is_voice_message(message):
@@ -926,17 +1035,19 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # #745: bookkeeping for the reconnect pick-up. Before any await, so a
         # pick-up that starts after this event was dispatched always sees it.
         if not self._note_delivered(message):
-            # <<REDACTED 1 lines>>
+            return
 
         # #346: a refused message used to vanish here without a trace. The
         # sender still sees nothing; the owner is told by DM and it is logged.
         if not self._is_message_authorized(message):
             await self._denied_notifier.report(self.bot, message)
             return
-# <<REDACTED 1 lines>>
+
         # Channel direct messages are ignored — thread creation is limited to
         # slash commands (/skill) and API (spawn_session) to prevent accidental sessions.
-        # <<REDACTED 3 lines>>
+        if message.channel.id == self.bot.channel_id:
+            return
+
         if not await self._is_runnable_request(message):
             return
 
@@ -949,7 +1060,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             return
         verdict = classify(await self.repo.get(message.channel.id))
         if accepts_message(verdict):
-            # <<REDACTED 1 lines>>
+            await self._handle_thread_reply(message)
         else:
             await self._handle_untracked_thread(message, message.channel)
 
@@ -966,7 +1077,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # still allowed (zero-config default unchanged).
         if not self._is_message_authorized(message):
             return False
-# <<REDACTED 1 lines>>
+
         # System messages (thread rename, pin, etc.) must not reach Claude
         if message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return False
@@ -1083,7 +1194,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # means "your message did not run", which would be a lie once it does.
         if await self._auto_reattach(thread, parent_channel_id) is not None:
             logger.info("%s reattached on arrival — running the message (#700)", ctx)
-            # <<REDACTED 1 lines>>
+            await self._handle_thread_reply(message)
             return
         # #862: nothing to reconnect to, but the binding still says which repo
         # this thread works in — so start over here instead of sending the
@@ -1279,7 +1390,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             resolvers=(self._resolve_tmux_manager, self._resolve_session_dir_manager),
             session_get=self.repo.get,
         )
-# <<REDACTED 1 lines>>
+
     async def _was_ever_our_thread(self, thread: discord.Thread, parent_channel_id: int) -> bool:
         """Whether this thread carries any trace of having been c-lord's (#556).
 
@@ -1676,7 +1787,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
         default = None
         if parent_id is not None:
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 default = await channel_cog.channel_repo(parent_id)
         # #1116: a choice's *value* is capped at 100 characters by Discord too.
         # Cutting it sent a different (non-existent) URL as ``repo:`` — so a repo
@@ -1689,7 +1800,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 )
             )
 
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             for repo in await channel_cog.known_repos():
                 if repo == default or needle not in repo.lower() or len(repo) > _CHOICE_MAX:
                     continue
@@ -1794,14 +1905,14 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         message: discord.Message | None = None,
     ) -> None:
         """Shared core for /stop and !stop (#209).
-# <<REDACTED 1 lines>>
+
         Interrupts the active runner without clearing the session DB so the
         user can resume by sending a new message.  ``respond`` posts the reply
         the way the caller needs (interaction response vs ctx.send).
 
         Gated like ``/clear`` (#405, #781): ``message`` is the invoking message
         for ``!stop`` (so a webhook can still drive it), ``None`` for the slash.
-        # <<REDACTED 1 lines>>
+        """
         if not self._authorize(user, message):
             logger.info(
                 "%s /stop rejected: user %s is not authorized (#781)",
@@ -1813,13 +1924,14 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
-            # <<REDACTED 2 lines>>
+            return
+
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
         result = await self._stop_thread_work(channel)
         # The session DB is intentionally left alone so the user can resume;
-        # <<REDACTED 1 lines>>
+        # dropping the runner's registration is left to _run_claude's own cleanup.
         content, embed, ephemeral = stop_reply(result)
         if embed is not None:
             await respond(embed=embed)
@@ -1883,12 +1995,12 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         """
         channel = interaction.channel
         if not isinstance(channel, discord.Thread):
-            # <<REDACTED 1 lines>>
+            await interaction.response.send_message(
                 "このコマンドはスレッド内でのみ使えます。", ephemeral=True
             )
             return
         if not self._is_allowed(interaction.user):
-            # <<REDACTED 1 lines>>
+            await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
             return
@@ -1900,7 +2012,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         existing = await self.repo.get(channel.id)
         if existing is not None:
-            # <<REDACTED 1 lines>>
+            await interaction.response.send_message(
                 "ℹ️ このスレッドの記録は失われていません。"
                 "そのままメッセージを送れば続きから再開します。",
                 ephemeral=True,
@@ -1930,7 +2042,12 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         plan = await self._reattach_thread(channel)
         await ctx.send(reattach_notice(plan))
 
-    # <<REDACTED 7 lines>>
+    @app_commands.command(name="stop", description="Stop the active session (session is preserved)")
+    async def stop_session(self, interaction: discord.Interaction) -> None:
+        """Stop the running Claude but keep the session.
+
+        Unlike ``/clear`` the session id stays, so the next message resumes it.
+        """
 
         async def respond(
             content: str | None = None,
@@ -1961,7 +2078,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 await ctx.send(content or "")
 
         await self._stop_impl(ctx.channel, respond, user=ctx.author, message=ctx.message)
-# <<REDACTED 1 lines>>
+
     @app_commands.command(
         name="clord-attach",
         description="Attach this thread to an existing tmux window",
@@ -1969,13 +2086,14 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
     @app_commands.describe(window="tmux window name (e.g. w1)")
     async def attach_window(self, interaction: discord.Interaction, window: str) -> None:
         """Remap an existing tmux window to the current thread."""
-        # <<REDACTED 2 lines>>
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
                 "This command can only be used in a thread.", ephemeral=True
             )
             return
 
         if not self._is_allowed(interaction.user):
-            # <<REDACTED 1 lines>>
+            await interaction.response.send_message(
                 "You are not authorized to use this command.", ephemeral=True
             )
             return
@@ -1983,7 +2101,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel.id
         tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=interaction.channel.id)
         if tmux_manager is None:
-            # <<REDACTED 1 lines>>
+            await interaction.response.send_message(
                 "tmux is not configured for this bot.", ephemeral=True
             )
             return
@@ -1994,7 +2112,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 interaction.channel.id, session_id=f"tmux-{interaction.channel.id}"
             )
             await interaction.response.send_message(f"Attached this thread to `{window}`.")
-        # <<REDACTED 2 lines>>
+        else:
+            await interaction.response.send_message(
                 f"Window `{window}` not found in tmux.", ephemeral=True
             )
 
@@ -2071,7 +2190,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
-            # <<REDACTED 2 lines>>
+            return
+
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
@@ -2085,7 +2205,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         if tmux_manager is None:
             await respond("tmux is not configured for this thread.", ephemeral=True)
             return
-# <<REDACTED 1 lines>>
+
         before: set[str] = set()
         project_dir: Path | None = None
 
@@ -2194,7 +2314,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                     "`/claude-restart` で Claude を再起動してください。"
                 )
         elif not await asyncio.to_thread(tmux_manager.is_claude_running, thread_id):
-            # <<REDACTED 1 lines>>
+            record = await self.repo.get(thread_id)
             verdict = classify(record)
             if verdict is not ThreadResume.RESUMES:
                 return stopped_hint(verdict)
@@ -2234,7 +2354,9 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         await asyncio.to_thread(tmux_manager.send_keys, thread_id, "Enter")
         return None
 
-    # <<REDACTED 3 lines>>
+    @app_commands.command(name="clear", description="Reset the Claude Code session for this thread")
+    async def clear_session(self, interaction: discord.Interaction) -> None:
+        """Reset this thread's Claude Code session."""
         respond, ack = self._deferrable_responder(interaction)
         await self._clear_impl(interaction.channel, respond, user=interaction.user, ack=ack)
 
@@ -2251,7 +2373,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             await ctx.send(content or "")
 
         await self._clear_impl(ctx.channel, respond, user=ctx.author, message=ctx.message)
-# <<REDACTED 1 lines>>
+
     async def _restart_impl(
         self,
         channel: object,
@@ -2287,7 +2409,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
-            # <<REDACTED 2 lines>>
+            return
+
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
@@ -2295,7 +2418,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         # A session must exist to restart-and-resume; without one there is
         # nothing to ``--continue`` and this would be a no-op.
-        # <<REDACTED 1 lines>>
+        record = await self.repo.get(thread_id)
         if record is None:
             await respond("No active session found for this thread to restart.", ephemeral=True)
             return
@@ -2303,7 +2426,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # Kill the active runner (graceful kill of the in-flight, possibly
         # wedged, turn) if one is registered.
         runner = self._active_runners.get(thread_id)
-        # <<REDACTED 2 lines>>
+        if runner:
+            await runner.kill()
             del self._active_runners[thread_id]
 
         # Kill the tmux window so the old/stuck claude process is gone and
@@ -2314,7 +2438,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         tmux_manager = await self._resolve_tmux_manager(parent_id, thread_id=thread_id)
         if tmux_manager is not None:
             await asyncio.to_thread(tmux_manager.kill_session, thread_id)
-# <<REDACTED 1 lines>>
+
         await respond(
             "\U0001f504 Claude を再起動しました。会話は保持されています — "
             "次のメッセージで `--continue` により文脈を引き継いで再開します。"
@@ -2447,7 +2571,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         if not isinstance(channel, discord.Thread):
             await respond("This command can only be used in a Claude chat thread.", ephemeral=True)
-            # <<REDACTED 2 lines>>
+            return
+
         if await self._answered_as_foreign_thread(channel, respond):
             return
 
@@ -2502,7 +2627,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             instructions=instructions,
         )
 
-    # <<REDACTED 2 lines>>
+    async def _handle_new_conversation(self, message: discord.Message) -> None:
+        """Open a thread on *message* and start a Claude session in it."""
         # #721: a readable name, not a raw cut of the prompt. This one is
         # permanent in a way the thread's own name is not — Discord writes it
         # into the channel's "started a thread" line, which no later rename
@@ -2525,17 +2651,35 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             with contextlib.suppress(discord.HTTPException):
                 await message.reply(create_thread_permission_help())
             return
-        # <<REDACTED 1 lines>>
+        prompt, image_paths = await self._build_prompt_and_images(message)
         prompt = await enrich_discord_references(prompt, message, self.bot)
-        # <<REDACTED 8 lines>>
+        await self._run_claude(message, thread, prompt, session_id=None, image_paths=image_paths)
+
+    async def spawn_session(
+        self,
+        channel: discord.TextChannel,
+        prompt: str,
+        thread_name: str | None = None,
+        session_id: str | None = None,
         repo: str | None = None,
         requester: discord.Member | discord.User | None = None,
         started_by: turn_events.StartedBy | None = None,
-    # <<REDACTED 13 lines>>
+    ) -> discord.Thread:
+        """Start a Claude session in a brand-new thread, with no user message.
+
+        ``on_message`` ignores what the bot itself says, so this is the door
+        for callers that are code rather than people (the REST API, ``/clord``).
+        The bot posts *prompt* into the thread as a seed message: the status
+        reactions need a real message to sit on.
+
+        Args:
+            channel: Text channel the thread is created under.
+            prompt: What Claude is asked to do.
             thread_name: Optional thread title; defaults to a readable topic
                 derived from *prompt* (#721 — one line, no markdown or URLs,
                 ``…`` when cut short).
-            # <<REDACTED 3 lines>>
+            session_id: Claude session to continue with ``--resume``; a new
+                session is started when omitted.
             repo: Optional repository for this thread (#514). Bound to the new
                   thread before Claude starts, so the session dir is cloned
                   from it instead of from the channel's binding.
@@ -2545,16 +2689,21 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                   ``POST /api/spawn``) ⇒ no person behind the turn: the ping
                   falls back to the bot owner and no Discord co-author is
                   recorded.
-# <<REDACTED 4 lines>>
+
+        Returns:
+            The thread that was created.
+        """
         # #721: an explicit name is the caller's own words — keep it, minus the
         # newlines Discord would flatten. Only the prompt-derived default gets
         # cleaned up into a topic.
         name = _explicit_thread_name(thread_name) or topic_module.heuristic_topic(prompt)
         archive_minutes = await resolve_auto_archive_duration(self._settings_repo)
         try:
-            # <<REDACTED 3 lines>>
+            thread = await channel.create_thread(
+                name=name,
+                type=discord.ChannelType.public_thread,
                 auto_archive_duration=archive_minutes,
-            # <<REDACTED 1 lines>>
+            )
         except discord.Forbidden as exc:
             # #443: bot was denied "View Channel" and/or "Create Public Threads"
             # on this channel.  The channel itself is unreachable (a notice
@@ -2580,9 +2729,9 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                     repo,
                 )
 
-        # <<REDACTED 1 lines>>
+        # The prompt goes in as a message so the status reactions have a target.
         try:
-            # <<REDACTED 1 lines>>
+            seed_message = await thread.send(prompt)
         except discord.Forbidden:
             # #75: bot can create the thread but lacks "Send Messages in
             # Threads".  The thread itself is unreachable, so surface the
@@ -2597,7 +2746,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             with contextlib.suppress(*DISCORD_CALL_FAILURES):
                 await channel.send(_SEND_PERMISSION_HELP)
             raise
-        # <<REDACTED 2 lines>>
+        # Claude runs in the background; the caller gets the thread back at once.
         task = asyncio.create_task(
             self._run_claude(
                 seed_message,
@@ -2612,7 +2761,9 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # so a spawned turn (/clord, /api/spawn) that died early — once parked
         # in ``_active_tasks``, never collected — left no trace at all.
         task.add_done_callback(partial(self._report_turn_task_outcome, thread.id))
-        # <<REDACTED 3 lines>>
+        return thread
+
+    async def cog_unload(self) -> None:
         """Record the mid-run sessions for a restart notice, then flush clears.
 
         #1262: the trigger clears the database refused (locked) are held in
@@ -2632,7 +2783,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
     async def _record_sessions_for_restart(self) -> None:
         """Record all mid-run Claude sessions so they get a restart notice.
-# <<REDACTED 3 lines>>
+
+        Runs when the cog is unloaded: ``systemctl restart`` / ``stop``, ``bot.close()``,
         or any other SIGTERM-based shutdown.  Sessions that were actively running
         when the bot was killed are recorded so that, on the next startup,
         ``on_ready`` posts a quiet restart notice into each thread.
@@ -2641,20 +2793,28 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         in tmux survives a bot restart and the observers (TranscriptMirror + menu
         watchdog) self-restore, so injecting a "continue your work" prompt only
         caused unwanted autonomous progress (意図しない前進).
-# <<REDACTED 3 lines>>
+
+        Idle sessions (Claude has answered and is waiting for the next message)
+        are not in ``_active_runners`` and are therefore not
         recorded — they resume naturally via message-triggered resume when the
         user sends their next message.
-# <<REDACTED 3 lines>>
+
+        Does nothing when there is no ``_resume_repo``.
+        """
         # #870: a turn whose lamp was adopted at the last startup is still
         # running, it just has no runner in this process.
         threads = list(dict.fromkeys([*self._active_runners, *self._adopted_lamps]))
         if not threads or self._resume_repo is None:
-            # <<REDACTED 3 lines>>
+            return
+
+        logger.info(
             "Shutdown detected: recording %d active session(s) for restart notice",
             len(threads),
-        # <<REDACTED 1 lines>>
+        )
         for thread_id in threads:
-            # <<REDACTED 6 lines>>
+            try:
+                session_id = await self._session_id_on_record(thread_id)
+
                 # #870: the message whose lamp the next startup must take back.
                 # Written here because the turn-start write misses a thread's
                 # first turn (no session row yet), and an adopted lamp's message
@@ -2680,11 +2840,76 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
                 # resume_prompt is intentionally None (#406): on_ready posts a
                 # quiet notice, it never re-runs Claude with a stored prompt.
-                # <<REDACTED 4 lines>>
+                await self._resume_repo.mark(
+                    thread_id,
+                    session_id=session_id,
+                    reason="bot_shutdown",
                     resume_prompt=None,
-                # <<REDACTED 2 lines>>
+                )
+                logger.info(
                     "Recorded thread %d for restart notice (session=%s)", thread_id, session_id
-                # <<REDACTED 21 lines>>
+                )
+            except Exception:
+                # One thread failing must not cost the others their notice.
+                logger.warning(
+                    "Failed to mark thread %d for restart-resume", thread_id, exc_info=True
+                )
+
+    async def _session_id_on_record(self, thread_id: int) -> str | None:
+        """The Claude session id stored for *thread_id*; ``None`` when there is no row."""
+        record = await self.repo.get(thread_id)
+        return record.session_id if record is not None else None
+
+    async def _restart_notices_due(self) -> AsyncIterator[tuple[PendingResume, discord.Thread]]:
+        """Use up the restart records left at shutdown, yielding the ones that can be served.
+
+        Every record is deleted the moment it is reached — before its thread
+        is even looked up — so nothing after that point can make it come back.
+        """
+        if self._resume_repo is None:
+            return
+        pending = await self._resume_repo.get_pending()
+        if not pending:
+            return
+        logger.info("Found %d pending session resume(s) on startup", len(pending))
+        for entry in pending:
+            await self._resume_repo.delete(entry.id)
+            thread = await self._thread_for_restart_notice(entry.thread_id)
+            if thread is not None:
+                yield entry, thread
+
+    async def _thread_for_restart_notice(self, thread_id: int) -> discord.Thread | None:
+        """The thread a recorded restart notice belongs to; ``None`` (logged) if unusable."""
+        try:
+            channel = self.bot.get_channel(thread_id)
+            if channel is None:
+                channel = await self.bot.fetch_channel(thread_id)
+        except Exception:
+            logger.warning(
+                "Pending resume: thread %d not found, skipping", thread_id, exc_info=True
+            )
+            return None
+        if not isinstance(channel, discord.Thread):
+            logger.warning("Pending resume: channel %d is not a Thread, skipping", thread_id)
+            return None
+        if not isinstance(channel.parent, discord.TextChannel):
+            logger.warning(
+                "Pending resume: thread %d has no TextChannel parent, skipping", thread_id
+            )
+            return None
+        return channel
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Post the restart notices recorded at shutdown; runs on every (re)connect.
+
+        Only records still inside the repository's TTL (5 minutes by default)
+        come back; older ones are dropped there without a word.
+
+        Safety: a record is deleted *before* it is acted on, so a crash half-way
+        never handles it twice, and the TTL keeps a long outage or an accidental
+        second restart from acting on stale marks. One thread failing (channel
+        gone, ...) is logged and skipped — it never keeps the bot from being ready.
 
         It also retires the UI the previous process left behind — dead ⏹ Stop
         buttons (#634) and question menus whose handlers died with that process
@@ -2692,7 +2917,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         the last run is dead" is guaranteed true, so it is the only moment this
         is safe. Spawned as its own task: it walks up to a few hundred threads
         and must not hold up becoming ready.
-        # <<REDACTED 1 lines>>
+        """
         # #713: who may drive this bot. Must happen before the first message
         # is served, and can only happen now — the owner comes from Discord.
         await resolve_fallback_owner_ids(self.bot, self._authorizer)
@@ -2705,7 +2930,9 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # Held on the cog so the task is not garbage-collected mid-sweep.
         self._stop_sweep_task = asyncio.create_task(self._run_startup_recovery())
 
-        # <<REDACTED 36 lines>>
+        async for entry, thread in self._restart_notices_due():
+            thread_id = entry.thread_id
+
             # #406: Do NOT re-prompt Claude on restart.  The ``claude`` process
             # in tmux survives a bot restart, and the observers (TranscriptMirror
             # for the reply text + the always-on menu watchdog for AskUserQuestion
@@ -2714,15 +2941,20 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             # progress (意図しない前進) and made the conversation appear to "jump"
             # when the queued tmux activity surfaced all at once.  Just post a
             # quiet, human-facing notice that recent display may have lagged.
-            # <<REDACTED 1 lines>>
+            logger.info(
                 "Restart notice for thread %d (session_id=%s, reason=%s) — "
                 "observers self-restored; not re-prompting Claude (#406)",
-                # <<REDACTED 5 lines>>
+                thread_id,
+                entry.session_id,
+                entry.reason,
+            )
+            try:
                 await thread.send(
                     "-# 🔄 C-lord を再起動しました。少し前の表示が遅延した可能性があります。"
-                # <<REDACTED 2 lines>>
+                )
+            except Exception:
                 logger.error("Failed to post restart notice in thread %d", thread_id, exc_info=True)
-# <<REDACTED 1 lines>>
+
             # #718: the lamp on the turn's trigger message died with the old
             # process — take it back. Its own task: it may wait for the turn end.
             task = asyncio.create_task(self._recover_orphaned_lamp(thread))
@@ -2738,7 +2970,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         """
         ctx = log_ctx(thread_id=thread.id)
         try:
-            # <<REDACTED 1 lines>>
+            record = await self.repo.get(thread.id)
             trigger_id = getattr(record, "trigger_message_id", None) if record else None
             working_dir = getattr(record, "working_dir", None) if record else None
             if not working_dir:
@@ -2750,7 +2982,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 except discord.NotFound:
                     # A thread's first message is its starter, which lives in
                     # the parent channel under the thread's own id.
-                    # <<REDACTED 2 lines>>
+                    parent = thread.parent
+                    if not isinstance(parent, discord.TextChannel):
                         raise
                     message = await parent.fetch_message(trigger_id)
             else:
@@ -2886,12 +3119,13 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 log_ctx(thread_id=thread.id),
                 exc_info=True,
             )
-        # <<REDACTED 1 lines>>
+        dashboard = self._get_dashboard()
         if dashboard is None:
             return
         await _safe_set_state(
             dashboard,
-            # <<REDACTED 2 lines>>
+            thread.id,
+            ThreadState.WAITING_INPUT,
             (getattr(message, "content", "") or "")[:100].replace("\n", " "),
             thread=thread,
             notify_user_id=_notify_target(requester, self.bot, kind="completion"),
@@ -2922,7 +3156,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
     async def _keep_open_outage(self) -> None:
         """Store (or clear) the outage in progress for the next process (#920)."""
-        # <<REDACTED 1 lines>>
+        if self._settings_repo is None:
             return
         outage = self._gateway.open_outage()
         try:
@@ -3079,7 +3313,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             # Ours = a thread this instance holds a session for — the rule
             # on_message applies (accepts_message). A shared guild is full of
             # other instances' threads; they read back their own.
-            # <<REDACTED 1 lines>>
+            record = await self.repo.get(thread.id)
             if not accepts_message(classify(record)):
                 continue
             read_back += 1
@@ -3231,7 +3465,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         """
         from ..startup_recovery import run_startup_recovery
 
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             await run_startup_recovery(self.bot, self.repo, self._ask_repo)
 
     async def _handle_thread_reply(
@@ -3241,7 +3475,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         earlier: Sequence[discord.Message] = (),
         fresh: bool = False,
     ) -> None:
-        # <<REDACTED 2 lines>>
+        """Continue the Claude session of an existing thread with *message*.
+
         ``fresh`` (#862) starts a new conversation instead: the thread had
         nothing left to reconnect to, so there is no session to continue. It
         forbids ``--continue``/``--resume`` outright and prepends
@@ -3264,7 +3499,10 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         itself (the run is dispatched as its own task), so a turn that blocks on a
         bridged menu can never hold the lock — that held-across-run lock was the
         #315 deadlock.
-        # <<REDACTED 4 lines>>
+        """
+        thread = message.channel
+        assert isinstance(thread, discord.Thread)
+
         # #512: a session the user closed on purpose (/workspace-stop) holds
         # incoming messages instead of running them. Checked before the lock and
         # before any prompt building so nothing is spent on a message we will not
@@ -3295,9 +3533,9 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         lock = self._thread_locks.setdefault(thread.id, asyncio.Lock())
         async with lock:
-            # <<REDACTED 1 lines>>
+            record = await self.repo.get(thread.id)
             session_id = (record.session_id or None) if record and not fresh else None
-            # <<REDACTED 1 lines>>
+            prompt, image_paths = await self._build_prompt_and_images(message)
             prompt = await enrich_discord_references(prompt, message, self.bot)
             if fresh:
                 prompt = f"{fresh_start_preamble(thread.id)}\n\n{prompt}"
@@ -3316,7 +3554,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                         ),
                     ]
                 )
-# <<REDACTED 1 lines>>
+
             # Interrupt any in-flight turn for this thread before starting the new
             # one.  We key on ``_active_tasks`` (set synchronously below, under
             # this same lock) rather than ``_active_runners`` (registered later,
@@ -3332,7 +3570,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 # goes quiet after this can be told apart from one that
                 # never got here.
                 logger.info("%s preempted prior turn", log_ctx(thread_id=thread.id))
-# <<REDACTED 1 lines>>
+
             # #270: when the tmux pane has died (bot restart / kill -9 / tmux-server
             # death) but a prior session's transcript is still on disk, resume it via
             # --continue instead of starting fresh and discarding the history.
@@ -3407,7 +3645,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             # A turn is starting, so this workspace is awake — clear the mark
             # where it is consumed rather than trusting a later write to do it.
             if record is not None and record.slept_at:
-                # <<REDACTED 1 lines>>
+                with contextlib.suppress(Exception):
                     await self.repo.set_slept(thread.id, False)
 
             # Run as its own task so the per-thread lock is NOT held for the
@@ -3426,9 +3664,9 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                     thread,
                     prompt,
                     session_id=session_id,
-                    # <<REDACTED 1 lines>>
+                    image_paths=image_paths,
                     try_continue=try_continue,
-                # <<REDACTED 1 lines>>
+                )
             )
             # #565: ``_active_tasks`` keeps a strong reference to this task, so a
             # turn that dies before anyone awaits it is never garbage-collected —
@@ -3584,7 +3822,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         # The answer came from outside the view, so no interaction edits the
         # menu — blank every live copy here instead.
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             await disable_stale_copies(
                 thread.id,
                 keep_message_id=None,
@@ -3729,7 +3967,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # killed the window 47 seconds into the wake, and the wake then sat
         # watching a window that no longer existed. Marking it first takes the
         # thread out of both reapers' candidate sets for the whole startup.
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             await self.repo.touch(thread.id)
 
         session_dir_manager = await self._resolve_session_dir_manager(
@@ -3765,7 +4003,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # words the next resume (#572), which is why it is cleared here and not
         # with the ``touch`` above: until this point "this workspace was slept"
         # was still the honest answer.
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             await self.repo.set_slept(thread.id, False)
 
         # The restore assigns a new tmux window, and the thread name carries that
@@ -3894,7 +4132,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # message (#700) and the 「▶️ 再開する」 button (#512) — so neither can
         # end up with its own wording. Best effort throughout: a wedged docker
         # costs a sentence, never the reopen.
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             sdm = await self._resolve_session_dir_manager(
                 thread.parent_id or thread.id, thread_id=thread.id
             )
@@ -3914,7 +4152,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         async def _on_reopen(_interaction: discord.Interaction) -> None:
             await self._reopen_thread(thread)
-            # <<REDACTED 2 lines>>
+            await self._handle_thread_reply(message)
+
         view = ReopenSessionView(_on_reopen, authorizer=self._authorizer)
         logger.info("%s message held — session is closed (#512)", log_ctx(thread_id=thread.id))
         with contextlib.suppress(discord.HTTPException):
@@ -3944,11 +4183,11 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         # runner to interrupt yet. Remember it, so the runner it registers later
         # never delivers the request this message just replaced.
         self._preempted_tasks.add(prev_task)
-        # <<REDACTED 1 lines>>
+        await thread.send("-# ⚡ Interrupted. Starting with new instruction...")
         # Looked up again: the runner may have registered while we posted.
         prev_runner = self._active_runners.get(thread.id) or prev_runner
         if prev_runner is not None:
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 await prev_runner.interrupt(silent=True)
         # No-op unless the turn is parked on a bridged menu; then it unblocks
         # bridge_pane_ask so the run can wind down instead of waiting on a click.
@@ -4025,19 +4264,26 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             )
             return
         await asyncio.gather(task, return_exceptions=True)
-# <<REDACTED 7 lines>>
+
+    async def _build_prompt(self, message: discord.Message) -> str:
+        """Just the prompt text; :meth:`_build_prompt_and_images` is the full version."""
+        text, _unused = await self._build_prompt_and_images(message)
+        return text
+
+    async def _build_prompt_and_images(self, message: discord.Message) -> tuple[str, list[str]]:
         """Build the prompt string from the message text.
-# <<REDACTED 1 lines>>
+
         Attachments are **not** part of this any more (#528): they are written
         to disk next to the checkout by :meth:`_stage_attachments`, which runs
         later — once the session directory is known — and appends their paths.
         Pasting file contents in here is what made a 20KB ``.md`` exceed tmux's
         input cap (#527) and what forced the 50KB drop that ate files silently.
-# <<REDACTED 2 lines>>
+
+        Returns:
             (prompt_text, []) — the second element is kept for API compatibility.
-        # <<REDACTED 1 lines>>
+        """
         return message.content or "", []
-# <<REDACTED 1 lines>>
+
     async def _stage_attachments(
         self,
         message: discord.Message,
@@ -4060,22 +4306,26 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             return ""
 
         skipped: list[str] = []
-        # <<REDACTED 2 lines>>
+        sections: list[str] = []
+
         if not work_dir or not Path(work_dir).is_dir():
             # No checkout to write into (unbound channel). Say so rather than
             # letting the files evaporate.
             skipped = [f"`{a.filename}` — 保存先のワークスペースがありません" for a in attachments]
             await self._report_skipped_attachments(thread, skipped)
             return ""
-# <<REDACTED 1 lines>>
+
         ensure_git_excluded(work_dir)
-# <<REDACTED 1 lines>>
+
         for attachment in attachments[:_MAX_ATTACHMENTS]:
-            # <<REDACTED 1 lines>>
+            if attachment.size > _MAX_ATTACHMENT_BYTES:
                 skipped.append(
                     f"`{attachment.filename}` — {_human_size(attachment.size)} は上限 "
                     f"{_human_size(_MAX_ATTACHMENT_BYTES)} を超えています"
-                # <<REDACTED 4 lines>>
+                )
+                continue
+            try:
+                data = await attachment.read()
             except Exception as exc:  # noqa: BLE001 — any download failure is reportable
                 logger.warning(
                     "%s failed to download attachment %s: %s",
@@ -4084,7 +4334,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                     exc,
                 )
                 skipped.append(f"`{attachment.filename}` — ダウンロードに失敗しました")
-                # <<REDACTED 1 lines>>
+                continue
             try:
                 path = await asyncio.to_thread(
                     save_attachment, work_dir, message.id, attachment.filename, data
@@ -4117,7 +4367,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         await self._report_skipped_attachments(thread, skipped)
         return "".join(sections)
-# <<REDACTED 1 lines>>
+
     @staticmethod
     async def _report_skipped_attachments(
         thread: discord.abc.Messageable, skipped: list[str]
@@ -4128,7 +4378,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         body = "\n".join(f"- {line}" for line in skipped)
         with contextlib.suppress(*DISCORD_CALL_FAILURES):
             await thread.send(f"⚠️ 次の添付は Claude に渡せませんでした:\n{body}")
-# <<REDACTED 1 lines>>
+
     async def _abort_turn_on_workspace_failure(
         self,
         thread: discord.Thread,
@@ -4169,7 +4419,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 log_ctx(thread_id=thread.id),
                 exc_info=True,
             )
-        # <<REDACTED 1 lines>>
+        with contextlib.suppress(Exception):
             await status.set_error()
         # #917: this turn never reaches ``run_claude_with_config``, so it tells
         # the event outlet itself — a dispatcher waiting on it hears it is dead.
@@ -4184,7 +4434,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                 exc_info=True,
             )
         if self._active_tasks.get(thread.id) is current_task:
-            # <<REDACTED 2 lines>>
+            self._active_tasks.pop(thread.id, None)
+        if dashboard is not None:
             await _safe_set_state(
                 dashboard, thread.id, ThreadState.WAITING_INPUT, description, thread=thread
             )
@@ -4235,12 +4486,12 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
         if isinstance(restored, int):
             restore = getattr(mirror, "restore_trigger_message", None)
             if callable(restore):
-                # <<REDACTED 1 lines>>
+                with contextlib.suppress(Exception):
                     restore(thread_id, restored, only=message_id)
             return
         forget = getattr(mirror, "forget_trigger_message", None)
         if callable(forget):
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 forget(thread_id, only=message_id)
         try:
             await self.repo.clear_trigger_message(thread_id, only={message_id})
@@ -4260,11 +4511,17 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
 
         return on_prompt_sent
 
-    # <<REDACTED 7 lines>>
+    async def _run_claude(
+        self,
+        user_message: discord.Message,
+        thread: discord.Thread,
+        prompt: str,
+        session_id: str | None,
+        image_paths: list[str] | None = None,
         try_continue: bool = False,
         requester: discord.Member | discord.User | None = None,
         started_by: turn_events.StartedBy | None = None,
-    # <<REDACTED 1 lines>>
+    ) -> None:
         """Execute Claude Code CLI and stream results to the thread.
 
         ``requester`` (#520) names the person who asked for this turn when the
@@ -4314,12 +4571,27 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             )
             return
 
-        # <<REDACTED 1 lines>>
+        if self._semaphore.locked():
             # #632: a courtesy notice — never a reason to drop the turn.
-            # <<REDACTED 7 lines>>
+            with contextlib.suppress(Exception):
+                await thread.send(
+                    "⏳ Waiting for a free session slot... "
+                    f"({self._max_concurrent} max sessions running)"
+                )
+
+        async with self._semaphore:
             # #565: distinguishes "waiting for a slot" from "never got here".
             logger.info("%s acquired session slot", log_ctx(thread_id=thread.id))
-            # <<REDACTED 10 lines>>
+            dashboard = self._get_dashboard()
+            coordination = self._get_coordination()
+            description = _dashboard_blurb(prompt)
+
+            # Registered so that a message replacing this turn can wait for it
+            # to finish before starting its own.
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._active_tasks[thread.id] = current_task
+
             # #246: the per-turn 🟢/🟡 lamp now lives on the trigger-message
             # reaction (StatusManager below), NOT on the thread name. We no
             # longer set_state("running") + immediately rename here — that
@@ -4332,10 +4604,15 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             # Mark thread as PROCESSING when Claude starts. #632: through
             # _safe_set_state — a failed embed refresh is decoration failing,
             # and it must never be the reason a turn never happened.
-            # <<REDACTED 1 lines>>
+            if dashboard is not None:
                 await _safe_set_state(
                     dashboard,
-                    # <<REDACTED 6 lines>>
+                    thread.id,
+                    ThreadState.PROCESSING,
+                    description,
+                    thread=thread,
+                )
+
             # #473: a hard stall shows the ⚠️ lamp on the trigger message and
             # nothing else — no prose line in the thread.
             # #769: thread_id routes the transcript mirror's activity to this
@@ -4344,7 +4621,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             # #870: saved again at shutdown — see _turn_triggers.
             self._turn_triggers[thread.id] = user_message.id
             await status.set_running()
-# <<REDACTED 1 lines>>
+
             # #918: model and effort are fixed together, once, for this turn. A
             # change made while the turn runs waits for the next one. #976: and a
             # /skill run still using the pane's Claude keeps it — no restart then.
@@ -4512,7 +4789,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             )
 
             self._register_runner(thread.id, runner, current_task)
-# <<REDACTED 1 lines>>
+
             # Issue #71: kick off a per-thread transcript mirror so JSONL
             # events flow to this Discord thread. This is the delivery path
             # (#712) — without a mirror the thread hears nothing back.
@@ -4520,7 +4797,8 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             if transcript_cog is not None and working_dir:
                 try:
                     transcript_cog.start_for(thread.id, working_dir)
-                # <<REDACTED 2 lines>>
+                except Exception:
+                    logger.warning(
                         "Failed to start TranscriptMirror for thread=%d",
                         thread.id,
                         exc_info=True,
@@ -4529,13 +4807,13 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             # #1262: from here until its prompt is in the pane (or the turn
             # ends), a /skill sent meanwhile does not take this trigger away. The
             # run's ``finally`` removes the mark; this one covers the steps before.
-            # <<REDACTED 1 lines>>
+            with contextlib.suppress(Exception):
                 self.repo.note_trigger_in_flight(thread.id, user_message.id)
             try:
                 # Record the trigger message so TranscriptMirror / ApiServer can
                 # thread the final answer back as a Discord reply (Issue #115).
                 if transcript_cog is not None:
-                    # <<REDACTED 1 lines>>
+                    with contextlib.suppress(Exception):
                         transcript_cog.set_trigger_message(thread.id, user_message.id)
                 try:
                     await self.repo.update_trigger_message(thread.id, user_message.id)
@@ -4569,17 +4847,25 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                         log_ctx(thread_id=thread.id),
                         exc_info=True,
                     )
-# <<REDACTED 1 lines>>
+
                 # #562: kept in a variable so the turn-end ping below can read the
                 # run's outcome — a turn that produced nothing must not be announced
                 # as finished.
                 run_config = RunConfig(
-                    # <<REDACTED 9 lines>>
+                    thread=thread,
+                    runner=runner,
+                    repo=self.repo,
+                    prompt=prompt,
+                    session_id=session_id,
+                    status=status,
+                    registry=self._registry,
+                    ask_repo=self._ask_repo,
+                    lounge_repo=self._lounge_repo,
                     settings_repo=self._settings_repo,
-                    # <<REDACTED 1 lines>>
+                    stop_view=stop_view,
                     session_dir_manager=session_dir_manager,
                     tmux_manager=tmux_manager,
-                    # <<REDACTED 1 lines>>
+                    image_paths=image_paths,
                     working_dir=working_dir or None,
                     authorizer=self._authorizer,
                     # #480: ping the requester of THIS turn when an
@@ -4613,22 +4899,23 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
             except asyncio.CancelledError:
                 run_cancelled = True
                 raise
-            # <<REDACTED 1 lines>>
+            finally:
                 # Issue #91: wrap every Discord call so that RuntimeError("Session is
                 # closed") during bot shutdown doesn't propagate and turn the bot into
                 # a zombie.  The individual helpers already log errors internally.
-                # <<REDACTED 2 lines>>
+                with contextlib.suppress(Exception):
+                    await stop_view.disable()
                 # Conditional pop: runs are no longer serialised by a lock held
                 # across the whole turn (#315), so a newer reply may have already
                 # replaced these entries with its own runner/task — only clear our
                 # own, never a successor's.
                 if self._active_runners.get(thread.id) is runner:
-                    # <<REDACTED 1 lines>>
+                    self._active_runners.pop(thread.id, None)
                 if self._active_tasks.get(thread.id) is current_task:
-                    # <<REDACTED 1 lines>>
+                    self._active_tasks.pop(thread.id, None)
                 # #1235: a first turn that ended before its session row existed
                 # must not leave its trigger for the next row (another turn's).
-                # <<REDACTED 1 lines>>
+                with contextlib.suppress(Exception):
                     self.repo.discard_pending_trigger(thread.id, user_message.id)
                 # #1262: sent or not, this turn's prompt is no longer on its way.
                 await self._end_trigger_in_flight(
@@ -4640,18 +4927,24 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                     and send_began.is_set()
                     and getattr(runner, "send_refused", False) is not True,
                 )
-# <<REDACTED 4 lines>>
+
+                with contextlib.suppress(Exception):
+                    await coordination.post_session_end(thread)
+
                 # #246: no per-turn thread rename here. The turn-end 🟡 lamp is
                 # the StatusManager reaction (set via set_done() on the RESULT
                 # event); the thread-name lamp flips to 🟡 on the next state-sync
                 # poll (is_processing() is already False after the pop above).
 
-                # <<REDACTED 1 lines>>
+                if dashboard is not None:
                     # #632: same guard as the PROCESSING update above, but this
                     # one logs instead of suppressing silently.
                     await _safe_set_state(
                         dashboard,
-                        # <<REDACTED 4 lines>>
+                        thread.id,
+                        ThreadState.WAITING_INPUT,
+                        description,
+                        thread=thread,
                         # #481: ping the requester of THIS turn, not a
                         # fixed owner — so completion reaches whoever is
                         # waiting (any guild / any authorized user, owner or
@@ -4684,7 +4977,7 @@ def _ever_ran_claude(working_dir: str | None) -> bool:
                         # is needed, and be answered by the replacement turn a
                         # second later.
                         preempted=runner.preempted,
-                    # <<REDACTED 1 lines>>
+                    )
 
                 # #910: the name is built when a message arrives, while Claude is
                 # still on the previous job's branch. Rebuild it now that the turn
