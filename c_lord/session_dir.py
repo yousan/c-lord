@@ -1176,6 +1176,17 @@ def _no_copy_remotes(
 
 def _local_remote_path(cwd: str, url: str) -> str | None:
     """The real path a local remote URL names; ``None`` for a network URL."""
+    written = _local_remote_as_written(cwd, url)
+    return None if written is None else os.path.realpath(written)
+
+
+def _local_remote_as_written(cwd: str, url: str) -> str | None:
+    """The absolute path a local remote URL names, its symlinks not followed (#1297).
+
+    Only *cwd* (what a relative URL is relative to) is resolved: git adds its
+    ``.git`` suffixes to the path as written, so ``<link>.git`` is a sibling of
+    the link, not of what it points at.
+    """
     if url.startswith("file://"):
         rest = url[len("file://") :]
         url = rest[rest.index("/") :] if "/" in rest else rest  # file://host/path
@@ -1184,7 +1195,7 @@ def _local_remote_path(cwd: str, url: str) -> str | None:
         url = os.fsdecode(unquote_to_bytes(os.fsencode(url)))
     elif _NETWORK_URL_RE.match(url):
         return None
-    return os.path.realpath(os.path.join(os.path.realpath(cwd), url))
+    return os.path.join(os.path.realpath(cwd), url)
 
 
 def _inside(path: str | None, root: str) -> bool:
@@ -1207,11 +1218,111 @@ def _no_copy(cwd: str, url: str, ws_root: str, sessions_root: str | None) -> boo
     local = _local_remote_path(cwd, url)
     if local is None:
         return False
-    if sessions_root is None or _inside(local, ws_root) or _inside(local, sessions_root):
+    if sessions_root is None:
         return True
-    # #1289: another instance's root (prod + staging on one host) is outside ours
-    # but just as deletable — also once that workspace is gone and only its root is left.
-    return _in_clord_workspace(local)
+    # #1297: a linked worktree (or a repo borrowing objects) outside every root keeps
+    # its objects and refs in another repo's git dir — judge where they live, too.
+    homes = _object_homes(_local_remote_as_written(cwd, url) or local)
+    if homes is None:
+        return True  # could not tell where its objects live: keep
+    for path in (local, *homes):
+        if _inside(path, ws_root) or _inside(path, sessions_root):
+            return True
+        # #1289: another instance's root (prod + staging on one host) is outside ours
+        # but just as deletable — also once that workspace is gone and only its root is left.
+        if _in_clord_workspace(path):
+            return True
+    return False
+
+
+def _read_small(path: Path) -> str | None:
+    """*path*'s text; ``""`` when it does not exist; ``None`` when it cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, NotADirectoryError):
+        return ""
+    except (OSError, ValueError):
+        return None
+
+
+#: The suffixes git tries, in order, for a local remote path (``enter_repo``).
+_REPO_SUFFIXES = ("/.git", "", ".git/.git", ".git")
+
+
+def _object_homes(local: str) -> list[str] | None:
+    """The real places that hold the objects and refs of the repo at *local* (#1297).
+
+    A linked worktree's ``.git`` is a file (``gitdir: <repo>/.git/worktrees/<n>``)
+    whose ``commondir`` names the repo's real git dir; a ``.git``, ``objects`` or
+    ``refs`` dir may be a symlink into another repo; a repo may borrow objects
+    through ``objects/info/alternates``. Those directories are deleted with the
+    repo they belong to, wherever *local* itself sits. Every path git may open
+    for *local* is followed (the ``enter_repo`` suffixes ``/.git``, none,
+    ``.git/.git``, ``.git`` — all that exist, not only the first) and every git
+    dir, common dir, ``objects`` / ``refs`` dir and alternate object dir is
+    returned resolved. ``None`` when a file that would say cannot be read or
+    parsed (quoted alternates, a NUL byte): the caller keeps.
+    """
+    try:
+        return _object_homes_unchecked(local)
+    except (OSError, ValueError):
+        return None
+
+
+def _object_homes_unchecked(local: str) -> list[str] | None:
+    git_dirs: list[Path] = []
+    for suffix in _REPO_SUFFIXES:
+        # #1297: suffixes go on the path as written; each candidate is then resolved.
+        written = Path(local.rstrip("/") + suffix)
+        cand = Path(os.path.realpath(written))
+        kind = _kind(cand)
+        if kind is None:
+            return None
+        if kind == "dir":
+            git_dirs.append(cand)
+        elif kind == "file":
+            text = _read_small(cand)
+            if text is None or "\0" in text:
+                return None
+            line = text.strip()
+            if line.startswith("gitdir:"):
+                gitdir = line[len("gitdir:") :].strip()
+                # A relative gitdir: judge it from the link's dir and the file's real dir.
+                for base in dict.fromkeys((written.parent, cand.parent)):
+                    git_dirs.append(Path(os.path.realpath(base / gitdir)))
+    dirs: list[Path] = []
+    for git_dir in git_dirs:
+        dirs.append(git_dir)
+        common = _read_small(git_dir / "commondir")
+        if common is None or "\0" in common:
+            return None
+        if common.strip():
+            dirs.append(Path(os.path.realpath(git_dir / common.strip())))
+    homes = [str(d) for d in dirs]
+    objects: list[Path] = []
+    for d in dirs:
+        homes.append(os.path.realpath(d / "refs"))
+        objects.append(Path(os.path.realpath(d / "objects")))
+    seen: set[str] = set()
+    while objects:
+        obj = objects.pop()
+        if str(obj) in seen:
+            continue
+        if len(seen) >= 32:
+            return None  # a chain that long is not something to reason about: keep
+        seen.add(str(obj))
+        homes.append(str(obj))
+        text = _read_small(obj / "info" / "alternates")
+        if text is None or "\0" in text:
+            return None
+        for raw in text.splitlines():
+            entry = raw.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            if entry.startswith('"'):
+                return None  # C-quoted: git unquotes it; rather than re-implement, keep
+            objects.append(Path(os.path.realpath(obj / entry)))
+    return [h for h in dict.fromkeys(homes) if h != local]
 
 
 def mark_sessions_root(root: str | os.PathLike[str] | None) -> None:
